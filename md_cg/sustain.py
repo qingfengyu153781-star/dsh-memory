@@ -1,0 +1,2031 @@
+# -*- coding: utf-8 -*-
+"""md_cg · 持续性自维持（记忆 OS #4）：常驻 / 心跳 / 自愈 / 会话续接
+
+路线图「常驻服务：会话 / 心跳 / 自愈」的落地。回答三个问题：
+
+① 别人怎么知道我还活着？—— **心跳戳**
+   `<net_dir>/heartbeat.<name>.stamp`（原子写，含 ts / pid / uptime / task_running）。
+   分级判定对齐 Mutual Sustain Loop v1.1：正常 / 警告 / 失联，阈值按心跳间隔的
+   2.5× / 3.5×；**任务执行中阈值放宽**（working factor），避免长任务被误判死亡。
+   戳写在仓库外（默认 ~/.mdcg/sustain），不污染知识库，也不随仓库泄露。
+
+② 进程被杀会不会留下坏状态？—— **自愈（diagnose → heal）**
+   诊断只读、不改动；修复动作幂等且逐条留审计：
+     · 索引漂移 / 孤儿索引 → 重建索引（索引是派生物，可安全重建）
+     · 索引增量分片积压 → 合并进快照
+     · 陈旧临时文件     → 清理（被杀死的写者留下的唯一命名 tmp）
+     · 日志半截行       → 补换行（否则下一条记录会粘在断行上）
+     · 私有节点不可解   → **只报告不修**（缺密钥是权限事实，不是故障）
+   原则：修复只碰派生物（索引 / 临时文件 / 日志边界），**永不删节点**。
+
+③ 重启后从哪继续？—— **会话水位（SessionLedger）**
+   `<root>/_sessions.json` 记录每个会话的 (last_t, last_seq, events)，
+   与 `sources.Ingestor` 的 `_sources.json`（源视角水位）互补；重启后
+   `resume_point(session)` 直接给出续接点，不重复摄取、不丢事件。
+
+④ 能力不会被饿死？—— **演化巡检（evolve）**
+   自我演化的三类动作（固化 `consolidate` / 重算重要性 `weights` / 去污染 `scrub`）
+   早已具备，缺的是**驱动源**：没人周期性问「现在有多少该固化 / 该重算的候选」。
+   `evolution_candidates()` 以**索引快照**为口径做只读盘点（零读节点文件、零写盘、
+   确定性），并挂到常驻循环的 `_tick_evolve()` 上。纪律与 self-heal 一致且更严：
+     · 巡检恒只读，`auto_evolve=False` 时**只记账不动库**（默认已改为 True，见 AUTO_DEFAULTS）；
+     · 自愈只放行**确定性且可回滚**的动作（重要性重算，有 rollback）；
+     · 依赖 LLM 的固化**永不自动跑**——巡检报出候选数，交人工另批。
+
+⑤ 演进血缘有没有断？—— **派生溯源巡检（G8）**
+   新增节点在建链时把 `derived_from` 写进 frontmatter 并追加到 `<root>/_link.jsonl`。
+   可台账会丢、节点会被删，于是血缘会出现**悬空边**（子/父节点已不在库里）。
+   `diagnose()` 每次都做只读盘点（零读节点文件：索引已带 `derived_from`），把悬空边
+   报为 `provenance_dangling`（severity=info、**无自动修复**）——关系事实的去留由人
+   处置，不给「自动删边」这种会篡改历史的动作。
+
+⑥ 对端挂了谁来救？—— **互维闭环（P-T-110 最小投影 · #30）**
+   两个灵枢互为维生系统：`mutual_watch` 读对端心跳 → 失联则**幂等拉起**
+   （pid 探活防误判 + 冷却防风暴）→ **验戳新鲜闭合**：拉起后必须轮询到
+   对端戳变新才算救活，否则如实报 `mutual_peer_unresponsive`——这正是
+   mutual-sustain-loop v1.1 §7 的 W4 部署教训（「拉起后应验证对端戳新鲜度，
+   当时缺该校验」）的机制化：不假装成功。`mutual_status` 做双亡检测：
+   自己也失联时互维本身不可信 → 显式上报外部告警语义，绝不静默。
+
+零第三方依赖。
+"""
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+
+from . import crypto
+from .datapath import aux_root
+from .fsutil import (FileLock, append_jsonl, atomic_write, count_jsonl,
+                     ends_mid_line, publish, read_jsonl)
+from .mdcg import LAYERS
+
+STAMP_VERSION = 1
+SUSTAIN_LOG = "_sustain.jsonl"
+LEDGER_FILE = "_sessions.json"
+
+DEFAULT_BEAT_INTERVAL = 600.0     # 心跳间隔 10min（对齐 mutual-sustain-loop）
+DEFAULT_HEAL_INTERVAL = 300.0     # 自愈巡检 5min
+DEFAULT_SCRUB_INTERVAL = 3600.0   # 记忆自净（抽查/去污染/校准）1h
+DEFAULT_EVOLVE_INTERVAL = 7200.0  # 演化巡检（固化/重要性候选盘点）2h；只读
+DEFAULT_TIDY_INTERVAL = 21600.0   # 整理巡检（contextual 同构组聚合）6h
+
+#: 六档 tick 的（档名 → interval 属性名）映射——进度面与 stale 阈值的取值面，
+#: 顺序即 `SustainLoop._run()` 的执行序（单一真源：改档名/加点只改这里）。
+TICK_INTERVAL_ATTRS = (("beat", "beat_interval"), ("heal", "heal_interval"),
+                       ("scrub", "scrub_interval"), ("evolve", "evolve_interval"),
+                       ("tidy", "tidy_interval"), ("sleep", "sleep_interval"))
+#: 活体进度面的 stale 阈值下限（秒）——issue #63：某档 tick 运行超过
+#: `max(2×该档 interval, TICK_STALE_MIN_S)` 时，状态面显式给 `stale_tick`
+#: 告警。**只上报，不杀线程**（线程不可安全强杀；处置=人工重启常驻进程，
+#: 见 `docs/mdcg/睡眠周期_运维前提与维护指南_v1.0.md`）。
+TICK_STALE_MIN_S = 1800.0
+
+# ---- 四档 `auto_*` 缺省的**单一真源**（P0-2，2026-10-01）--------------------
+# 为什么要有这张表：同一组缺省此前在**三处**各写一份——op 路径
+# （mcp_server.py 的 `_sustain_call` start 分支）、env 路径（`_start_sustain`）
+# 与 `SustainLoop.__init__` 形参。三份必然漂移，且已经漂了：`auto_tidy` 在
+# op 路径是 `False`、在 env 路径是 `"1"`（True）——同一个 `(root,name)` 走哪条
+# 入口得到相反的整理语义，是**对外可见的缺省不一致**。
+# 纪律：改缺省只改这里；调用点只许经 `auto_default` / `auto_from_env` /
+# `auto_from_args` 读取，**不得再写第二处字面量**（守卫 test_auto_defaults.py 钉死）。
+#
+# ⚠ 本轮**对外可见的缺省变更**（P0-2 裁决值 = 开）：`auto_tidy` 由 op 路径原
+# 字面量 `False` 收敛为 `True`，取 env 路径（生产路径：常驻 serve 自启）既有值
+# ——该动作确定性、永不删除节点、可逆可审计（见 `_tick_tidy` 说明），op 路径的
+# `False` 是唯一错位项。**opt-out：`MDCG_AUTO_TIDY=0`（env 路径）／显式传
+# `auto_tidy=false`（op 路径——显式入参仍优先于本表）。**
+AUTO_DEFAULTS = {"auto_heal": True, "auto_scrub": True,
+                 "auto_evolve": True, "auto_tidy": True}
+#: 各 `auto_*` 的 env 覆盖键（env 路径入口照此读；即各档的 opt-out 名）。
+AUTO_ENVS = {"auto_heal": "MDCG_SUSTAIN_AUTOHEAL",
+             "auto_scrub": "MDCG_AUTO_SCRUB",
+             "auto_evolve": "MDCG_AUTO_EVOLVE",
+             "auto_tidy": "MDCG_AUTO_TIDY"}
+#: 关断字面量——与两入口既有口径逐字一致的三写法（`0` / `false` / `False`）。
+AUTO_OFF_VALUES = ("0", "false", "False")
+
+DEFAULT_WARN_FACTOR = 2.5         # 2.5× 心跳间隔 → 警告
+DEFAULT_DEAD_FACTOR = 3.5         # 3.5× → 失联
+DEFAULT_WORKING_FACTOR = 2.0      # 任务执行中阈值 ×2
+STALE_TEMP_AGE = 3600.0           # 临时文件超过 1h 视为陈旧
+ACCESS_LOG_COMPACT_LINES = 500    # 访问日志超过该行数即折叠（否则无上限增长）
+_POLL = 0.2                       # 循环轮询步长（常驻进程 CPU 可忽略）
+
+
+# 生效条件：name 为 AUTO_DEFAULTS 的键时返回该档缺省的 bool（真源表取值，无副作用）；键不存在时抛 KeyError（不做静默回落——拼错档名即为编程错误）。
+def auto_default(name: str) -> bool:
+    """`auto_*` 缺省的真源读取（无环境、无入参）。"""
+    return bool(AUTO_DEFAULTS[name])
+
+
+# 生效条件：name 为 AUTO_DEFAULTS 的键时，从 environ（缺省 os.environ）按 AUTO_ENVS[name] 取名取值，缺键时回落「真源缺省对应的字面量」（真值→"1"、假值→"0"）；取值经 str() 后不属于 AUTO_OFF_VALUES 即为真。返回 bool。
+def auto_from_env(name: str, environ=None) -> bool:
+    """env 路径（常驻 serve 自启）的 `auto_*` 读取器。
+
+    与改动前的逐处字面量**同义**：`os.environ.get(<键>, <默认>) not in
+    ("0", "false", "False")`——默认字面量由真源表推出，不再各写一份。
+    """
+    env = os.environ if environ is None else environ
+    return str(env.get(AUTO_ENVS[name],
+                       "1" if AUTO_DEFAULTS[name] else "0")) not in AUTO_OFF_VALUES
+
+
+# 生效条件：args 为 dict 且含 name 键时返回 bool(args[name])（显式传 None 亦为 False——与改动前 `bool(a.get(name, <默认>))` 逐字同义）；args 非 dict 或缺该键时回落 auto_default(name)。
+def auto_from_args(name: str, args, environ=None) -> bool:
+    """op 路径（工具面 `sustain action=start`）的 `auto_*` 读取器。
+
+    判据是**键在不在**而不是值真假：`{"auto_tidy": False}` 与
+    `{"auto_tidy": None}` 都按「显式给了」处理（前者关、后者按 bool(None)=False
+    关），缺键才回落真源缺省——与改动前 `a.get(name, default)` 的语义一字不差。
+    `environ` 仅为签名对齐 `auto_from_env`（op 路径不读 env；保留位以免调用点
+    两边形参不一致）。
+    """
+    if isinstance(args, dict) and name in args:
+        return bool(args[name])
+    return auto_default(name)
+
+
+# --------------------------------------------------------------------------
+# 心跳
+# --------------------------------------------------------------------------
+
+# 生效条件：d 为真值时返回 d，d 为 None/空串时回落 MDCG_SUSTAIN_DIR，该环境变量也未设或为空串时返回 os.path.join(aux_root(), "sustain")（默认 ~/.mdcg/sustain，可经 MDCG_AUX_ROOT 改）；
+def net_dir(d: str = None) -> str:
+    """心跳戳目录：显式 → MDCG_SUSTAIN_DIR → aux_root()/sustain（仓库外）。"""
+    return (d or os.environ.get("MDCG_SUSTAIN_DIR")
+            or os.path.join(aux_root(), "sustain"))
+
+
+# 生效条件：给定必填 name，返回 net_dir(d) 下 heartbeat.<name>.stamp 的拼接路径。
+def stamp_path(name: str, d: str = None) -> str:
+    return os.path.join(net_dir(d), f"heartbeat.{name}.stamp")
+
+
+# 生效条件：name 必填，组装含模块常量 STAMP_VERSION 与 task_running 的戳记录、原子写入 stamp_path(name,d) 后返回该 rec。
+def write_stamp(name: str, d: str = None, **extra) -> dict:
+    """写一次心跳（原子替换）。extra 会并入戳内容（None 值丢弃）。"""
+    rec = {"v": STAMP_VERSION, "name": name, "ts": time.time(),
+           "pid": os.getpid(),
+           "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+           "task_running": bool(extra.pop("task_running", False))}
+    for k, v in extra.items():
+        if v is not None:
+            rec[k] = v
+    atomic_write(stamp_path(name, d),
+                 json.dumps(rec, ensure_ascii=False, indent=1))
+    return rec
+
+
+# 生效条件：stamp_path(name, d) 所得路径上 os.path.exists 为真且 json.load 结果为 dict 时，返回该 rec 并附加 age=max(0.0, time.time() - float(rec.get("ts") or 0))；该路径不可读、json.load 抛 ValueError/OSError 或 rec 非 dict 时返回 None；
+def read_stamp(name: str, d: str = None):
+    """读心跳戳并附 age（秒）；不存在 / 损坏 → None。"""
+    p = stamp_path(name, d)
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            rec = json.load(f)
+    except (ValueError, OSError):
+        return None
+    if not isinstance(rec, dict):
+        return None
+    # 契约（本函数文档串「不存在 / 损坏 → None」）：`ts` 非数值也算损坏。
+    # 修前 `float(rec.get("ts") or 0)` 只挡了假值（None/0/""），`ts="abc"` 这类
+    # **合法 JSON 里的非法值**会抛 ValueError 穿出本函数；而 peers() 在循环里
+    # 直接调本函数、无 try —— 一个坏戳会让**整个 peers() 失败**，同目录下所有
+    # 健康节点的状态一并丢失（实测：4 戳含 1 坏 → peers() 抛错；删坏戳 → 恢复 3 条）。
+    try:
+        ts = float(rec.get("ts") or 0)
+    except (TypeError, ValueError):
+        return None
+    rec["age"] = max(0.0, time.time() - ts)
+    return rec
+
+
+# 生效条件：对 stamp_path(name,d) 执行 os.remove，OSError 被静默忽略，无返回值。
+def clear_stamp(name: str, d: str = None):
+    try:
+        os.remove(stamp_path(name, d))
+    except OSError:
+        pass
+
+
+# 生效条件：age 为 None 返回 'absent'；否则以 factor=working if task_running else 1.0 比较 age 与 interval*warn*factor、interval*dead*factor，分别返回 'ok'/'warning'/'dead'。
+def judge(age, *, interval: float = DEFAULT_BEAT_INTERVAL,
+          task_running: bool = False, warn: float = DEFAULT_WARN_FACTOR,
+          dead: float = DEFAULT_DEAD_FACTOR,
+          working: float = DEFAULT_WORKING_FACTOR) -> str:
+    """按心跳年龄分级：ok / warning / dead / absent。
+
+    task_running=True 时阈值整体放宽 working 倍——长任务期间不写心跳是正常的，
+    若不放宽会把「正在干活」误判成「已死」。
+    """
+    if age is None:
+        return "absent"
+    factor = working if task_running else 1.0
+    if age <= interval * warn * factor:
+        return "ok"
+    if age <= interval * dead * factor:
+        return "warning"
+    return "dead"
+
+
+# 生效条件：net_dir(d) 可列为目录时遍历 heartbeat.*.stamp 并返回含 age 与 state 的记录列表，否则返回 []。
+def peers(d: str = None):
+    """列出本机所有心跳戳（含状态）。"""
+    base = net_dir(d)
+    if not os.path.isdir(base):
+        return []
+    out = []
+    for fn in sorted(os.listdir(base)):
+        if not (fn.startswith("heartbeat.") and fn.endswith(".stamp")):
+            continue
+        rec = read_stamp(fn[len("heartbeat."):-len(".stamp")], base)
+        if rec:
+            rec["state"] = judge(rec["age"],
+                                 task_running=bool(rec.get("task_running")))
+            out.append(rec)
+    return out
+
+
+# --------------------------------------------------------------------------
+# 心跳台账（append-only · 有界分片轮转）—— 让「连续 N 周期无断」可严格测得
+#
+# 缺口（答卷 `docs/plans/灵枢1.0_最小智能系统实存答卷_v1.1.md` §八 分诊第 4 项 ·
+# **甲类能力缺口**）：`_sustain.jsonl` 是 heal **动作**台账（有动作才写，平静期与
+# 停摆期不可区分），心跳戳是**覆盖式单点**（无历史序列）——故「连续 N 周期无断」
+# 在现数据结构下**不可严格测得**（取证见 `docs/eval/W7v11_结构面局限取证_v0.1.md`
+# §丁）。
+#
+# 本台账补此缺口：**每个心跳周期追加一行**（append-only、只追加不改写历史行），
+# 配合 **分片轮转 + 保留片数上限**（有界，形态照抄 `_audit.jsonl` 轮转）与
+# **节流探测**（把 stat 写入税摊到 1/N），并由只读统计
+# `heartbeat_ledger_stats()` 直接算出「最长连续无断区间 / 断点数 / 最近一次周期
+# 时刻」。位置与 `_sustain.jsonl` **同域**（库根 `<root>/_heartbeat.jsonl`）。
+#
+# **零判定变更**（硬边界）：本台账只新增写入与只读统计，不改变任何既有读面——
+# `beat()` 的返回、心跳戳字段、`_sustain.jsonl` 既有记录、`judge()`/`heal()` 的
+# 返回均逐位不变（守卫 `md_cg/test_heartbeat_ledger.py` L1 钉死）。
+#
+# **写点边界**：只有**常驻循环**的 `SustainLoop.beat()` 记台账（那才是「心跳
+# 周期」）；`write_stamp` 的其它调用点不记——进度面刷新 `_flush_progress` 非心跳
+# 周期（进/出六档各刷一次，会把「停摆」稀释），MCP 手动 `action=beat` 非循环
+# 自证（人可手动补戳，不能当「循环活着」的证据）。故台账是**循环自证面**。
+# --------------------------------------------------------------------------
+
+HEARTBEAT_LOG = "_heartbeat.jsonl"        # 活动台账（与 _sustain.jsonl 同域：库根）
+HEARTBEAT_ARCHIVE = "_heartbeat_archive"  # 分片归档目录（不在 LAYERS，不参与节点索引）
+HEARTBEAT_INDEX = "_index.json"           # 归档索引：分片 bytes/events 缓存（稳态 O(1)）
+HEARTBEAT_ROTATE_BYTES = 4 << 20          # 活动台账轮转阈值（≤0 关闭轮转＝退回无上界）
+HEARTBEAT_KEEP_SHARDS = 4                 # 归档分片保留数（≤0 不淘汰；淘汰必留痕）
+HEARTBEAT_PROBE_EVERY = 8                 # 每 N 次写入探测一次大小（把写入税摊到 1/N）
+HEARTBEAT_ENV = "MDCG_HEARTBEAT_LEDGER"   # 开关（缺省开；"0"/"false"/"False" 关）
+#: 相邻心跳周期间隔 ≤ 该阈值即视为「连续」；缺省 2× 心跳间隔（600s）= 1200s。
+HEARTBEAT_GAP_THRESHOLD = 2.0 * DEFAULT_BEAT_INTERVAL
+#: 轮转自述行与心跳周期行的区分标记（统计只取 kind=="beat"，轮转痕不进时间序列）。
+HB_KIND_BEAT = "beat"
+HB_KIND_ROTATE = "rotate"
+#: D2：非 beat 业务档的台账行 kind——失败档**必须在台账可见**（不被
+#: `heartbeat_ledger_stats` 按 kind==HB_KIND_BEAT 的过滤吞掉）。
+#: #376（2026-10-14）已接线：beat 与 tick 两档的失败行（ok 为假）统一进
+#: `heartbeat_ledger_stats` 的 failed/failures 失败读数。
+HB_KIND_TICK = "tick"
+#: #376：失败明细保留条数（`failures` 只带**最近**这几条——读数有界）。
+FAILURES_KEEP = 5
+
+#: root → 已写次数（进程内；仅用于节流探测步长。跨进程各自计数，不影响正确性
+#: ——多写者共享同一活动文件时，任一方到点都会做一次 stat，只是探测得更密）。
+_HB_WRITES: dict = {}
+
+
+# 生效条件：environ 缺省取 os.environ，读 HEARTBEAT_ENV 键，其 str() 值不在 AUTO_OFF_VALUES 中即返回 True（缺键回落 "1"＝开）；否则 False。
+def heartbeat_ledger_enabled(environ=None) -> bool:
+    """心跳台账开关（缺省**开**）：`MDCG_HEARTBEAT_LEDGER` ∈ 关断字面量即关。"""
+    env = os.environ if environ is None else environ
+    return str(env.get(HEARTBEAT_ENV, "1")) not in AUTO_OFF_VALUES
+
+
+#: D1 解耦开关：**缺省关**（"0"）——既有单线程基线（六档顺序）逐位不变。
+BEAT_THREAD_ENV = "MDCG_SUSTAIN_BEAT_THREAD"
+
+
+# 生效条件：environ 缺省取 os.environ，读 BEAT_THREAD_ENV 键，其 str() 值不在 AUTO_OFF_VALUES 中即返回 True（缺键回落 "0"＝关）；否则 False。
+def beat_thread_enabled(environ=None) -> bool:
+    """心跳独立线程开关（缺省**关**）：`MDCG_SUSTAIN_BEAT_THREAD` ∈ 关断字面量即关。
+
+    开启后 `start()` 额外起一条 daemon 线程专用 beat：业务档阻塞时心跳仍推进
+    （判活面与被判活对象不再共用执行体，D1）。缺省关 ⇒ 既有行为逐位不变。
+    """
+    env = os.environ if environ is None else environ
+    return str(env.get(BEAT_THREAD_ENV, "0")) not in AUTO_OFF_VALUES
+
+
+# 生效条件：给定库根 root，返回 root/HEARTBEAT_LOG 的拼接路径。
+def heartbeat_path(root: str) -> str:
+    return os.path.join(root, HEARTBEAT_LOG)
+
+
+# 生效条件：给定库根 root，返回 root/HEARTBEAT_ARCHIVE 的拼接路径。
+# 生效条件：root 给定时返回 root/SUSTAIN_LOG 的绝对路径（与 heartbeat_path 同形）。
+# issue #547：落点路径的**单点 getter** —— 此前 sustain.py 内有两处直接拼
+# os.path.join(root, SUSTAIN_LOG)；与 heartbeat_path 对齐后产品代码只经 getter 取路径。
+def sustain_log_path(root: str) -> str:
+    """sustain 台账路径（单点）。"""
+    return os.path.join(root, SUSTAIN_LOG)
+
+
+def heartbeat_archive_dir(root: str) -> str:
+    return os.path.join(root, HEARTBEAT_ARCHIVE)
+
+
+# 生效条件：t 为数值时间戳时返回 "%Y-%m-%dT%H:%M:%S" 本地时间字符串。
+def _iso(t) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(float(t)))
+
+
+# 生效条件：root/HEARTBEAT_ARCHIVE 可列目录时返回其中以 "_heartbeat." 开头、".jsonl" 结尾的名字升序列表（序号零填充 ⇒ 字典序==时间序）；listdir 抛 OSError 时返回 []。
+def _hb_shards(root: str):
+    try:
+        names = os.listdir(heartbeat_archive_dir(root))
+    except OSError:
+        return []
+    return sorted(n for n in names
+                  if n.startswith("_heartbeat.") and n.endswith(".jsonl"))
+
+
+# 生效条件：遍历 _hb_shards(root) 中 "_heartbeat.<n>.jsonl" 形式取 int(n) 最大值 top（解析失败 continue、无可解析项 top=0），返回 top+1。
+def _hb_next_seq(root: str) -> int:
+    top = 0
+    for n in _hb_shards(root):
+        try:
+            top = max(top, int(n[len("_heartbeat."):-len(".jsonl")]))
+        except ValueError:
+            continue
+    return top + 1
+
+
+# 生效条件：读 root/HEARTBEAT_ARCHIVE/HEARTBEAT_INDEX（json）；不可读/损坏/非 dict 时回落 {}，只保留 value 为 dict 的项。
+def _hb_load_index(root: str) -> dict:
+    try:
+        with open(os.path.join(heartbeat_archive_dir(root), HEARTBEAT_INDEX),
+                  "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items() if isinstance(v, dict)}
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+# 生效条件：把 idx 以 JSON（ensure_ascii=False, indent=1, sort_keys=True）原子写入 root/HEARTBEAT_ARCHIVE/HEARTBEAT_INDEX；OSError 被吞掉。
+def _hb_save_index(root: str, idx: dict):
+    try:
+        os.makedirs(heartbeat_archive_dir(root), exist_ok=True)
+        atomic_write(os.path.join(heartbeat_archive_dir(root), HEARTBEAT_INDEX),
+                     json.dumps(idx, ensure_ascii=False, indent=1, sort_keys=True))
+    except OSError:
+        pass
+
+
+# 生效条件：HEARTBEAT_ROTATE_BYTES <= 0 时直接返回（轮转关闭）；否则 root 写计数自增，未到 HEARTBEAT_PROBE_EVERY 倍数即返回；到倍数且活动台账 size ≥ 阈值时调用 rotate_heartbeat(root)。
+def _hb_rotate_if_needed(root: str):
+    """写前闸门：活动台账达阈值即切分（把 stat 摊到 1/HEARTBEAT_PROBE_EVERY）。"""
+    limit = HEARTBEAT_ROTATE_BYTES
+    if limit <= 0:
+        return
+    n = _HB_WRITES.get(root, 0) + 1
+    _HB_WRITES[root] = n
+    if n % HEARTBEAT_PROBE_EVERY:
+        return
+    try:
+        if os.path.getsize(heartbeat_path(root)) < limit:
+            return
+    except OSError:
+        return
+    rotate_heartbeat(root)
+
+
+# 生效条件：在 FileLock(root/_heartbeat.rotate.lock) 下，若活动台账 size ≥ HEARTBEAT_ROTATE_BYTES 则 publish 为 HEARTBEAT_ARCHIVE/_heartbeat.%06d.jsonl，登记索引、淘汰越限分片，并在新活动台账追加一条 kind="rotate" 自述行后返回 {"shard","bytes","events","pruned"}；size 不足、getsize OSError 或 rename 失败时返回 None。
+def rotate_heartbeat(root: str, reason: str = "size"):
+    """把活动心跳台账切分为归档分片（publish 原子 rename，不重写一个字节）。
+
+    语义边界（诚实面）：
+    · 分片内容与轮转前**逐行一致**（rename 不动字节）；轮转前记录序列是轮转后
+      （跨分片按时间序合并）序列的**前缀**——append-only 指「分片内只追加」，
+      分片封存后不再改写；
+    · 并发由 FileLock + 「rename 前复检大小 / 失败即返回 None」兜住；
+    · 保留策略只淘汰**分片**，且淘汰名单写进新台账的 rotate 自述行（不静默丢证据）。
+    """
+    path = heartbeat_path(root)
+    with FileLock(os.path.join(root, "_heartbeat.rotate.lock"), timeout=5.0):
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return None
+        if size < HEARTBEAT_ROTATE_BYTES:
+            return None                    # 已被并发写者轮转
+        arc = heartbeat_archive_dir(root)
+        os.makedirs(arc, exist_ok=True)
+        name = "_heartbeat.%06d.jsonl" % _hb_next_seq(root)
+        try:
+            publish(path, os.path.join(arc, name))
+        except OSError:
+            return None                    # 抢输（文件已被移走）→ 让位，不报错
+        events = count_jsonl(os.path.join(arc, name))
+        idx = _hb_load_index(root)
+        idx[name] = {"bytes": size, "events": events,
+                     "t": round(time.time(), 3), "reason": reason}
+        _hb_save_index(root, idx)
+        pruned = _hb_prune_shards(root)
+        _HB_WRITES[root] = 0
+        row = {"t": time.time(), "name": "_rotate", "pid": os.getpid(),
+               "kind": HB_KIND_ROTATE, "ok": True, "shard": name,
+               "bytes": size, "events": events, "pruned": pruned, "reason": reason}
+        try:                               # 自述留痕：轮转本身可审计
+    # #326-④：append_jsonl 不再上抛、以 False 报写失败——本处**仍容忍**（best-effort
+    # 簿记），但失败不再静默：源头已记 fsutil.APPEND_FAILURES + 有界 stderr 告警
+    # （B 面单点）。显式消费返回值：不留裸调用（守卫 AST 钉子会抓）。
+            _ok = append_jsonl(path, row)
+        except OSError:
+            pass
+        return {"shard": name, "bytes": size, "events": events, "pruned": pruned}
+
+
+# 生效条件：HEARTBEAT_KEEP_SHARDS <= 0 时返回 []（不淘汰）；否则保留最近 keep 个分片，越限的逐个 os.remove 并从索引 pop（OSError 则 continue），最后保存索引并返回被淘汰分片名列表。
+def _hb_prune_shards(root: str):
+    """保留最近 HEARTBEAT_KEEP_SHARDS 个分片、淘汰更旧的（≤0 表示不淘汰）。"""
+    keep = HEARTBEAT_KEEP_SHARDS
+    if keep <= 0:
+        return []
+    shards = _hb_shards(root)
+    gone = shards[:-keep] if len(shards) > keep else []
+    if not gone:
+        return []
+    idx = _hb_load_index(root)
+    for n in gone:
+        try:
+            os.remove(os.path.join(heartbeat_archive_dir(root), n))
+        except OSError:
+            continue                       # 删不掉就留着：不假装已淘汰
+        idx.pop(n, None)
+    _hb_save_index(root, idx)
+    return gone
+
+
+# 生效条件：开关关（heartbeat_ledger_enabled() 为假）时返回 None 且不写盘；否则先经 _hb_rotate_if_needed(root) 有界闸门，再向 root/HEARTBEAT_LOG 追加一行 {"t","name","pid","kind":"beat","ok"(,"error")}，返回该行；任何写入异常被吞掉并返回 None（心跳不可因台账而中断）。
+def record_heartbeat(root: str, name: str, *, ok: bool = True, error=None,
+                     t=None, pid=None, extra=None,
+                     kind: str = HB_KIND_BEAT) -> dict:
+    """追加一条**心跳周期**记录（append-only）——「连续 N 周期无断」的原始证据。
+
+    字段（至少）：`t`（时间戳）+`name`（周期名）+`pid`+`ok`（该周期结果）；
+    失败时附 `error`（摘要，截 200）。写路径 best-effort：开关关 / 任何异常都
+    返回 None 且不外溢（与心跳写戳同纪律）。
+    """
+    if not heartbeat_ledger_enabled():
+        return None
+    row = {"t": float(t) if t is not None else time.time(),
+           "name": name, "pid": os.getpid() if pid is None else pid,
+           "kind": kind, "ok": bool(ok)}
+    if error is not None:
+        row["error"] = str(error)[:200]
+    if extra:
+        row.update(extra)
+    try:
+        _hb_rotate_if_needed(root)
+        append_jsonl(heartbeat_path(root), row)
+    except Exception:                      # noqa: BLE001 —— 台账永不拖垮心跳
+        return None
+    return row
+
+
+# 生效条件：按 _hb_shards(root)（时间序，旧片在前）再活动台账的顺序流式产出各 JSONL 记录（read_jsonl 自动跳过坏行）；文件/目录缺失即跳过。
+def _hb_records(root: str):
+    arc = heartbeat_archive_dir(root)
+    for n in _hb_shards(root):
+        for r in read_jsonl(os.path.join(arc, n)):
+            yield r
+    for r in read_jsonl(heartbeat_path(root)):
+        yield r
+
+
+# 生效条件：只读统计 root 下 kind∈{beat,tick} 的记录（name 非 None 时按周期名过滤）——成功 beat 的 t 序列以相邻 t 间隔 > threshold_s 为断点；失败行（beat/tick 的 ok 为假）只进失败读数、不进时间序列；返回 {n, threshold_s, shards, file, failed, failures, absent, span_s, span_iso, last_iso, last_age_s, segments, longest_s, longest_iso, count_in_longest, breaks, breaks_top}；该过滤名下一条记录都没有时 absent=True 且各时序读数 None（只有失败行时 absent=False、n=0、failed=该档失败行数、failures=最近 FAILURES_KEEP 条明细）。
+def heartbeat_ledger_stats(root: str, *, name: str = None,
+                           threshold_s: float = HEARTBEAT_GAP_THRESHOLD) -> dict:
+    """只读统计：**最长连续无断区间 / 断点数 / 最近一次周期时刻**（＋失败读数）。
+
+    用途＝闭合答卷 §八 分诊第 4 项的「不可严格测得」——`_sustain.jsonl`（heal 动作
+    台账）与心跳戳（覆盖式单点）都答不了，本台账答得了。**只读**：不写、不轮转。
+    有界台账（分片 ≤ 保留片数 × 轮转阈值）使该读数代价有界。
+
+    #376（2026-10-14）：时间序列**只纳入成功的 beat**——原实现按 `kind=="beat"`
+    取数，把 `ok=False` 的心跳也折成时间戳计入，于是「连续 N 周期无断」被失败行
+    刷长、业务档失败行则被 kind 过滤**整个丢弃**（两类表现同一根因）。修后：失败
+    的 beat 与业务档 tick 进**独立失败读数** `failed`（失败行数）与 `failures`
+    （最近 `FAILURES_KEEP` 条明细，落账序）。**不改写入路径 / 调度 / 配置 / 告警**
+    （本函数只读）；**全成功台账的原有读数逐位不变**（n/threshold_s/shards/file/
+    absent/span_*/last_*/segments/longest_*/count_in_longest/breaks* 一律照旧，
+    两个失败字段是纯增量）。`absent` 口径随之钉为「该过滤名下**一条记录都没有**」：
+    只有失败行的档位是 absent=False + n=0 + failed=k（那正是必须可见的形态），
+    空台账仍 absent=True。
+    """
+    def _num(x):                     # t 可取数判据（bool 不算数，沿用原口径）
+        return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+    ts, failed, failures = [], 0, []
+    for r in _hb_records(root):
+        if not isinstance(r, dict):
+            continue
+        _kind = r.get("kind")
+        if _kind not in (HB_KIND_BEAT, HB_KIND_TICK):
+            continue                     # 轮转自述行等非周期行不进统计（原口径）
+        if name is not None and r.get("name") != name:
+            continue
+        if not r.get("ok", True):
+            # #376：失败行（beat 与 tick 同列）——契约见 HB_KIND_TICK 注释。
+            # **不进**时间序列：失败周期不是「无断」的证据。
+            failed += 1
+            _t = r.get("t")
+            failures.append({"t": float(_t) if _num(_t) else None,
+                             "iso": _iso(_t) if _num(_t) else None,
+                             "name": r.get("name"), "kind": _kind,
+                             "error": r.get("error")})
+            continue
+        if _kind != HB_KIND_BEAT:
+            continue                     # 成功业务档不进心跳时间序列（原口径）
+        v = r.get("t")
+        if _num(v):
+            ts.append(float(v))
+    ts.sort()
+    # 失败明细按**落账序**取最近 FAILURES_KEEP 条（_hb_records 恒为时间序流）。
+    out = {"n": len(ts), "threshold_s": float(threshold_s),
+           "shards": len(_hb_shards(root)), "file": HEARTBEAT_LOG,
+           "failed": failed, "failures": failures[-FAILURES_KEEP:]}
+    if not ts:
+        # absent＝该过滤名下**一条记录都没有**（既无成功 beat 也无失败行）。
+        # 只有失败行时 absent=False：那种台账恰恰是必须看得见的一种形态。
+        out.update({"absent": failed == 0, "segments": 0, "longest_s": None,
+                    "longest_iso": None, "count_in_longest": 0,
+                    "breaks": 0, "breaks_top": [], "span_s": None,
+                    "span_iso": None, "last_iso": None, "last_age_s": None})
+        return out
+    runs, breaks = [], []
+    start = prev = ts[0]
+    for t in ts[1:]:
+        if t - prev > threshold_s:
+            runs.append((start, prev))
+            breaks.append({"at_iso": _iso(prev), "next_iso": _iso(t),
+                           "gap_s": round(t - prev, 1)})
+            start = t
+        prev = t
+    runs.append((start, prev))
+    best = max(runs, key=lambda r: r[1] - r[0])
+    out.update({
+        "absent": False,
+        "span_s": round(ts[-1] - ts[0], 1),
+        "span_iso": "%s → %s" % (_iso(ts[0]), _iso(ts[-1])),
+        "last_iso": _iso(ts[-1]),
+        "last_age_s": round(max(0.0, time.time() - ts[-1]), 1),
+        "segments": len(runs),
+        "longest_s": round(best[1] - best[0], 1),
+        "longest_iso": "%s → %s" % (_iso(best[0]), _iso(best[1])),
+        "count_in_longest": sum(1 for t in ts if best[0] <= t <= best[1]),
+        "breaks": len(breaks),
+        "breaks_top": sorted(breaks, key=lambda b: -b["gap_s"])[:5],
+    })
+    return out
+
+
+# --------------------------------------------------------------------------
+# 互维闭环（P-T-110 最小投影 · #30）
+# --------------------------------------------------------------------------
+
+DEFAULT_RESTART_COOLDOWN = 300.0   # 同一对端两次拉起的最小间隔（防风暴）
+DEFAULT_FRESH_TIMEOUT = 60.0       # 拉起后等待对端戳变新鲜的窗口
+
+
+# 生效条件：pid 可转 int 且 >0 时按探活（os.name=='nt' 用 OpenProcess+WaitForSingleObject，否则 os.kill(pid,0)）返回 True，转 int 失败或 pid<=0 或探活失败返回 False。
+def pid_alive(pid) -> bool:
+    """进程探活（零第三方依赖）：Windows=OpenProcess+WaitForSingleObject；
+    posix=os.kill(pid,0)。pid 无效 / 已退出 / 权限外 → False（诚实）。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        SYNCHRONIZE = 0x00100000
+        WAIT_TIMEOUT = 0x00000102
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(SYNCHRONIZE, False, pid)
+        if not h:
+            return False
+        try:
+            return k32.WaitForSingleObject(h, 0) == WAIT_TIMEOUT
+        finally:
+            k32.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+# 生效条件：cmd 为 argv 列表时以 stdout/stderr=DEVNULL、不经 shell 的 subprocess.Popen 拉起（nt 附加 DETACHED|NEW_GROUP creationflags），返回该 Popen 对象。
+def _default_spawner(cmd):
+    """分离式拉起：argv 列表、不经 shell、输出弃置（Windows 完全脱离父控制台）。"""
+    import subprocess
+    kw = {}
+    if os.name == "nt":
+        kw["creationflags"] = (0x00000008 | 0x00000200)  # DETACHED|NEW_GROUP
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, **kw)
+
+
+# 生效条件：root 与 peer 必填，扫描 root/SUSTAIN_LOG（模块常量）返回 op='mutual'、action='restart' 且 detail 以 peer 开头的记录中最大 t，无匹配返回 0.0。
+def _last_mutual_restart(root: str, peer: str) -> float:
+    """_sustain.jsonl 里该对端最近一次互维拉起时间（无 → 0.0，审计即状态）。"""
+    last = 0.0
+    try:
+        with open(sustain_log_path(root), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if (r.get("op") == "mutual" and r.get("action") == "restart"
+                        and str(r.get("detail") or "").startswith(str(peer))):
+                    last = max(last, float(r.get("t") or 0.0))
+    except OSError:
+        pass
+    return last
+
+
+# 生效条件：cg 与 peer 必填，读对端戳判状态：ok/warning 直接返回 action='none'；dead/absent 时依次按 pid_alive、restart_cooldown、restart_cmd 有无走 alive_but_stale/restart_cooldown/dead_unhandled/拉起并验戳，返回 out。
+def mutual_watch(cg, peer: str, *, restart_cmd=None, d: str = None,
+                 interval: float = DEFAULT_BEAT_INTERVAL,
+                 restart_cooldown: float = DEFAULT_RESTART_COOLDOWN,
+                 fresh_timeout: float = DEFAULT_FRESH_TIMEOUT, poll: float = 0.5,
+                 spawner=None) -> dict:
+    """互维守护（单侧一次检查）：读对端心跳 → 失联则幂等拉起 → 验戳闭合。
+
+    判定序（P-T-110 语义，全链路审计进 _sustain.jsonl）：
+      ok/warning        → 不动作；
+      dead/absent：
+        ① 误判防护：戳里 pid 仍存活 → `alive_but_stale`（长任务未标
+           task_running？）——**不拉起**，不杀活进程；
+        ② 冷却：距上次拉起 < restart_cooldown → `restart_cooldown`；
+        ③ 无 restart_cmd → `dead_unhandled`（ok=False，诚实上报没手段，
+           不假装能救）；
+        ④ 拉起（spawner 或分离式 Popen）→ **验戳新鲜闭合**（W4 补丁）：
+           轮询对端戳 ts 超过拉起前值才算 `recovered=True`；超时 →
+           `recovered=False` + `mutual_peer_unresponsive`——对端拉起后
+           互维未激活（v1.1 §7 的 W4 场景）会被显式暴露，不假装成功。
+    """
+    rec = read_stamp(peer, d)
+    state = (judge(rec["age"], interval=interval,
+                   task_running=bool(rec.get("task_running")))
+             if rec else "absent")
+    out = {"ok": True, "peer": peer, "state": state, "t": time.time(),
+           "action": "none", "recovered": None}
+    if state in ("ok", "warning"):
+        return out
+    if rec and pid_alive(rec.get("pid")):
+        out.update(action="alive_but_stale",
+                   note="对端进程存活但戳陈旧（长任务未标 task_running？）——不拉起")
+        _audit(cg.root, "mutual", "alive_but_stale", peer)
+        return out
+    last = _last_mutual_restart(cg.root, peer)
+    if last and (time.time() - last) < restart_cooldown:
+        out.update(action="restart_cooldown",
+                   note="距上次拉起 %.1fs，冷却中" % (time.time() - last))
+        return out
+    if not restart_cmd:
+        out.update(ok=False, action="dead_unhandled",
+                   note="对端失联且未提供 restart_cmd——诚实上报，不假装能救")
+        _audit(cg.root, "mutual", "dead_unhandled", peer)
+        return out
+    before_ts = float((rec or {}).get("ts") or 0.0)
+    spawn = spawner or _default_spawner
+    try:
+        spawn(restart_cmd)
+    except Exception as e:                                 # noqa: BLE001
+        out.update(ok=False, action="restart_error",
+                   error="%s: %s" % (type(e).__name__, e))
+        _audit(cg.root, "mutual", "restart_error", peer)
+        return out
+    deadline = time.time() + fresh_timeout
+    while time.time() < deadline:
+        r2 = read_stamp(peer, d)
+        if r2 and float(r2.get("ts") or 0.0) > before_ts:
+            out.update(action="restarted", recovered=True, fresh_ts=r2.get("ts"))
+            _audit(cg.root, "mutual", "restart", peer)
+            return out
+        time.sleep(poll)
+    out.update(ok=False, action="restarted", recovered=False,
+               note=("拉起命令已执行但对端戳未更新（互维未激活？）——"
+                     "mutual_peer_unresponsive，不假装成功"))
+    _audit(cg.root, "mutual", "restart_unverified", peer)
+    return out
+
+
+# 生效条件：cg 与 peer 必填，分别按 name 与 peer 读戳判状态，仅当自身与对端状态均属 ('dead','absent') 时返回 ok=False、both_dead=True。
+def mutual_status(cg, peer: str, *, d: str = None, name: str = "md_cg",
+                  interval: float = DEFAULT_BEAT_INTERVAL) -> dict:
+    """互维状态 + 双亡检测：自己也失联时互维不可信 → 显式外部告警语义。"""
+    mine, theirs = read_stamp(name, d), read_stamp(peer, d)
+    my_state = (judge(mine["age"], interval=interval,
+                      task_running=bool(mine.get("task_running")))
+                if mine else "absent")
+    peer_state = (judge(theirs["age"], interval=interval,
+                        task_running=bool(theirs.get("task_running")))
+                  if theirs else "absent")
+    dead = ("dead", "absent")
+    both_dead = my_state in dead and peer_state in dead
+    return {"ok": not both_dead, "self": my_state, "peer": peer_state,
+            "both_dead": both_dead,
+            "note": ("双向同时失联：互维本身已不可信，须外部告警（P-T-110 风险表）"
+                     if both_dead else "互维链路可用")}
+
+
+# --------------------------------------------------------------------------
+# 诊断（只读）
+# --------------------------------------------------------------------------
+
+# 生效条件：root 必填，对模块常量 LAYERS 各层 os.walk 统计以 .md 结尾的文件名个数并返回 n（不解析正文）。
+def _count_node_files(root: str) -> int:
+    """轻量统计磁盘节点数（只数文件名，不解析正文）。"""
+    n = 0
+    for layer in LAYERS:
+        for _dp, _dirs, files in os.walk(os.path.join(root, layer)):
+            n += sum(1 for f in files if f.endswith(".md"))
+    return n
+
+
+# 生效条件：root 与 older_than 必填，返回 root 及其 LAYERS 各层下以 '.' 开头、名含 '.tmp-' 且 mtime 早于 now-older_than 的路径列表。
+def _list_stale_temps(root: str, older_than: float):
+    now, out = time.time(), []
+    bases = [root] + [os.path.join(root, l) for l in LAYERS]
+    for base in bases:
+        if not os.path.isdir(base):
+            continue
+        for name in os.listdir(base):
+            if ".tmp-" not in name or not name.startswith("."):
+                continue
+            p = os.path.join(base, name)
+            try:
+                if now - os.path.getmtime(p) > older_than:
+                    out.append(p)
+            except OSError:
+                pass
+    return out
+
+
+# 生效条件：root 必填，返回 root 顶层以 .jsonl/.log 结尾且 ends_mid_line 为真的路径列表；root 非目录返回 []。
+def _half_line_logs(root: str):
+    """顶层行式日志里末尾不是换行的（写者被杀留下的半截记录）。"""
+    out = []
+    if not os.path.isdir(root):
+        return out
+    for name in sorted(os.listdir(root)):
+        if not (name.endswith(".jsonl") or name.endswith(".log")):
+            continue
+        p = os.path.join(root, name)
+        if os.path.isfile(p) and ends_mid_line(p):
+            out.append(p)
+    return out
+
+
+# 生效条件：root/_index_log 可列为目录时返回其中 .log 结尾的文件名列表，否则返回 []。
+def _index_log_shards(root: str):
+    d = os.path.join(root, "_index_log")
+    if not os.path.isdir(d):
+        return []
+    return [f for f in os.listdir(d) if f.endswith(".log")]
+
+
+# 生效条件：cg 具备 crypto_status 且其返回 unlocked 为假时，返回 cg.index['nodes'] 中 sensitivity 经 crypto.is_encrypted_level 判为加密档的条目数；属性缺失、调用异常或已解锁时返回 0。
+def _locked_nodes(cg) -> int:
+    """加密引擎在「未解锁」状态下被隔离的私有节点数（缺密钥 = 权限事实）。"""
+    if not hasattr(cg, "crypto_status"):
+        return 0
+    try:
+        st = cg.crypto_status() or {}
+    except Exception:
+        return 0
+    if st.get("unlocked"):
+        return 0
+    nodes = (getattr(cg, "index", {}) or {}).get("nodes") or {}
+    # H-4 止血：取用前先取快照——`nodes` 是**共享可变面**（前台 add/flush 会改
+    # 同一 dict），裸迭代撞上并发写即 RuntimeError('dictionary changed size
+    # during iteration')（N138，FI-M04）。list() 拷贝在 C 层一次完成（迭代期间
+    # 不释放 GIL），故快照自身原子；判据与结果逐位不变（只换取用方式）。
+    return sum(1 for e in list(nodes.values())
+               if crypto.is_encrypted_level(e.get("sensitivity")))
+
+
+# --------------------------------------------------------------------------
+# 演化巡检（G7：给「固化 / 重要性」能力装上驱动源）
+# --------------------------------------------------------------------------
+
+#: 演化巡检项 → 对应的写入动作（`scrub` 已有独立 tick，不并入此项）
+EVOLVE_FIXES = {"ccg_backlog": "consolidate_run",
+                "importance_drift": "importance"}
+
+
+# 生效条件：nodes 与 top 必填，遍历索引条目统计缺 verification_basis 或 has_neg_conditions 的候补数 n、no_basis、no_neg 并取最多 top 个 sample，返回含 proxy=True 与 EVOLVE_FIXES['ccg_backlog'] 的字典。
+def _ccg_backlog(nodes: dict, top: int) -> dict:
+    """固化候补量（**索引代理指标**：零读节点文件、确定性、O(N)）。
+
+    真正的固化闸门在 `consolidate`（四要素 + 验证基底 + 白箱 replay，需读正文与 LLM）。
+    巡检只要**驱动信号**：索引里的 `verification_basis` / `has_neg_conditions` 已能
+    区分「有/无验证基底」「有/无负条件」，足够回答「有没有货等着固化」。
+
+    代理指标 ≠ 判定结论：报出的是**候补量**，不是「这些节点确实该固化」。
+    """
+    n = no_basis = no_neg = 0
+    sample = []
+    # H-4 止血：快照迭代（同 `_locked_nodes` 注释；N138 裸迭代崩溃面）。
+    for nid, e in list(nodes.items()):
+        mb = not e.get("verification_basis")
+        mn = not e.get("has_neg_conditions")
+        no_basis += 1 if mb else 0
+        no_neg += 1 if mn else 0
+        if mb or mn:
+            n += 1
+            if len(sample) < top:
+                sample.append(nid)
+    return {"n": n, "no_basis": no_basis, "no_neg": no_neg, "sample": sample,
+            "proxy": True, "fix": EVOLVE_FIXES["ccg_backlog"]}
+
+
+# 生效条件：cg 必填，取 cg.index['nodes']（layer 非空时按 layer 过滤），经 weights.recalc(apply=False) 与 _ccg_backlog 汇总，返回 ok=True、readonly=True、dry_run=True 的候选盘点字典。
+def evolution_candidates(cg, *, layer: str = None, top: int = 8,
+                         min_delta: float = None) -> dict:
+    """演化候选盘点（G7）：**只读、零读节点文件、确定性、不写盘**。
+
+    回答「现在有多少该固化 / 该重算重要性的候选」，供常驻巡检与人工决策。
+    与 `diagnose()`（故障体检）刻意分开：这里盘的是**演化工作量**，不是故障——
+    候补多不代表库有毛病，故 `ok` 恒 True、severity 恒 info。
+
+    `importance_drift` 复用 `weights.recalc(apply=False)`（纯数学，不读文件）；
+    `ccg_backlog` 用索引代理指标。二者都不碰节点内容。
+    """
+    nodes = (getattr(cg, "index", None) or {}).get("nodes") or {}
+    if layer:
+        # H-4 止血：快照迭代（N138 裸迭代崩溃面）——过滤结果另建新 dict，
+        # 与旧式字典推导逐项同序同值。
+        nodes = {k: v for k, v in list(nodes.items()) if v.get("layer") == layer}
+    from . import weights
+    md = weights.APPLY_DELTA if min_delta is None else float(min_delta)
+    imp = weights.recalc(cg, layer=layer, apply=False, min_delta=md,
+                         dry_run_samples=top)
+    cb = _ccg_backlog(nodes, top)
+    idr = {"n": imp["changed"], "scanned": imp["nodes_scanned"],
+           "min_delta": imp["min_delta"],
+           "sample": [s["node_id"] for s in imp["samples"]],
+           "fix": EVOLVE_FIXES["importance_drift"]}
+    return {"ok": True, "action": "evolve_check", "op": "sustain",
+            "root": cg.root, "t": time.time(), "readonly": True, "dry_run": True,
+            "nodes": len(nodes), "top": top, "layer": layer,
+            "ccg_backlog": cb, "importance_drift": idr,
+            "candidates": cb["n"] + idr["n"],
+            "by_fix": {EVOLVE_FIXES["ccg_backlog"]: cb["n"],
+                       EVOLVE_FIXES["importance_drift"]: idr["n"]},
+            "note": ("只读盘点：未写盘、未改任何节点；固化需 LLM（交人工/另批），"
+                     "重要性重算为确定性动作（有 rollback）")}
+
+
+# 生效条件：给定 cg 后只读汇总（nodes 取自 cg.index、disk 计数、refindex.check_refs），stale_temp_age 传入 _list_stale_temps；check_heartbeat / check_evolution(evolve_top) / check_provenance(provenance_top) 为真时分别追加对应 issue，返回 ok = 无 severity=="warning" 的 issue 连同 stats。
+def diagnose(cg, *, name: str = "md_cg", stale_temp_age: float = STALE_TEMP_AGE,
+             check_heartbeat: bool = True, check_evolution: bool = True,
+             evolve_top: int = 5, check_provenance: bool = True,
+             provenance_top: int = 5) -> dict:
+    """只读体检：返回 issues（带 fix 名）与 stats，不改动任何文件。"""
+    root = cg.root
+    issues = []
+    nodes = (getattr(cg, "index", {}) or {}).get("nodes") or {}
+    disk = _count_node_files(root)
+
+    if len(nodes) != disk:
+        issues.append({"code": "index_drift", "severity": "warning",
+                       "detail": f"索引 {len(nodes)} ≠ 磁盘 {disk}",
+                       "fix": "rebuild_index"})
+    # H-4 止血：快照迭代（N138：前台 add/flush 与后台巡检共用一个 MdCG 实例，
+    # 索引 dict 是共享可变面；裸 items() 撞并发写即 RuntimeError）。
+    # 面**不止本文件**：本函数默认参数还会经 evolution_candidates → weights.recalc
+    # → weights.coverage_index，且下面无条件调 refindex.check_refs——那些站点同样
+    # 作用于这个共享 dict，必须一并取快照（否则只切在这里等于没止血；见
+    # md_cg/test_h4_sustain_snapshot.py 的全域扫描器与目标级判据）。
+    orphans = [nid for nid, e in list(nodes.items())
+               if e.get("path")
+               and not os.path.exists(os.path.join(root, e["path"]))]
+    if orphans:
+        issues.append({"code": "index_orphan", "severity": "warning",
+                       "detail": f"{len(orphans)} 条索引指向不存在的文件",
+                       "sample": orphans[:5], "fix": "rebuild_index"})
+
+    shards = _index_log_shards(root)
+    if shards:
+        # severity 必须是 warning：_tick_heal 只在 rep["ok"] 为假（即存在 warning）时
+        # 才进 heal()，标 info 会让本问题永远进不了修复路径。
+        issues.append({"code": "index_log_backlog", "severity": "warning",
+                       "detail": f"{len(shards)} 个索引增量分片未合并",
+                       "fix": "compact_index"})
+
+    _acc_log = os.path.join(root, "_access.log")
+    _acc_lines = 0
+    try:
+        if os.path.exists(_acc_log):
+            with open(_acc_log, encoding="utf-8", errors="replace") as _af:
+                _acc_lines = sum(1 for _ in _af)
+    except OSError:
+        _acc_lines = 0
+    if _acc_lines > ACCESS_LOG_COMPACT_LINES:
+        issues.append({"code": "access_log_backlog", "severity": "warning",
+                       "detail": f"访问日志 {_acc_lines} 行未折叠进节点"
+                                 f"（> {ACCESS_LOG_COMPACT_LINES}）",
+                       "fix": "compact_access"})
+
+    temps = _list_stale_temps(root, stale_temp_age)
+    if temps:
+        issues.append({"code": "stale_temps", "severity": "info",
+                       "detail": f"{len(temps)} 个陈旧临时文件",
+                       "sample": [os.path.basename(p) for p in temps[:5]],
+                       "fix": "sweep_temps"})
+
+    half = _half_line_logs(root)
+    if half:
+        issues.append({"code": "half_line_logs", "severity": "warning",
+                       "detail": f"{len(half)} 个日志末尾半截行",
+                       "sample": [os.path.basename(p) for p in half[:5]],
+                       "fix": "seal_half_lines"})
+
+    locked = _locked_nodes(cg)
+    if locked:
+        issues.append({"code": "locked_nodes", "severity": "info",
+                       "detail": f"{locked} 个私有节点密文不可解（缺密钥）",
+                       "fix": None})   # 权限事实，不自愈
+
+    # ref 漂移 / 悬空（R3）：索引是派生物，源变了就报 stale，源没了就报 dangling。
+    # 只读、不抛；修复动作是重跑 index_code / index_doc（rebuild_refs）。
+    from . import refindex
+    refs = refindex.check_refs(cg, ledger=refindex.Ledger(root))
+    if refs["stale"]:
+        issues.append({"code": "ref_stale", "severity": "warning",
+                       "detail": f"{len(refs['stale'])} 个 ref 漂移（源文件已改动）",
+                       "sample": [r.get("path") for r in refs["stale"][:5]],
+                       "fix": "rebuild_refs"})
+    if refs["dangling"]:
+        issues.append({"code": "ref_dangling", "severity": "warning",
+                       "detail": f"{len(refs['dangling'])} 个 ref 悬空（源文件已删除）",
+                       "sample": [r.get("path") for r in refs["dangling"][:5]],
+                       # 悬空**没有**自动动作：源已不在，重切只能扫到 0 个文件
+                       # （refindex.rebuild 的 roots_missing 侧已拦住「水位被写空」），
+                       # 处置走 op=ref action=prune 或恢复真源后重建 ⇒ 不承诺够不着的
+                       # 动作（fix 只被展示面消费，改它是口径修正而非行为开关）。
+                       "fix": None})
+    if refs.get("truncated"):
+        issues.append({"code": "ref_check_truncated", "severity": "info",
+                       "detail": f"ref 巡检只覆盖前 {refs['max_nodes']} 个节点，结果不完整",
+                       "fix": None})   # 覆盖缺口，显式说出来而非静默
+
+    if check_heartbeat:
+        st = read_stamp(name)
+        state = (judge(st["age"], task_running=bool(st.get("task_running")))
+                 if st else "absent")
+        if state != "ok":
+            issues.append({"code": "heartbeat_" + state, "severity": "info",
+                           "detail": f"本机心跳状态：{state}", "fix": "beat"})
+
+    # ---- 演化巡检（G7）：盘的是「该做多少事」，不是「库有毛病」，
+    #      故 severity 恒 info（不影响 ok），且全程只读、零读节点文件。
+    evolve = None
+    if check_evolution:
+        evolve = evolution_candidates(cg, top=evolve_top)
+        cb, idr = evolve["ccg_backlog"], evolve["importance_drift"]
+        if cb["n"]:
+            issues.append({"code": "ccg_backlog", "severity": "info",
+                           "detail": (f"{cb['n']} 个固化候补"
+                                      f"（索引代理：无验证基底 {cb['no_basis']}"
+                                      f" / 无负条件 {cb['no_neg']}）"),
+                           "sample": cb["sample"], "fix": cb["fix"],
+                           "proxy": True})
+        if idr["n"]:
+            issues.append({"code": "importance_drift", "severity": "info",
+                           "detail": (f"{idr['n']} 个节点结构重要性偏离 "
+                                      f"≥{idr['min_delta']}（可重算）"),
+                           "sample": idr["sample"], "fix": idr["fix"]})
+
+    # ---- 派生溯源巡检（G8）：只读检出悬空派生边（端点已不在索引内）。
+    #      **无自动修复**：删边等于篡改演进血缘，只报告、由人处置；
+    #      故 severity 恒 info（不影响 ok、不触发自愈），零读节点文件。
+    prov = None
+    if check_provenance:
+        from . import provenance as _pv
+        prov = _pv.check(cg, limit=provenance_top)
+        if prov["dangling_count"]:
+            issues.append({"code": "provenance_dangling", "severity": "info",
+                           "detail": (f"{prov['dangling_count']} 条派生边悬空"
+                                      f"（{prov['edges']} 条边中，端点不在索引内）"),
+                           "sample": [f"{r['child']}->{r['parent']}"
+                                      for r in prov["dangling"]],
+                           "fix": None})   # 关系事实：只检出，不自动删边
+
+    return {"ok": not any(i["severity"] == "warning" for i in issues),
+            "root": root, "issues": issues, "t": time.time(),
+            "evolve": evolve, "provenance": prov,
+            "stats": {"nodes_indexed": len(nodes), "nodes_on_disk": disk,
+                      "index_log_shards": len(shards), "stale_temps": len(temps),
+                      "half_line_logs": len(half), "locked_nodes": locked,
+                      "ref_checked": refs["checked"],
+                      "ref_stale": len(refs["stale"]),
+                      "ref_dangling": len(refs["dangling"]),
+                      "provenance_edges": (prov["edges"] if prov else 0),
+                      "provenance_dangling":
+                          (prov["dangling_count"] if prov else 0),
+                      "evolve_candidates":
+                          (evolve["candidates"] if evolve else 0)}}
+
+
+# --------------------------------------------------------------------------
+# 自愈
+# --------------------------------------------------------------------------
+
+# 生效条件：path 必填，以 'ab' 模式向该路径追加写入单个换行 b'\n'，无返回值。
+def _seal_half_line(path: str):
+    with open(path, "ab") as f:
+        f.write(b"\n")
+
+
+# 生效条件：root/op/action 必填，向 root/SUSTAIN_LOG（模块常量）追加一行含 t/op/action/detail(截断 200)/pid 的 JSONL，无返回值。
+def _audit(root: str, op: str, action: str, detail: str = ""):
+    append_jsonl(sustain_log_path(root),
+                 {"t": time.time(), "op": op, "action": action,
+                  "detail": str(detail)[:200], "pid": os.getpid()})
+
+
+# --------------------------------------------------------------------------
+# 同因不重试（自愈的失败记忆）
+#
+# 为什么需要：自愈没有记忆——每 tick 都 diagnose → heal。当病灶**超出预算**时
+# （例：ref_stale 的根因是 rebuild 被 max_files=500 / max_items=2000 截断，
+# 永远重写不到"坏"的那几个节点、截断还跳过对账），每 tick 都会重跑同一次注定
+# 失败的 rebuild、重刷同一批行与审计。记忆 + 退避是唯一有界的止法。
+#
+# 边界（刻意保守）：①只影响**同一信号的重复失败**——首次失败永远真跑、永远如实
+# 上报，绝不把「失败」变成「不报」；②信号变化、或上次结果不坏（ok/truncated 都
+# 好）⇒ 立刻放行重试；③记忆进程内、重启即清（只影响退避节奏，不影响正确性）；
+# ④默认只在常驻循环里启用（`repeat_guard=True`），手动 op=sustain action=heal
+# 不受影响（手动即显式要求试一次）。
+# --------------------------------------------------------------------------
+
+_HEAL_MEMO: dict = {}          # (root, code) → {signal, bad, streak, ts}
+HEAL_BACKOFF_MAX = 3600.0      # 退避上限 1h
+
+
+# 生效条件：res 非 dict 时返回 False，否则返回 res.get('ok') is False 或 bool(res.get('truncated'))——即「跑完了但没修好/没修完」；
+def _bad_result(res) -> bool:
+    """动作结果是否「跑完了但没修好」（ok=False 或 truncated）。"""
+    if not isinstance(res, dict):
+        return False
+    return res.get("ok") is False or bool(res.get("truncated"))
+
+
+# 生效条件：按 (root, code) 查 _HEAL_MEMO，存在且 signal 与上次相同、上次 bad 且距上次尝试 < min(HEAL_BACKOFF_MAX, interval*2^(streak-1)) 时返回 (True, {'streak','wait_s','age_s','reason'})（不改记忆），否则返回 (False, {})；
+def _repeat_skip(root: str, code: str, signal: str,
+                 interval: float) -> tuple:
+    """同因失败不重试：返回 (skip, info)。`interval` 是调用方的巡检间隔（退避基准）。
+
+    等待时长只由**失败的尝试次数**（streak）决定：每次「真的又试了一次仍失败」
+    才翻倍；窗口内被拦下的那些 tick 只报同一个窗口，不把等待继续推大——
+    否则一次失败就会在几个 tick 内冲到 1h 上限，退避与「试了几次」脱钩。
+    """
+    st = _HEAL_MEMO.get((root, code)) or {}
+    if not st or st.get("signal") != signal or not st.get("bad"):
+        return False, {}
+    streak = int(st.get("streak") or 0)
+    wait = min(HEAL_BACKOFF_MAX, max(0.0, float(interval)) * (2 ** max(0, streak - 1)))
+    age = time.time() - float(st.get("ts") or 0.0)
+    if age < wait:
+        return True, {"streak": streak, "wait_s": round(wait, 1),
+                      "age_s": round(age, 1), "reason": "repeat_failure"}
+    return False, {}
+
+
+# 生效条件：按 (root, code) 记下本次的 signal 与结果是否坏；同信号连续失败时 streak 累加、坏结果首次记 1、好结果清零，ts 记当前时间；
+def _repeat_remember(root: str, code: str, signal: str, bad: bool) -> None:
+    st = _HEAL_MEMO.get((root, code)) or {}
+    same = st.get("signal") == signal
+    if bad:
+        streak = int(st.get("streak") or 0) + 1 if same else 1
+    else:
+        streak = 0
+    _HEAL_MEMO[(root, code)] = {"signal": signal, "bad": bool(bad),
+                                "streak": streak, "ts": time.time()}
+
+
+# 生效条件：按 diagnose(cg, name=name, stale_temp_age=stale_temp_age) 的 issues code 集合分派——命中 index_drift/index_orphan 重建索引、**ref_stale** 按 ref 重建源索引（ref_dangling 不触发）、index_log_backlog 合并索引分片、stale_temps 清理陈旧临时文件、half_line_logs 修补半截日志；ccg_backlog 仅 allow_evolve=True 且 reflect_fn 非 None 时才 consolidate（否则记 needs_llm），importance_drift 仅 allow_evolve=True 时才重算重要性（否则记 evolve_disabled）；dry_run=True 时各动作只记入 actions 不落盘，返回含 after["ok"]、dry_run、actions、before/after 的 stats 与 t 的 dict；repeat_guard 为真时同一信号且上次未修好的动作记 {'applied': False, 'reason': 'repeat_failure'} 并按 heal_interval*2^n 退避（上限 1h）；
+def heal(cg, *, name: str = "md_cg", dry_run: bool = False,
+         stale_temp_age: float = STALE_TEMP_AGE,
+         allow_evolve: bool = False, reflect_fn=None, verify_fn=None,
+         heal_interval: float = DEFAULT_HEAL_INTERVAL,
+         repeat_guard: bool = False) -> dict:
+    """按诊断结果修复派生物。dry_run=True 时只列动作、不落盘。
+
+    演化类动作（G7）默认**不动**，须显式 `allow_evolve=True` 才放行，且只放行
+    **确定性**动作（重要性重算，有 rollback）；依赖 LLM 的固化永不自动跑。
+
+    `repeat_guard=True`（常驻循环用）开启「同因不重试」：诊断信号与上次全同、
+    且上次结果未修好（`ok=False` 或 `truncated`）时不再执行，记
+    `{'applied': False, 'reason': 'repeat_failure', 'streak': n}` 并按
+    `heal_interval × 2^n` 退避（上限 1h，进程内记忆、重启即清）。首次失败永远
+    真跑并如实上报；手动调用默认不开启（手动即显式要求试一次）。
+    """
+    before = diagnose(cg, name=name, stale_temp_age=stale_temp_age)
+    codes = {i["code"] for i in before["issues"]}
+    root = cg.root
+    actions = []
+
+    def _signal(code: str) -> str:
+        """该 code 的**诊断事实签名**（detail + sample）：同因＝信号不变。"""
+        for i in before["issues"]:
+            if i["code"] == code:
+                return "%s|%s" % (i.get("detail"), i.get("sample"))
+        return ""
+
+# 生效条件：闭包 dry_run 为真时向 actions 追加 {"code": code, "detail": detail, "applied": False} 并返回；repeat_guard 为真且 _repeat_skip 判为重复失败时追加 applied=False/reason=repeat_failure/streak/wait_s 并返回；否则调用 fn() 取回值 res，res 为 dict 且 ok 为 False（或 truncated）时记 ok=False 并附 result 摘要，抛异常时追加 applied=True/ok=False 与 error，最后执行 _audit(root, "heal", code, detail) 并 _repeat_remember；
+    def act(code: str, detail: str, fn):
+        if dry_run:
+            actions.append({"code": code, "detail": detail, "applied": False})
+            return
+        if repeat_guard:
+            skip, info = _repeat_skip(root, code, _signal(code), heal_interval)
+            if skip:
+                # 不是「不报」：把「同一病灶上次就没修好」如实记进动作与审计。
+                actions.append({"code": code, "detail": detail, "applied": False,
+                                "ok": False, **info})
+                _audit(root, "heal", code,
+                       "%s → repeat_failure（第 %s 次，退避 %ss）"
+                       % (detail, info.get("streak"), info.get("wait_s")))
+                return
+        res = None
+        try:
+            res = fn()
+        except Exception as e:                       # 自愈失败不能拖垮进程
+            actions.append({"code": code, "detail": detail, "applied": True,
+                            "ok": False, "error": f"{type(e).__name__}: {e}"})
+            # #404：台账是**外部可见读数**，必须与事实一致——失败时把「清理 N 个…」改写成
+            # 带结果的形态再落账，否则 `_audit` 会照写一行「已清理 N 个」的假账（issue 期望 #2）。
+            # 只改 detail（不动 applied/ok 语义）。
+            detail = "%s → 失败：%s: %s" % (detail, type(e).__name__, e)
+        else:
+            # `fn()` 跑完 ≠ 修好：返回 dict 且 ok is False（或 truncated）时
+            # 如实记 ok=False——「重建失败」绝不能被记成 ok=True。
+            bad = _bad_result(res)
+            row = {"code": code, "detail": detail, "applied": True, "ok": not bad}
+            if isinstance(res, dict):
+                # #404：白名单是**回执的判据面**——诚实计数（removed/planned）必须进得来，
+                # 否则「删了几个」到不了外部读数（本件首版就被自己的守卫抓到这一点）。
+                brief = {k: res[k] for k in ("ok", "indexed", "files", "truncated",
+                                             "roots_missing", "errors",
+                                             "removed", "planned")
+                         if k in res}
+                if isinstance(brief.get("errors"), list):
+                    brief["errors"] = brief["errors"][:1]
+                if brief:
+                    row["result"] = brief
+                    detail = "%s → %s" % (detail, brief)
+            actions.append(row)
+        if repeat_guard:
+            _repeat_remember(root, code, _signal(code),
+                             bool(actions[-1].get("ok") is False))
+        _audit(root, "heal", code, detail)
+
+    if "index_drift" in codes or "index_orphan" in codes:
+        act("rebuild_index", "重建索引（漂移 / 孤儿）", cg.rebuild_index)
+    if "ref_stale" in codes:
+        # 只对 ref_stale 自动重建。ref_dangling（源已删/已搬）重切只会 0 文件、
+        # 治不好 dangling（rebuild 的 roots_missing 侧已拦「水位被写空」），出口是
+        # op=ref action=prune / 恢复真源后重建 —— 不在这里触发。
+        # 止血点必须在本行：heal 按 code 分派（fix 字段无任何调度器消费）。
+        from . import refindex as _ri
+        _led = _ri.Ledger(root)
+        act("rebuild_refs", "按 ref 重建源索引（修复 ref_stale）",
+            lambda: _ri.rebuild(cg, ledger=_led))
+    if "index_log_backlog" in codes:
+        act("flush_index", "合并索引增量分片", cg.flush)
+
+# 生效条件：闭包内先 cg.flush()（把内存 _dirty 落进分片）再 cg.compact_index()
+# （读「_index.json 快照 + 分片」写回快照并清空分片）；顺序不可颠倒——compact_index
+# 以整体替换 self.index，未 flush 的内存条目会丢。
+    def _compact_index():
+        cg.flush()
+        return cg.compact_index()
+    if "index_log_backlog" in codes:
+        act("compact_index", "分片折叠进 _index.json（快照落盘）", _compact_index)
+    if "access_log_backlog" in codes:
+        act("compact_access", "折叠访问日志进 access_count / last_access",
+            cg.compact_access)
+    if "stale_temps" in codes:
+        paths = _list_stale_temps(root, stale_temp_age)
+
+# 生效条件：对闭包变量 paths 逐个 os.remove 并按**实际结果**返回 {"ok","removed","planned","errors"}——单条失败记入 errors 后继续；paths 非空而**一个都没删掉**时抛 OSError（让 act 如实记 ok=False，不假装成功）；paths 为空时返回 ok=True/removed=0（无事可做不是失败）。
+        def _sweep():
+            # #404（2026-10-16）根因：原实现 `except OSError: pass` 吞掉失败、且返回 None ⇒
+            # act 的 `_bad_result(None)` 为假 ⇒ 回执 `applied=True/ok=True`，`_audit` 同时照写
+            # 「清理 N 个陈旧临时文件」——**回执与台账都与事实相反**（同函数内 seal_half_lines
+            # 不吞异常，本处是唯一把失败吞成成功的动作，与「绝不假装成功」正面对撞）。
+            # 修法：按实际结果回报 + 全失败即抛（fail-loud）；**不改 act 的 applied 语义**——
+            # 沿用仓内既有口径（scrub.py 的 #411 修法：applied=动作跑过、ok=按事实判）。
+            done, failed = 0, []
+            for p in paths:
+                try:
+                    os.remove(p)
+                except OSError as e:
+                    failed.append("%s: %s" % (os.path.basename(p), e))
+                else:
+                    done += 1
+            if paths and done == 0:
+                raise OSError("陈旧临时件一个都没删掉（%d/%d）：%s"
+                              % (done, len(paths), "；".join(failed[:3])))
+            return {"ok": not failed, "removed": done, "planned": len(paths),
+                    "errors": failed[:3]}
+        act("sweep_temps", f"清理 {len(paths)} 个陈旧临时文件", _sweep)
+    if "half_line_logs" in codes:
+        paths = _half_line_logs(root)
+        act("seal_half_lines", f"修补 {len(paths)} 个半截日志行",
+            lambda: [_seal_half_line(p) for p in paths])
+
+    # ---- 演化类修复（G7）：默认关闭，且只放行确定性动作 ----
+    if "ccg_backlog" in codes:
+        det = next((i for i in before["issues"] if i["code"] == "ccg_backlog"), {})
+        detail = f"{det.get('detail', '固化候补')}；固化需 LLM 反思/验证"
+        if allow_evolve and reflect_fn is not None:
+            from . import consolidate as _cd
+
+# 生效条件：调用时返回 _cd.consolidate(cg.root, apply=True, reflect_fn=reflect_fn, verify_fn=verify_fn)；
+            def _consolidate():
+                return _cd.consolidate(cg.root, apply=True,
+                                       reflect_fn=reflect_fn,
+                                       verify_fn=verify_fn)
+            act("consolidate_run", detail, _consolidate)
+        else:
+            actions.append({"code": "consolidate_run", "detail": detail,
+                            "applied": False, "reason": "needs_llm"})
+    if "importance_drift" in codes:
+        if allow_evolve:
+            from . import weights
+
+# 生效条件：调用时返回 weights.recalc(cg, apply=True, actor="sustain_evolve")；
+            def _importance():
+                return weights.recalc(cg, apply=True, actor="sustain_evolve")
+            act("importance", "重算结构重要性（确定性；可 rollback）", _importance)
+        else:
+            actions.append({"code": "importance",
+                            "detail": "重算结构重要性（确定性动作）",
+                            "applied": False, "reason": "evolve_disabled"})
+
+    after = (before if dry_run
+             else diagnose(cg, name=name, stale_temp_age=stale_temp_age))
+    return {"ok": after["ok"], "dry_run": dry_run, "actions": actions,
+            "before": before["stats"], "after": after["stats"],
+            "t": time.time()}
+
+
+# --------------------------------------------------------------------------
+# 会话水位（重启续接）
+# --------------------------------------------------------------------------
+
+# 生效条件：以 root 实例化后账本固定指向 os.path.join(root, LEDGER_FILE)，其 _load/_save/note/resume_point/sessions/summary 均以该路径为唯一读写对象；
+class SessionLedger:
+    """会话水位账本：<root>/_sessions.json。
+
+    与 sources.Ingestor 的水位互补：Ingestor 记「某个源读到哪」，
+    这里记「某个会话发生过什么」——重启后按会话给出续接点。
+    """
+
+# 生效条件：传入 root 时置 self.root=root 且 self.path=os.path.join(root, LEDGER_FILE)，不做其他校验；
+    def __init__(self, root: str):
+        self.root = root
+        self.path = os.path.join(root, LEDGER_FILE)
+
+# 生效条件：self.path（root/LEDGER_FILE）可读且 json 结果为 dict、且 d.get("sessions") 也是 dict 时返回该 d；self.path 不可读、json.load 抛 ValueError/OSError、或 d 非 dict / sessions 非 dict 时返回 {"schema": 1, "sessions": {}}；
+    def _load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, encoding="utf-8") as f:
+                    d = json.load(f)
+                if isinstance(d, dict) and isinstance(d.get("sessions"), dict):
+                    return d
+            except (ValueError, OSError):
+                pass
+        return {"schema": 1, "sessions": {}}
+
+# 生效条件：传入 d 时执行 atomic_write(self.path, json.dumps(d, ensure_ascii=False, indent=1))，自身无返回值；
+    def _save(self, d):
+        atomic_write(self.path, json.dumps(d, ensure_ascii=False, indent=1))
+
+# 生效条件：以 session 为键 setdefault 会话记录后写 events=int(s.get("events") or 0)+int(n)（n 默认 1，n=0 时计数不变），t 非 None 时写 last_t 且 first_t 为空时一并写入，seq 非 None 时写 last_seq，actor 为真值时写 actor，最后写 updated_at 并 _save，返回 dict(s, session=session)；
+    def note(self, session: str, *, t=None, seq=None, n: int = 1,
+             actor: str = None) -> dict:
+        """记一笔会话活动（事件计数 + 最后 (t, seq) 水位）。"""
+        d = self._load()
+        s = d["sessions"].setdefault(
+            session, {"events": 0, "first_t": None, "last_t": None})
+        s["events"] = int(s.get("events") or 0) + int(n)
+        if t is not None:
+            s["last_t"] = float(t)
+            if s.get("first_t") is None:
+                s["first_t"] = float(t)
+        if seq is not None:
+            s["last_seq"] = seq
+        if actor:
+            s["actor"] = actor
+        s["updated_at"] = time.time()
+        self._save(d)
+        return dict(s, session=session)
+
+# 生效条件：_load()["sessions"].get(session) 为假值（键缺失或值为空 dict）时返回 {"session": session, "resume": None, "events": 0}；否则返回 {"session": session, "events": s.get("events", 0), "resume": {"t": s.get("last_t"), "seq": s.get("last_seq")}, "last_t": s.get("last_t"), "actor": s.get("actor")}；
+    def resume_point(self, session: str) -> dict:
+        """重启续接点：(t, seq) 之后的事件才是新的。"""
+        s = self._load()["sessions"].get(session)
+        if not s:
+            return {"session": session, "resume": None, "events": 0}
+        return {"session": session, "events": s.get("events", 0),
+                "resume": {"t": s.get("last_t"), "seq": s.get("last_seq")},
+                "last_t": s.get("last_t"), "actor": s.get("actor")}
+
+# 生效条件：无参调用时返回 dict(self._load()["sessions"]) 的浅拷贝，账本缺失/损坏时 _load 回落默认值故此处为 {}；
+    def sessions(self) -> dict:
+        return dict(self._load()["sessions"])
+
+# 生效条件：取 d=_load()["sessions"] 后返回 {"sessions": len(d), "events": sum(int(v.get("events") or 0)), "latest": max(v.get("last_t") or 0) if d else None}，d 为空时 latest 为 None；
+    def summary(self) -> dict:
+        d = self._load()["sessions"]
+        return {"sessions": len(d),
+                "events": sum(int(v.get("events") or 0) for v in d.values()),
+                "latest": max((v.get("last_t") or 0) for v in d.values())
+                if d else None}
+
+
+# 生效条件：os.path.exists(os.path.join(cg.root, "_sources.json")) 为真且 json.load 成功时返回 dict((d or {}).get("sources") or {})（d 或 sources 为假值即回落 {}）；该路径不可读或 json.load 抛 ValueError/OSError 时返回 {}；
+def watermarks(cg) -> dict:
+    """源视角水位快照（读 sources.Ingestor 的 _sources.json）。"""
+    p = os.path.join(cg.root, "_sources.json")
+    if not os.path.exists(p):
+        return {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+    except (ValueError, OSError):
+        return {}
+    return dict((d or {}).get("sources") or {})
+
+
+# --------------------------------------------------------------------------
+# 常驻循环
+# --------------------------------------------------------------------------
+
+# 生效条件：传入 cg 即构造实例并把 self.cg 指向它，name/beat_interval/heal_interval/auto_heal/scrub_interval/auto_scrub/evolve_interval/auto_evolve/tidy_interval/auto_tidy 用各默认值（DEFAULT_* 与 AUTO_DEFAULTS 真源表）经 float()/bool() 落为 self 属性，ledger 为假值（默认 None）时回落 SessionLedger(cg.root)，d 经 net_dir(d) 赋值，其余运行态字段初始化为 False/None/空列表/空 Event/Lock
+class SustainLoop:
+    """常驻自维持循环：后台线程周期心跳 + 周期巡检 + 必要时自愈。
+
+    daemon 线程，进程退出即消失；`stop()` 会清掉自己的心跳戳，
+    让对端立刻看到「正常下线」而不是「失联」。
+    """
+
+# 生效条件：传入 cg 时按 name 与各 DEFAULT_* / AUTO_DEFAULTS 真源表默认值初始化——self.d=net_dir(d)（d 假值时回落 MDCG_SUSTAIN_DIR/~/ .mdcg/sustain）、self.ledger=ledger or SessionLedger(cg.root)（ledger 假值时新建），beat/heal/scrub/evolve/tidy 间隔 float() 化、auto_heal/auto_scrub/auto_evolve/auto_tidy bool() 化后存为实例属性；
+    def __init__(self, cg, name: str = "md_cg", *,
+                 beat_interval: float = DEFAULT_BEAT_INTERVAL,
+                 heal_interval: float = DEFAULT_HEAL_INTERVAL,
+                 # 四档 `auto_*` 缺省取自**单一真源**（P0-2）：本形参默认值与
+                 # 两个入口读取的是同一张表，`SustainLoop(cg)` 与
+                 # `sustain action=start` / `_start_sustain` 三面同值。
+                 auto_heal: bool = AUTO_DEFAULTS["auto_heal"], d: str = None,
+                 ledger: SessionLedger = None,
+                 scrub_interval: float = DEFAULT_SCRUB_INTERVAL,
+                 auto_scrub: bool = AUTO_DEFAULTS["auto_scrub"],
+                 evolve_interval: float = DEFAULT_EVOLVE_INTERVAL,
+                 auto_evolve: bool = AUTO_DEFAULTS["auto_evolve"],
+                 tidy_interval: float = DEFAULT_TIDY_INTERVAL,
+                 auto_tidy: bool = AUTO_DEFAULTS["auto_tidy"],
+                 # 第六档：睡眠周期（§三 九步 / §4.7）。四个缺省一律取自
+                 # `md_cg/sleep.py` 的 **env 表单一真源**（SLEEP_ENV_DEFAULTS +
+                 # sleep_env 族读取器）——本处**不写第二份缺省字面量**；两个
+                 # 入口（`_start_sustain` / op 路径）同样只经那些读取器。
+                 sleep_interval: float = None,
+                 auto_sleep: bool = None,
+                 sleep_merge: str = None,
+                 sleep_window: str = None,
+                 sleep_scrub_apply: bool = None):
+        from . import sleep as _sleep
+        self.cg = cg
+        self.name = name
+        self.beat_interval = float(beat_interval)
+        self.heal_interval = float(heal_interval)
+        self.auto_heal = bool(auto_heal)
+        self.d = net_dir(d)
+        self.ledger = ledger or SessionLedger(cg.root)
+        self.scrub_interval = float(scrub_interval)
+        self.auto_scrub = bool(auto_scrub)
+        self.evolve_interval = float(evolve_interval)
+        self.auto_evolve = bool(auto_evolve)
+        self.tidy_interval = float(tidy_interval)
+        self.auto_tidy = bool(auto_tidy)
+        # 第六档睡眠周期：值全来自 sleep 模块的真源读取器（缺省见 §4.7 表）。
+        self.sleep_interval = float(_sleep.sleep_interval()
+                                    if sleep_interval is None
+                                    else sleep_interval)
+        self.auto_sleep = bool(_sleep.sleep_enabled() if auto_sleep is None
+                               else auto_sleep)
+        self.sleep_merge = (_sleep.sleep_merge_mode() if sleep_merge is None
+                            else str(sleep_merge))
+        self.sleep_window = (_sleep.sleep_window() if sleep_window is None
+                             else str(sleep_window))
+        self.sleep_scrub_apply = bool(_sleep.sleep_scrub_apply()
+                                      if sleep_scrub_apply is None
+                                      else sleep_scrub_apply)
+        self.last_sleep = None
+        self.sleeps = []
+        self.sleep_round = 0
+        self.task_running = False
+        self.beats = 0
+        self.last_beat = None
+        self.last_diagnose = None
+        self.heals = []
+        self.last_scrub = None
+        self.scrubs = []
+        # 自净轮次（issue #66）：`_tick_scrub` 每轮自增，用作抽样 seed 的
+        # 轮次分量——固定 seed 会让每轮样本逐字相同（抽样面冻结）。
+        self.scrub_round = 0
+        self.last_evolve = None
+        self.evolves = []
+        self.last_tidy = None
+        self.tidys = []
+        # 数据健康不变量断言集结论（Pi⑤）：与 tidy 同节奏，只取结论不落盘
+        self.last_conformance = None
+        # 活体进度面（issue #63）：当前档 / 上一档完成 / 上一档错误——
+        # 写点 = 既有心跳戳（见 `_progress_fields` / `_flush_progress`），
+        # **不造第二套状态文件**。
+        self.current_tick = None
+        self.last_tick_done = None
+        self.last_tick_error = None
+        self._ticks_wrapped = False          # 六档进度面包装的幂等标记
+        self._started_at = None
+        self._th = None
+        self._beat_th = None                 # D1：独立心跳线程（缺省关）
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+
+    # ---- 心跳 ----
+
+# 生效条件：task_running 非 None 时先置 self.task_running=bool(task_running)，再 write_stamp(self.name, self.d, task_running=self.task_running, root=self.cg.root, uptime=... if self._started_at else 0.0, **进度三字段)；写戳抛异常时先 record_heartbeat(ok=False, error=摘要) 再原样抛出；写戳成功则 beats 自增、记 last_beat=rec["ts"]、record_heartbeat(ok=True, t=rec["ts"])，返回该 rec；
+    def beat(self, task_running: bool = None) -> dict:
+        if task_running is not None:
+            self.task_running = bool(task_running)
+        try:
+            rec = write_stamp(
+                self.name, self.d, task_running=self.task_running, root=self.cg.root,
+                uptime=round(time.time() - self._started_at, 3)
+                if self._started_at else 0.0,
+                **self._progress_fields())      # 进度面随心跳同落（单点状态面）
+        except Exception as e:                   # noqa: BLE001
+            # 写戳失败：台账如实记 error 摘要（「容忍≠静默」），随后**原样抛出**
+            # ——既有行为不变（写戳失败 beat 亦失败，只是现在多一条错误留痕）。
+            record_heartbeat(self.cg.root, self.name, ok=False,
+                             error="%s: %s" % (type(e).__name__, e))
+            raise
+        self.beats += 1
+        self.last_beat = rec["ts"]
+        # 心跳周期台账（append-only，缺省开）：写戳成功后再追加一行。**不改返回、
+        # 不改戳**（零判定变更，守卫 L1）——t 取戳的 ts，使台账与戳同源。
+        record_heartbeat(self.cg.root, self.name, ok=True, t=rec["ts"])
+        return rec
+
+    # ---- 活体进度面（issue #63）----
+    #
+    # 为什么有这一段：`_run()` 单线程串行六档，任一档**无界阻塞**即全循环停摆
+    # （实测停 9.5 小时：心跳/自愈/巡检/演化/整理/睡眠全停）。卡住期间外部
+    # **无法知道卡在哪档**——tick 台账在 run_cycle **返回后**才写。故：
+    #   · 进入/退出每档各刷一次**既有状态面**（心跳戳）——不造第二套状态文件；
+    #   · `current_tick` 给出「此刻在哪档、已跑多久」，`stale_tick` 超限告警；
+    #   · 六档异常**不再静默**（容忍≠静默）：`last_tick_error` 记类名 + 摘要。
+    # 形态：全部经 `_wrap_ticks()` **单点包装**——`_run` 的六档 try/except 逐字
+    # 未改（`md_cg/test_sleep_p1.py` G3a 把它钉死；包装让异常在进入 `_run` 的
+    # except 之前就已被记录，那边的 `pass` 保留为兜底）。
+
+# 生效条件：无入参；返回进度三字段 dict（current_tick / last_tick_done / last_tick_error；None 值由 write_stamp 丢弃）——写戳与 status 读取的唯一取值面。
+    def _progress_fields(self) -> dict:
+        """进度三字段（写点与读取的**单一取值面**）。"""
+        return {"current_tick": self.current_tick,
+                "last_tick_done": self.last_tick_done,
+                "last_tick_error": self.last_tick_error}
+
+# 生效条件：以 write_stamp(self.name, self.d, task_running=self.task_running, root=self.cg.root, uptime=... if self._started_at else 0.0, **进度三字段) 刷新既有心跳戳（原子替换）；写失败静默（与心跳同纪律）——进度面缺失是已知边界（写失败时 status 的当前档读数退化为 null）。
+    def _flush_progress(self):
+        """把进度面刷新进**既有状态面**（心跳戳）——不新建状态文件。
+
+        为什么**进入**档时就要刷：卡死场景下「没有下一次写」正是常态——进度
+        必须在进入时就落盘，否则观测面恰好缺了要观测的那一刻。写失败静默
+        （与 `beat()` 同纪律），但失败即拉不到进度，属已知边界。
+        """
+        try:
+            write_stamp(self.name, self.d, task_running=self.task_running,
+                        root=self.cg.root,
+                        uptime=round(time.time() - self._started_at, 3)
+                        if self._started_at else 0.0,
+                        **self._progress_fields())
+        except Exception:                            # noqa: BLE001
+            pass                                     # 进度面刷新失败不拖垮常驻
+
+# 生效条件：无入参；把六档 tick 方法（beat / _tick_heal / _tick_scrub / _tick_evolve / _tick_tidy / _tick_sleep）就地包上 _wrap_tick（幂等：_ticks_wrapped 为真即直接返回 self）；返回 self。
+    def _wrap_ticks(self):
+        """把六档 tick 包上进度面（幂等）——**不改 `_run` 的逐字形态**。
+
+        为什么用包装而不是改 `_run` 的六档结构：`_run` 的六档 try/except 形态
+        被既有守卫**逐字**钉死（`md_cg/test_sleep_p1.py` G3a「第六档形态与
+        既有五档逐字同构（try/except 吞异常 + 末尾 _stop.wait(_POLL)）」），
+        而 issue #63 要求的「进/出留读数 + 异常不静默」是**每档同款**动作——
+        单点包装既保住既有形态（六档语义与顺序一字不动），又免六处重复
+        （改档名/加点只动 `TICK_INTERVAL_ATTRS`）。
+        """
+        if getattr(self, "_ticks_wrapped", False):
+            return self
+        for name, _attr in TICK_INTERVAL_ATTRS:
+            meth = "_tick_" + name if name != "beat" else "beat"
+            setattr(self, meth, self._wrap_tick(name, getattr(self, meth)))
+        self._ticks_wrapped = True
+        return self
+
+# 生效条件：name 为该档名、fn 为该档可调用；返回包装函数 wrapped——调用时先写 current_tick={name, started_at, pid} 并刷新戳，调 fn(*a, **kw)，异常记入 last_tick_error={name, error: 类名+摘要（截 200 字符）, t} 并**不重抛**（容忍≠静默；`_run` 的既有 except 保留为兜底），随后清 current_tick、记 last_tick_done={name, t, ok} 并再刷新戳。
+    def _wrap_tick(self, name: str, fn):
+        """单档 tick 的**进度面包裹**（issue #63）：进/出各留读数，异常不静默。
+
+        「容忍 ≠ 静默」：六档的 except 面此前只有 `pass`——失败的档在外部
+        读不到。现在失败一律进 `last_tick_error`（类名 + 摘要）；卡住靠
+        `current_tick` 的年龄与 `stale_tick` 告警判（不杀线程）。
+        """
+        def wrapped(*a, **kw):
+            self.current_tick = {"name": name, "started_at": time.time(),
+                                 "pid": os.getpid()}
+            self._flush_progress()
+            ok_ = True
+            try:
+                fn(*a, **kw)
+            except Exception as e:                   # noqa: BLE001
+                ok_ = False
+                if name != "beat":
+                    # D2：失败档**必须在台账可见**——非 beat 业务档每轮失败追加
+                    # 一条 kind="tick" 行（beat 自身失败已由 beat() 记 ok=False）。
+                    record_heartbeat(self.cg.root, name, ok=False,
+                                     error="%s: %s" % (type(e).__name__,
+                                                       str(e)[:200]),
+                                     kind=HB_KIND_TICK)
+                self.last_tick_error = {"name": name, "t": time.time(),
+                                        "error": "%s: %s" % (type(e).__name__,
+                                                             str(e)[:200])}
+            self.current_tick = None
+            self.last_tick_done = {"name": name, "t": time.time(), "ok": ok_}
+            self._flush_progress()
+            return ok_
+        wrapped.__name__ = "wrapped_%s_tick" % name
+        return wrapped
+
+# 生效条件：ct 为 current_tick 形态（含 name 与 started_at）且 name 在 TICK_INTERVAL_ATTRS 内时，以该档 interval 算 lim=max(2×interval, TICK_STALE_MIN_S)，年龄（now-started_at）超 lim 返回 {tick, age_s, limit_s, alert}（alert 文案含档名与已运行时长）；未超或形态不符返回 None。
+    def _stale_tick(self, ct):
+        """`current_tick` 的 stale 判定：年龄 > `max(2×该档 interval, 1800s)`。
+
+        超限**只告警不杀线程**（线程不可安全强杀；处置=人工重启常驻进程，
+        见运维指南「常驻循环的卡死防护与观测」一节）。
+        """
+        if not isinstance(ct, dict):
+            return None
+        name = ct.get("name")
+        attr = dict(TICK_INTERVAL_ATTRS).get(name)
+        if attr is None:
+            return None
+        try:
+            lim = max(2.0 * float(getattr(self, attr)), TICK_STALE_MIN_S)
+            age = max(0.0, time.time() - float(ct.get("started_at") or 0.0))
+        except (TypeError, ValueError):
+            return None
+        if age <= lim:
+            return None
+        return {"tick": name, "age_s": round(age, 1), "limit_s": round(lim, 1),
+                "alert": ("档 %s 已运行 %.0fs（阈值 %.0fs = max(2×间隔, %.0fs)）"
+                          "——疑似卡死；不自动杀线程，处置=人工重启常驻进程"
+                          % (name, age, lim, TICK_STALE_MIN_S))}
+
+    # ---- 生命周期 ----
+
+# 生效条件：不适用（无必需形参与模块级常量）
+    def start(self):
+        if self._th is not None and self._th.is_alive():
+            return self
+        self._started_at = time.time()
+        self._stop.clear()
+        self.beat()
+        self._th = threading.Thread(target=self._run, name="mdcg-sustain",
+                                    daemon=True)
+        self._th.start()
+        if beat_thread_enabled():
+            # D1：心跳独立线程（缺省关）——业务档阻塞时心跳仍推进。
+            self._beat_th = threading.Thread(target=self._beat_loop,
+                                             name="mdcg-sustain-beat",
+                                             daemon=True)
+            self._beat_th.start()
+        return self
+
+# 生效条件：调用时置 _stop 事件，self._th 非 None 时 join(timeout)（默认 3.0）后置为 None，随后 clear_stamp(self.name, self.d)，返回 self；
+    def stop(self, timeout: float = 3.0):
+        self._stop.set()
+        if self._th is not None:
+            self._th.join(timeout)
+            self._th = None
+        bt = getattr(self, "_beat_th", None)
+        if bt is not None:
+            bt.join(timeout)                 # _stop 已置位 ⇒ 心跳线程即刻退出
+            self._beat_th = None
+        clear_stamp(self.name, self.d)
+        return self
+
+# 生效条件：self._stop 未置位期间轮询（**先调 _wrap_ticks 给六档包上进度面，幂等**），按 beat_interval/heal_interval/scrub_interval/evolve_interval/tidy_interval/**sleep_interval（第六档）** 到期分别执行 beat 与 _tick_heal/_tick_scrub/_tick_evolve/_tick_tidy/_tick_sleep（六档调用形态与既有五档逐字同构：try/except 吞异常 + `_stop.wait(_POLL)` 收尾；进/出读数与异常记录由包装单点提供——issue #63）；
+    def _run(self):
+        self._wrap_ticks()               # issue #63：六档包上进度面（幂等，形态不变）
+        # issue #207 T1（2026-10-13 DSH 端）：beat 的**调度源**在开启独立心跳线程后
+        # 应当**转移**而不是**叠加**。原实现下 start() 起了 _beat_loop 线程，
+        # 而本循环仍在按 beat_interval 调 beat() —— 两路叠加，心跳与台账行数按
+        # 倍率翻倍（实测 OFF=30 / ON=59 @0.2s），且 status()["beats"] 这一对外
+        # 读数随之失真（uptime/beats 被外部用来推「转过多少轮」）。
+        # 本函数自己的 docstring 写的就是「唯一改动的是 beat 的**调度源**」——
+        # 是转移语义。缺省关时本标志恒为 True，既有单线程基线逐位不变。
+        own_beat = not beat_thread_enabled()
+        next_beat = time.time() + self.beat_interval
+        next_heal = time.time() + self.heal_interval
+        next_scrub = time.time() + self.scrub_interval
+        next_evolve = time.time() + self.evolve_interval
+        next_tidy = time.time() + self.tidy_interval
+        next_sleep = time.time() + self.sleep_interval
+        while not self._stop.is_set():
+            now = time.time()
+            if own_beat and now >= next_beat:
+                try:
+                    self.beat()
+                except Exception:
+                    pass                       # 心跳失败不中断常驻
+                next_beat = now + self.beat_interval
+            if now >= next_heal:
+                try:
+                    self._tick_heal()
+                except Exception:
+                    pass                       # 巡检失败不中断常驻
+                next_heal = now + self.heal_interval
+            if now >= next_scrub:
+                try:
+                    self._tick_scrub()
+                except Exception:
+                    pass                       # 自净失败不中断常驻
+                next_scrub = now + self.scrub_interval
+            if now >= next_evolve:
+                try:
+                    self._tick_evolve()
+                except Exception:
+                    pass                       # 演化巡检失败不中断常驻
+                next_evolve = now + self.evolve_interval
+            if now >= next_tidy:
+                try:
+                    self._tick_tidy()
+                except Exception:
+                    pass                       # 整理巡检失败不中断常驻
+                next_tidy = now + self.tidy_interval
+            if now >= next_sleep:
+                try:
+                    self._tick_sleep()
+                except Exception:
+                    pass                       # 睡眠周期失败不中断常驻
+                next_sleep = now + self.sleep_interval
+            self._stop.wait(_POLL)
+
+    # ---- D1：心跳独立线程（缺省关）----
+
+# 生效条件：由 start() 在 beat_thread_enabled() 为真时起一条 daemon 线程执行；循环里每 beat_interval 调一次 self.beat()，异常吞掉（心跳失败不拖垮常驻），_stop 置位即退出。
+    def _beat_loop(self):
+        """独立心跳线程体（D1）：与业务档**不共用执行体**——业务档阻塞时心跳仍推进。
+
+        唯一改动的是 beat 的**调度源**（多一条线程），复用既有 `beat()`（写戳 +
+        台账，纯追加、无共享可变状态）；缺省关时本线程不启动，既有单线程基线
+        逐位不变。线程退出由 `_stop` 事件驱动（`stop()` 置位后 wait 立即返回）。
+        """
+        while not self._stop.wait(self.beat_interval):
+            try:
+                self.beat()
+            except Exception:                    # noqa: BLE001
+                pass                             # 心跳失败不中断常驻
+
+# 生效条件：以 apply=self.auto_tidy 调 writelimit.tidy_contextual(self.cg, actor="sustain_tidy")，把 t/scanned/groups/members/applied_count/auto_tidy 记入 self.last_tidy 与 tidys（仅保留最近 20 条），随后调 _tick_conformance()；auto_tidy 为假时只盘点不落盘；
+    def _tick_tidy(self):
+        """整理巡检（contextual 流水治理·读侧）：同构组聚合 + 成员降权。
+
+        确定性动作、永不删节点；`auto_tidy` 为假时只盘点不落盘。缺省值取自
+        模块级真源 `AUTO_DEFAULTS`（P0-2；缺省为 True，opt-out 见该表注释）。
+        治理对象：单日批次流水（「批次247收官记忆」×163 那类同模板写入）
+        —— 写入侧限流（writelimit.check）拦增量，本巡检收敛存量。
+        """
+        from . import writelimit
+        r = writelimit.tidy_contextual(self.cg, apply=self.auto_tidy,
+                                       actor="sustain_tidy")
+        rec = {"t": r["t"], "scanned": r["scanned"], "groups": r["groups"],
+               "members": r["members"],
+               "applied_count": r.get("applied_count", 0),
+               "auto_tidy": self.auto_tidy}
+        self.last_tidy = rec
+        with self._lock:
+            self.tidys.append(rec)
+            self.tidys = self.tidys[-20:]
+        self._tick_conformance()
+
+# 生效条件：把 conformance.report_summary(self.cg) 的结论写入 self.last_conformance；该调用抛异常时写入 {"ok": False, "verdict": "BLINDSPOT", "error": "<类型名>: <消息>"}；
+    def _tick_conformance(self):
+        """数据健康不变量断言集（Pi⑤）——与 tidy 同节奏，**只取结论**。
+
+        复用 tidy 的 6h 节奏而不新开周期：两者都是「存量数据体检」，且都是
+        只读巡检。纪律：本断言集**只告警不改数据**，故 `auto_*` 在此无意义；
+        `check_paths=False` 跳过 1.1 万次 stat，`_audit.jsonl` 只读尾窗。
+        """
+        from . import conformance
+        try:
+            self.last_conformance = conformance.report_summary(self.cg)
+        except Exception as e:                              # noqa: BLE001
+            self.last_conformance = {"ok": False, "verdict": "BLINDSPOT",
+                                     "error": f"{type(e).__name__}: {e}"}
+
+# 生效条件：self.sleep_round 自增 1 后以 enabled=self.auto_sleep / merge_mode=self.sleep_merge / scrub_apply=self.sleep_scrub_apply / window=self.sleep_window / round_index=self.sleep_round 调 sleep.run_cycle(self.cg)，把 t/batch/round/candidates/merged/skipped/conflicts/九步名与其 skipped 明细/auto_sleep/merge_mode 记入 last_sleep 与 sleeps（保留最近 20 条）；auto_sleep 为假时 run_cycle 只记账不迭代；
+    def _tick_sleep(self):
+        """睡眠周期（第六档 tick）：§3.1 九步显式化 + §4.4 副本迭代与周期合并。
+
+        **只在副本上迭代**（物化 → 影子迭代 → 对账四闸 → 语义重放 + git 合并），
+        主库真源面在非合并阶段逐字节不变。四个开关全取 `md_cg/sleep.py` 的 §4.7
+        env 表真源：`MDCG_SLEEP`（总开关，缺省开）、`MDCG_SLEEP_MERGE`（缺省
+        auto＝自动走四阶段，冲突仍挂起）、`MDCG_SLEEP_WINDOW`（缺省 23:00-07:00，
+        **窗口外只记账不迭代**）、`MDCG_SLEEP_SCRUB_APPLY`（缺省 **关**——第④步
+        缺省只在副本上盘点、不落盘）。
+
+        ⑤权重刷新与衰减 / ⑥索引重建两步本轮是**显式 no-op 占位**（台账里标
+        `skipped: "未接线"`），故本轮**不动检索读数**。
+        """
+        from . import sleep as _sleep
+        self.sleep_round += 1
+        r = _sleep.run_cycle(self.cg, enabled=self.auto_sleep,
+                             merge_mode=self.sleep_merge,
+                             scrub_apply=self.sleep_scrub_apply,
+                             window=self.sleep_window,
+                             round_index=self.sleep_round)
+        steps = list(r.get("steps") or [])
+        rec = {"t": r.get("t"), "batch": r.get("batch"), "round": r.get("round"),
+               "candidates": r.get("candidates"),
+               "merged": r.get("merged"), "skipped": r.get("skipped"),
+               "conflicts": r.get("conflicts"),
+               "steps": [s.get("step") for s in steps],
+               "steps_skipped": ["%s:%s" % (s.get("step"), s.get("skipped"))
+                                 for s in steps if s.get("skipped")],
+               "auto_sleep": self.auto_sleep, "merge_mode": self.sleep_merge}
+        self.last_sleep = rec
+        with self._lock:
+            self.sleeps.append(rec)
+            self.sleeps = self.sleeps[-20:]
+
+# 生效条件：恒以 evolution_candidates(self.cg) 只读盘点并记入 last_evolve 与 evolves（保留最近 20 条）；仅当 self.auto_evolve 为真且 ev["importance_drift"]["n"] 为真时才额外执行 weights.recalc(self.cg, apply=True, actor="sustain_evolve")，其异常写入 rec["applied"]；
+    def _tick_evolve(self):
+        """演化巡检（G7）：盘点固化/重要性候选 —— 让「有能力」变成「有驱动」。
+
+        恒只读盘点并记账；`auto_evolve=True` 时才额外落盘**确定性**动作
+        （仅重要性重算，可 rollback）。固化依赖 LLM，巡检只报候补量、交人工。
+        """
+        ev = evolution_candidates(self.cg)
+        rec = {"t": ev["t"], "candidates": ev["candidates"],
+               "ccg_backlog": ev["ccg_backlog"]["n"],
+               "importance_drift": ev["importance_drift"]["n"],
+               "auto_evolve": self.auto_evolve, "applied": []}
+        if self.auto_evolve and ev["importance_drift"]["n"]:
+            from . import weights
+            try:
+                r = weights.recalc(self.cg, apply=True, actor="sustain_evolve")
+                rec["applied"].append({"fix": "importance",
+                                       "written": r["written"],
+                                       "batch": r["batch"]})
+            except Exception as e:                 # 演化失败不能拖垮常驻
+                rec["applied"].append({"fix": "importance",
+                                       "error": f"{type(e).__name__}: {e}"})
+        self.last_evolve = rec
+        with self._lock:
+            self.evolves.append(rec)
+            self.evolves = self.evolves[-20:]
+
+# 生效条件：self.scrub_round 自增后以 seed=f"sustain:{self.scrub_round}"、dry_run=not self.auto_scrub 调 scrub.sweep(self.cg)，把 t/ok/n_issues/n_high_medium/applied/already_handled/planned_dry_run/checked_breakdown/seed/dry_run 记入 last_scrub 与 scrubs（保留最近 20 条）；auto_scrub=False（默认）时 dry_run=True 只读巡检；
+    def _tick_scrub(self):
+        """记忆自净：抽查 → 联想 → 去污染 → 校准偏差。
+
+        `auto_scrub=False`（默认）时只做只读巡检并记账，不动任何节点；
+        开启后才执行去污染（仍只做可逆动作、永不删节点）。
+
+        抽样轮转（issue #66）：seed 按**轮次**派生（`scrub_round` 每 tick
+        自增）——固定 seed=0 会让每轮样本逐字相同（抽样面冻结，「老面孔」
+        长期占用名额）；库层 `scrub.sample` 的缺省 seed=0 不变（显式调用的
+        可复现性不受影响）。
+        """
+        from . import scrub
+        self.scrub_round += 1
+        seed = f"sustain:{self.scrub_round}"
+        rep = scrub.sweep(self.cg, dry_run=not self.auto_scrub, seed=seed)
+        dec = rep["decontaminate"]
+        rec = {"t": rep["t"], "ok": rep["ok"],
+               "n_issues": rep["audit"]["n_issues"],
+               "n_high_medium": rep["n_high_medium"],
+               "applied": dec["applied"],
+               # 覆盖账（issue #66）：轮读数可区分「旧面孔（名单命中跳过）」
+               # 与「本轮检查」（dry_run 轮是常驻默认下唯一的账）。
+               "already_handled": dec["already_handled"],
+               "planned_dry_run": dec["planned_dry_run"],
+               "checked_breakdown": dec["checked_breakdown"],
+               "seed": seed,
+               "dry_run": rep["dry_run"]}
+        self.last_scrub = rec
+        with self._lock:
+            self.scrubs.append(rec)
+            self.scrubs = self.scrubs[-20:]
+
+# 生效条件：先 diagnose(self.cg, name=self.name) 并将 ok 与 issues code 记入 last_diagnose；仅当 self.auto_heal 为真且 rep["ok"] 为假时才调 heal(self.cg, name=self.name)，其 actions 非空时把各 action 的 code 记入 heals（保留最近 20 条）；
+    def _tick_heal(self):
+        rep = diagnose(self.cg, name=self.name)
+        self.last_diagnose = {"t": time.time(), "ok": rep["ok"],
+                              "issues": [i["code"] for i in rep["issues"]]}
+        if not (self.auto_heal and not rep["ok"]):
+            return
+        # 常驻循环才开 repeat_guard（同因不重试 + 退避）：手动 op=sustain action=heal
+        # 不受影响；heal_interval 用作退避基准。
+        res = heal(self.cg, name=self.name,
+                   heal_interval=self.heal_interval, repeat_guard=True)
+        if res["actions"]:
+            with self._lock:
+                self.heals.append({
+                    "t": res["t"],
+                    "actions": [a["code"] for a in res["actions"]],
+                    # 没修好的（含重复失败被拦下的）单列，免得「动作跑了」被读成
+                    # 「修好了」——审计行同口径。
+                    "failed": [a["code"] for a in res["actions"]
+                               if a.get("ok") is False]})
+                self.heals = self.heals[-20:]
+
+    # ---- 状态 ----
+
+# 生效条件：以 read_stamp(self.name, self.d) 判定 state（有戳走 judge(age, interval=self.beat_interval, task_running=...)，无戳为 "stopped"）；进度面（issue #63）同进程内存优先、跨进程回落戳内字段，current_tick 附 running_s（已运行秒数）；stale_tick 在 current_tick 年龄超 max(2×该档 interval, 1800s) 时给出告警（含档名与时长）；返回含 name/running/pid/uptime（无 _started_at 时为 0.0）/beats/last_beat/各 interval 与 auto_* 开关/heals[-5:]/evolves[-5:]/tidys[-5:]/current_tick/last_tick_done/last_tick_error/stale_tick/peers(self.d)/ledger.summary() 的 dict；
+    def status(self) -> dict:
+        st = read_stamp(self.name, self.d)
+        state = (judge(st["age"], interval=self.beat_interval,
+                       task_running=bool(st.get("task_running")))
+                 if st else "stopped")
+        # 进度面（issue #63）：同进程内存优先（最实时），跨进程回落戳内字段
+        # ——戳是**既有状态面**（不造第二套状态文件）；外部 `action=beat`
+        # 覆盖戳时内存侧不受影响。
+        cur = self.current_tick or (st or {}).get("current_tick")
+        if isinstance(cur, dict):
+            cur = dict(cur)
+            try:
+                cur["running_s"] = round(max(
+                    0.0, time.time() - float(cur.get("started_at") or 0.0)), 1)
+            except (TypeError, ValueError):
+                cur["running_s"] = None
+        last_done = self.last_tick_done or (st or {}).get("last_tick_done")
+        last_err = self.last_tick_error or (st or {}).get("last_tick_error")
+        return {"name": self.name, "running": bool(self._th
+                                                   and self._th.is_alive()),
+                "pid": os.getpid(),
+                "uptime": round(time.time() - self._started_at, 3)
+                if self._started_at else 0.0,
+                "beats": self.beats, "last_beat": self.last_beat,
+                "beat_interval": self.beat_interval,
+                "heal_interval": self.heal_interval,
+                "auto_heal": self.auto_heal, "state": state,
+                "task_running": self.task_running,
+                "last_diagnose": self.last_diagnose,
+                "heals": self.heals[-5:],
+                "scrub_interval": self.scrub_interval,
+                "auto_scrub": self.auto_scrub,
+                "last_scrub": self.last_scrub,
+                "evolve_interval": self.evolve_interval,
+                "auto_evolve": self.auto_evolve,
+                "last_evolve": self.last_evolve,
+                "evolves": self.evolves[-5:],
+                "last_tidy": self.last_tidy,
+                "tidys": self.tidys[-5:],
+                "sleep_interval": self.sleep_interval,
+                "auto_sleep": self.auto_sleep,
+                "sleep_merge": self.sleep_merge,
+                "sleep_window": self.sleep_window,
+                "sleep_scrub_apply": self.sleep_scrub_apply,
+                "last_sleep": self.last_sleep,
+                "sleeps": self.sleeps[-5:],
+                "last_conformance": self.last_conformance,
+                # 活体进度面（issue #63）：此刻在哪档 / 上一档完成 / 上一档错误
+                # / 超限告警（只上报，不杀线程）。
+                "current_tick": cur,
+                "last_tick_done": last_done,
+                "last_tick_error": last_err,
+                "stale_tick": self._stale_tick(cur),
+                "peers": peers(self.d),
+                "sessions": self.ledger.summary()}
+
+
+_LOOPS = {}
+_LOOPS_LOCK = threading.Lock()
+
+
+# 生效条件：cg 必填，以 (os.path.abspath(cg.root), name) 为键在模块级 _LOOPS 中复用已有实例或新建 SustainLoop 并返回该实例。
+def ensure_loop(cg, name: str = "md_cg", **kw) -> SustainLoop:
+    """按 (root, name) 复用同一个常驻循环（避免重复线程 / 重复戳）。"""
+    key = (os.path.abspath(cg.root), name)
+    with _LOOPS_LOCK:
+        lp = _LOOPS.get(key)
+        if lp is None:
+            lp = SustainLoop(cg, name=name, **kw)
+            _LOOPS[key] = lp
+        return lp
+
+
+# 生效条件：cg 必填，返回 _LOOPS[(os.path.abspath(cg.root), name)]，该键未登记时返回 None。
+def get_loop(cg, name: str = "md_cg"):
+    return _LOOPS.get((os.path.abspath(cg.root), name))
+
+
+# 生效条件：模块级 _LOOPS 非空时清空该表并对每个循环调用 stop()（异常被吞），无返回值。
+def stop_all():
+    """测试 / 进程退出用：停掉本进程创建的所有常驻循环。"""
+    with _LOOPS_LOCK:
+        loops = list(_LOOPS.values())
+        _LOOPS.clear()
+    for lp in loops:
+        try:
+            lp.stop()
+        except Exception:
+            pass
+
+
+# 生效条件：以 read_stamp(name) 有戳时返回 heartbeat={'age': round(st["age"],1), 'state': judge(...), 'pid', 'task_running'}、无戳时 {'state':'absent'}，loop 取 get_loop(cg, name) 有值时给 running/beats/state、无值时 {'running': False}，并附带 SessionLedger(cg.root).summary()、scrub_summary(cg)、evolve_summary(cg)、provenance_summary(cg)；
+def summary(cg, name: str = "md_cg") -> dict:
+    """并入 health_os 的轻量摘要（只读戳与计数，不做巡检）。"""
+    st = read_stamp(name)
+    lp = get_loop(cg, name)
+    return {
+        "heartbeat": ({"age": round(st["age"], 1),
+                       "state": judge(st["age"],
+                                      task_running=bool(st.get("task_running"))),
+                       "pid": st.get("pid"),
+                       "task_running": bool(st.get("task_running"))}
+                      if st else {"state": "absent"}),
+        "loop": ({"running": bool(lp._th and lp._th.is_alive()),
+                  "beats": lp.beats, "state": lp.status()["state"]}
+                 if lp else {"running": False}),
+        "sessions": SessionLedger(cg.root).summary(),
+        "scrub": scrub_summary(cg),
+        "evolve": evolve_summary(cg),
+        "provenance": provenance_summary(cg),
+    }
+
+
+# 生效条件：cg 必填，可导入 provenance 且其 summary(cg) 调用成功时返回该摘要，异常时返回 {}。
+def provenance_summary(cg) -> dict:
+    """派生溯源摘要（G8，只读；失败不抛，避免拖垮 health_os）。"""
+    try:
+        from . import provenance as _pv
+        return _pv.summary(cg)
+    except Exception:                     # noqa: BLE001
+        return {}
+
+
+# 生效条件：cg 必填，evolution_candidates(cg, top=3) 成功时返回 candidates/ccg_backlog/importance_drift 计数摘要，异常时返回 {}。
+def evolve_summary(cg) -> dict:
+    """演化巡检摘要（只读；失败不抛，避免拖垮 health_os）。"""
+    try:
+        ev = evolution_candidates(cg, top=3)
+        return {"candidates": ev["candidates"],
+                "ccg_backlog": ev["ccg_backlog"]["n"],
+                "importance_drift": ev["importance_drift"]["n"],
+                "proxy": True}
+    except Exception:                     # noqa: BLE001
+        return {}
+
+
+# 生效条件：cg 必填，可导入 scrub 且其 summary(cg) 调用成功时返回该摘要，异常时返回 {}。
+def scrub_summary(cg) -> dict:
+    """记忆自净摘要（惰性导入，避免模块加载顺序耦合）。"""
+    try:
+        from . import scrub
+        return scrub.summary(cg)
+    except Exception:                     # noqa: BLE001
+        return {}

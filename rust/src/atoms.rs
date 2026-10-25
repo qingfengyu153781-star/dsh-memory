@@ -1,0 +1,343 @@
+//! 批次 15：query 统一归一层——与 `md_cg/semantic/unify.py` 同口径。
+//!
+//! 使用者口径定案（2026-09-23）：**统一翻译为中文 → 归一化到标准中文集 →
+//! 检索**。任何语言 query 先归一为标准原子序列（空格 join）再进检索各路。
+//!
+//! **作用域收窄（2026-09-30 使用者裁定）**：只对**英文内容**做翻译归一，
+//! 中文内容原样不动——query 先按中文段/非中文段切开，中文段逐字保留、
+//! 绝不送 `segment`；只有非中文段里的英文进归一链路。旧口径「含任一 ASCII
+//! 字母即整条归一」会把中夹英 query 的中文部分逐字切开（「自我接纳」→
+//! 「自 我 接 纳」），实测 locomo-zh-500 公开题池 500 题词法 hit@1
+//! 94.4%→95.8%（lexical,fuzzy 87.2%→96.6%）。
+//!
+//! 词表真源单侧化：en→zh 映射与 segment 键集由 Python 侧导出
+//! （`md_cg/semantic/export_en_zh_map.py` → `en_zh_map.json`，28478 词 +
+//! 204 标准原子），本模块**只查表不维护词典**——杜绝双词表版本漂移。
+//!
+//! 对齐细节：
+//!   - en 形态归一复用 `text::normalize_en`（小写+停用词+strip_tense_en，
+//!     已有 golden 对齐测试）——查表键 = strip 后原形（tests→test）；
+//!   - segment = 贪心最长匹配（键长降序，未命中单字符保留），对齐
+//!     `zh_en_atoms.segment`；
+//!   - 无字母 query 原样返回（纯中文经 bigrams 去空白后与原文等价）；
+//!   - 分段判据单点 = `crate::text::is_zh`（CJK 基本区 U+4E00–U+9FFF，与
+//!     Python `canonical.is_zh_char` 同判据）：中文段逐字保留、不送 segment；
+//!   - 未登录词原样保留（unknown_keep，词表边界非错误）。
+//!
+//! 载入：env `MDCG_EN_ZH_MAP` 指向 en_zh_map.json（缺省探测仓库相对路径
+//! `md_cg/semantic/en_zh_map.json`）；两处都没有 → None（归一层静默不
+//! 生效，与 Python 失败降级同风格）。
+//!
+//! 开关三态（2026-09-30 使用者裁定：**缺省由「未设=开」翻为「未设=关」**，
+//! 与 Python `semantic/unify.py::unify_on` 的 `== "1"` 逐位同语义）：
+//!
+//! | MDCG_UNIFY_QUERY | 本函数 | Python `unify_on()` |
+//! |---|---|---|
+//! | 未设 | `None`（不载入） | `False` |
+//! | `"0"` | `None`（不载入） | `False` |
+//! | `"1"` | `Some(Atoms)`（载入） | `True` |
+//!
+//! 定因：本层本职是让**英文** query 命中中文节点，对中文检索池是**纯开销**
+//! ——locomo-zh-500 公开题池（池 567 / 题 500）缺省关态 lexical hit@1 96.4% /
+//! lexical+fuzzy 97.2%，开态 95.8% / 96.6%（各跑两遍逐位相同）。显式 `=1`
+//! 仍能开回（英文对照路要用）。
+
+use crate::json::Json;
+use crate::text::normalize_en;
+use std::collections::HashMap;
+use std::path::Path;
+
+/// 标准原子词表 + en→zh 映射（进程内共享，`Clone` 廉价——Arc 语义由
+/// `Engine.atoms: Option<Atoms>` 单点持有即可，引擎本身不可变共享）。
+#[derive(Debug, Clone)]
+pub struct Atoms {
+    /// segment 贪心匹配键（长度降序；多字键优先防前缀吞并）。
+    zh_sorted: Vec<String>,
+    /// en 小写词（strip 后原形）→ 中文原子串。
+    en2zh: HashMap<String, String>,
+}
+
+impl Atoms {
+    /// 从 en_zh_map.json 载入（Python 导出器产出）。
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| format!("读 {} 失败: {}", path.display(), e))?;
+        let j = crate::json::parse(&raw)?;
+        let zh_sorted = {
+            let mut keys: Vec<String> = j
+                .get("zh_keys")
+                .and_then(Json::as_arr)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Json::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            keys.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
+            keys
+        };
+        let en2zh = j
+            .get("map")
+            .and_then(Json::as_obj)
+            .map(|pairs| {
+                pairs
+                    .iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        if zh_sorted.is_empty() || en2zh.is_empty() {
+            return Err(format!("{} 缺 zh_keys/map 段", path.display()));
+        }
+        Ok(Self { zh_sorted, en2zh })
+    }
+
+    /// env/缺省路径探测（`None` = 归一层不生效）。
+    ///
+    /// 生效条件：`MDCG_UNIFY_QUERY` **未设或取值不为 "1"** 时无条件返回 None
+    /// （缺省关，2026-09-30 使用者裁定；唯一开态 = 显式 "1"，与 Python
+    /// `unify_on()` 的 `== "1"` 逐位同语义——未设 / "0" / 其它取值一律关）；
+    /// 否则 `MDCG_EN_ZH_MAP` 显式指路即用该路径；未指路时——
+    /// **未启用 `no-probe` 特征**（缺省）走 `CARGO_MANIFEST_DIR` 的上级仓库
+    /// 相对路径探测（`../md_cg/semantic/en_zh_map.json`，文件存在才取）；
+    /// **启用 `no-probe` 特征**（`cargo build --features no-probe`）时该探测
+    /// 整体短路为 None——用于只打包二进制、不携带仓库词表的部署，避免把
+    /// 构建机的绝对路径当成运行期约定。两条分支都保留在源码里，靠 cfg 选一。
+    ///
+    /// R-6（2026-09-29）：本函数的两个 `#[cfg(feature = "no-probe")]` 分支此前
+    /// 在该 crate 的 `Cargo.toml` 里**未声明对应特征** ⇒ 每次构建刷 2 条
+    /// `unexpected cfg condition value: no-probe` 告警，且 `feature` 分支恒不可达
+    /// （死代码）。修复=在 `Cargo.toml` 声明 `[features] no-probe = []`（保留能力，
+    /// 不删分支；理由见该文件注释），构建告警归零。
+    pub fn from_env() -> Option<Self> {
+        // 三态判据（2026-09-30 使用者裁定：缺省由「未设=开」翻为「未设=关」）：
+        // 唯一开态 = 显式 `MDCG_UNIFY_QUERY=1`；未设 / `"0"` / 其它取值一律
+        // 不载入。与 Python `md_cg/semantic/unify.py::unify_on`（`== "1"`）
+        // 逐位同语义——两侧对「未设 / "0" / "1"」三态判定必须一致。
+        if std::env::var("MDCG_UNIFY_QUERY").as_deref() != Ok("1") {
+            return None; // 未设（缺省关）/ 显式 "0" / 非 "1"：归一层不生效
+        }
+        let p = std::env::var("MDCG_EN_ZH_MAP").ok().map(PathBuf::from).or_else(|| {
+            // 缺省：CARGO_MANIFEST_DIR 的上级仓库相对路径（评测器与仓库同仓场景）
+            #[cfg(not(feature = "no-probe"))]
+            {
+                let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../md_cg/semantic/en_zh_map.json");
+                p.is_file().then_some(p)
+            }
+            #[cfg(feature = "no-probe")]
+            None
+        })?;
+        match Self::load(&p) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                eprintln!("[mcdg-eval] 统一归一层载入失败，退化为无归一口径: {e}");
+                None
+            }
+        }
+    }
+
+    /// 贪心最长匹配（对齐 `zh_en_atoms.segment`）：命中键消费，未命中单
+    /// 字符保留；返回空格 join 的原子序列。
+    pub fn segment(&self, text: &str) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out: Vec<String> = Vec::new();
+        let mut pos = 0usize;
+        while pos < chars.len() {
+            let mut matched = false;
+            for key in &self.zh_sorted {
+                let kc: Vec<char> = key.chars().collect();
+                if kc.is_empty() || pos + kc.len() > chars.len() {
+                    continue;
+                }
+                if chars[pos..pos + kc.len()] == kc[..] {
+                    out.push(key.clone());
+                    pos += kc.len();
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                out.push(chars[pos].to_string());
+                pos += 1;
+            }
+        }
+        out.join(" ")
+    }
+
+    /// 统一归一（对齐 `unify_query`）：无 ASCII 字母原样；否则按「中文段 /
+    /// 非中文段」切分——**中文段逐字保留、绝不送 segment**（2026-09-30 使用者
+    /// 裁定收窄作用域：只对英文内容做翻译归一，中文内容原样不动），含 ASCII
+    /// 字母的非中文段走 en 归一→查表→segment，不含 ASCII 字母的非中文段
+    /// （数字/标点）折空白后原样保留。各段按原顺序单空格 join；**归一产物为空
+    /// （折空白后）则回退原入参本身（不 trim）**——与 Python `unify_query` 的
+    /// `return text` 逐位同语义（乙1：此前误为 `query.trim()`，两侧对含首尾
+    /// 空白的空产物入参不一致；fixture「空产物回退」例钉两侧逐位相同）。
+    ///
+    /// 中文判据单点 = `crate::text::is_zh`（U+4E00–U+9FFF），与 Python
+    /// `md_cg/semantic/canonical.py::is_zh_char` 同判据；逐位对拍 fixture =
+    /// `md_cg/semantic/unify_fixture.json`（Python 守卫 `md_cg/test_unify_scope.py`
+    /// 与下方 `unify_mixed_fixture_matches_python` 单测钉同一份期望值）。
+    pub fn unify(&self, query: &str) -> String {
+        if !query.chars().any(|c| c.is_ascii_alphabetic()) {
+            return query.to_string();
+        }
+        let mut parts: Vec<String> = Vec::new();
+        let mut cur: Option<bool> = None; // 当前段是否中文段；None = 尚无段
+        let mut buf = String::new();
+        for c in query.chars() {
+            let z = crate::text::is_zh(c);
+            if let Some(prev) = cur {
+                if prev != z {
+                    parts.push(self.unify_run(&buf));
+                    buf.clear();
+                }
+            }
+            cur = Some(z);
+            buf.push(c);
+        }
+        if !buf.is_empty() {
+            parts.push(self.unify_run(&buf));
+        }
+        let joined = parts
+            .iter()
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .collect::<Vec<String>>()
+            .join(" ");
+        if joined.trim().is_empty() {
+            // 回退原入参（不 trim）——对齐 Python `unify_query` 尾行 `return text`
+            // （text 为未 strip 的原入参）。取 `query` 而非 `query.trim()` 是
+            // 2026-09-30 清理批次乙1 的定点修正。
+            query.to_string()
+        } else {
+            joined
+        }
+    }
+
+    /// 段内归一：**不含 ASCII 字母的段**（中文段 / 数字 / 标点）折空白后原样；
+    /// 含 ASCII 字母的段走既有链路（`normalize_en` → `en2zh` 查表 → `segment`），
+    /// 返回空格 join 的原子/保留词序列。中文段不在此分支（已由 `unify` 切走），
+    /// 故中文段结构性不可能经过 `segment`。
+    fn unify_run(&self, run: &str) -> String {
+        if !run.chars().any(|c| c.is_ascii_alphabetic()) {
+            return run.split_whitespace().collect::<Vec<&str>>().join(" ");
+        }
+        let base = normalize_en(run); // 小写+停用词+strip_tense+中文保留
+        let mut out: Vec<String> = Vec::new();
+        for word in base.split_whitespace() {
+            // 单字母词（I）经 normalize_en 原样保留大写——查表一律 lower
+            // （en_zh_map 键全小写；对齐 Python 链 i→我）
+            if let Some(zh) = self.en2zh.get(&word.to_lowercase()) {
+                let seg = self.segment(zh);
+                if !seg.is_empty() {
+                    out.push(seg);
+                    continue;
+                }
+            }
+            // 未登录词原样（unknown_keep）；非 ASCII 词走 segment——中文段
+            // 已被 `unify` 切走，此处只剩全角标点/其它文种（非中文段走既有
+            // 链路，保留原分支语义）
+            if word.chars().any(|c| !c.is_ascii()) {
+                let seg = self.segment(word);
+                if !seg.is_empty() {
+                    out.push(seg);
+                    continue;
+                }
+            }
+            out.push(word.to_string());
+        }
+        out.join(" ")
+    }
+}
+
+use std::path::PathBuf;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn atoms() -> Atoms {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../md_cg/semantic/en_zh_map.json");
+        Atoms::load(&p).expect("en_zh_map.json 可载入（仓库内相对路径）")
+    }
+
+    #[test]
+    fn unify_en_to_zh_atoms() {
+        let a = atoms();
+        // 与 Python unify_query 冒烟同例：跨语归一生效（「牛肉」为
+        // ZH_EN 整键，segment 整词消费——两侧逐位同形）
+        assert_eq!(a.unify("I eat beef yesterday"), "我 吃 牛肉 昨天");
+        assert_eq!(a.unify("wrote"), "写");
+        assert_eq!(a.unify("compiler tests"), "编 辑 家 测 试");
+    }
+
+    #[test]
+    fn unify_pure_zh_untouched() {
+        let a = atoms();
+        assert_eq!(a.unify("蜂群调度 依赖门禁"), "蜂群调度 依赖门禁");
+    }
+
+    #[test]
+    fn segment_greedy_longest() {
+        let a = atoms();
+        // 「牛肉」若为单键则整词消费；否则拆「牛 肉」——与 Python segment 同序
+        let seg = a.segment("牛肉面");
+        assert!(seg == "牛肉 面" || seg == "牛 肉 面", "贪心口径: {seg}");
+    }
+
+    /// 混合 query 逐位对拍 fixture（作用域收窄，2026-09-30）：**与 Python 守卫
+    /// `md_cg/test_unify_scope.py` 同源**——两侧都取自 `md_cg/semantic/unify_fixture.json`
+    /// （本测试经 include_str! 编译期嵌入同一份文件，Python 侧运行时读它），
+    /// 期望值逐位相同。两处定点变异在此必红：①作用域改回「整条归一」
+    /// （纯中/中夹英的中文段被切开）；②中文段也送 segment。
+    #[test]
+    fn unify_mixed_fixture_matches_python() {
+        let a = atoms();
+        let raw = include_str!("../../md_cg/semantic/unify_fixture.json");
+        let j = crate::json::parse(raw).expect("unify_fixture.json 可解析");
+        let cases = j
+            .get("cases")
+            .and_then(Json::as_arr)
+            .expect("unify_fixture.json 含 cases 数组");
+        assert!(cases.len() >= 12, "fixture 用例数须 >= 12：{}", cases.len());
+        // 收集式断言（非首条即 panic）：定点变异后「红了几例」可直接数出
+        let mut bad: Vec<String> = Vec::new();
+        for c in cases {
+            let name = c.get("name").and_then(Json::as_str).unwrap_or("?");
+            let inp = c.get("in").and_then(Json::as_str).unwrap_or("");
+            let want = c.get("out").and_then(Json::as_str).unwrap_or("");
+            let got = a.unify(inp);
+            if got != want {
+                bad.push(format!("{name}: in={inp:?} got={got:?} want={want:?}"));
+            }
+        }
+        assert!(bad.is_empty(), "fixture 逐位不符 {} 例: {bad:?}", bad.len());
+    }
+
+    // ---- R-6（2026-09-29）：no-probe 特征声明后两条 cfg 分支都可编译 ----
+    //
+    // 缺省构建（未启用 no-probe）：`from_env` 的缺省路径探测分支在位。
+    // 断言形式=「该 cfg 分支下的代码确实被编进本次构建」——`cargo test` 与
+    // `cargo test --features no-probe` 两条构建各跑一个，两者必须都通过。
+    #[cfg(not(feature = "no-probe"))]
+    #[test]
+    fn r6_probe_branch_is_active_by_default() {
+        assert!(!cfg!(feature = "no-probe"), "缺省构建不得带 no-probe");
+        // 探测分支确实在编译单元内（能取到 CARGO_MANIFEST_DIR 派生的候选路径）
+        let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../md_cg/semantic/en_zh_map.json");
+        assert!(p.to_string_lossy().ends_with("en_zh_map.json"));
+    }
+
+    #[cfg(feature = "no-probe")]
+    #[test]
+    fn r6_no_probe_branch_is_active_under_feature() {
+        // 启用 no-probe 时同一编译单元里该分支可达（特征已声明 ⇒ 不是死 cfg）。
+        // 本用例**只在该特征构建下被编译并执行**——它通过即证明该 cfg 名已被
+        // Cargo 认知（未声明特征的 cfg 分支在此构建里根本进不来，且缺省构建会
+        // 刷 unexpected_cfgs 告警，见 Cargo.toml 注释）。
+        assert!(cfg!(feature = "no-probe"), "带 --features no-probe 构建应置位");
+    }
+}

@@ -1,0 +1,21 @@
+# 换行归一（仓库级）
+#
+# 为什么需要：认知图行号 pre-commit 钩子（scripts/git-hooks/pre-commit）是 sh 脚本，
+# 必须为 LF——CRLF 会让 shebang 变成 `#!/bin/sh\r`，报 `\r: command not found` 而静默失效。
+# 本机 / 多数 Windows 环境 core.autocrlf=true，checkout 会把文本转成 CRLF，
+# 故须在此显式钉死该目录的行尾，否则钩子在 clone 后不可用。
+scripts/git-hooks/* text eol=lf
+
+# 同理：仓库内所有 sh 脚本都必须 LF——它们要么在 Linux 容器里跑
+# （scripts/linux_verify.sh / verify_linux.sh / verify_linux_node.sh，
+# 由 README 的发版门禁命令直接挂载工作树执行），要么是宿主侧脚本。
+# 2026-09-28 实证：一次编辑器改写把 linux_verify.sh 变成 CRLF，容器内立刻
+# `set: -^M: invalid option` + `syntax error near unexpected token '$'\r''`，
+# 整条 Linux 验证腿在第一步就退出——而本机（autocrlf=true）看不出来。
+*.sh text eol=lf
+
+# 同理（PR #47 跟进，2026-10-03）：GitHub Actions 工作流等 yml 文件也钉 LF——
+# 贡献者环境差异会把 yml 带成 CRLF 混合（实证：PR #47 的 python-tests.yml 索引层
+# 32 CRLF / 11 LF），跨平台一致性与 diff 噪声都要求归一。
+*.yml text eol=lf
+*.yaml text eol=lf

@@ -1,0 +1,190 @@
+"""
+analyzer.py · 分析器（第六阶段 C4）：字节码可读转储
+中文源码/.pbc → 可读指令列表（地址+指令+参数）——开发者工具链。
+"""
+
+
+# 生效条件：code 为可解包为 (op, arg) 二元组的可迭代序列（空序列返回空列表）时，逐项产出「序号 名称 参数」字符串列表，op 具 name 属性取 op.name、否则取 str(op)。
+def bytecode_dump(code):
+    """字节码（枚举/字符串 op）→ 可读指令列表"""
+    lines = []
+    for i, (op, arg) in enumerate(code):
+        name = op.name if hasattr(op, "name") else str(op)
+        lines.append(f"{i:4d}  {name:14s} {arg}")
+    return lines
+
+
+# 生效条件：source 与 strict（默认 False，原样透传）交给 compile_source，返回的 result["ok"] 为假值（False/0/空）时得 (None, result)，为真值时得 (bytecode_dump(code), result)。
+def analyze_source(source, strict=False):
+    """中文源码 → 字节码转储（分析器入口）"""
+    from .compiler import compile_source
+    code, result = compile_source(source, strict=strict)
+    if not result["ok"]:
+        return None, result
+    return bytecode_dump(code), result
+
+
+# 生效条件：path 不做任何前置校验（None/空串等假值同样透传）直接交给 load_pbc，返回 bytecode_dump(load_pbc(path))。
+def analyze_pbc(path):
+    """.pbc 文件 → 字节码转储"""
+    from .pbc import load_pbc
+    return bytecode_dump(load_pbc(path))
+
+
+if __name__ == "__main__":
+    print("=== C4：分析器（字节码可读转储）===\n")
+    src = """术曰：
+1。道 新信任路径；
+2。德 0.3；
+3。止。
+"""
+    lines, r = analyze_source(src)
+    if r["ok"]:
+        for ln in lines:
+            print(f"  {ln}")
+        print(f"\n=== 判定 ===\n分析器: {'✔ 字节码可读转储' if lines else '✘'}")
+
+
+# ============ T11 · 分析器完整化（F3 符号表 / F4 调用图 / F5 数据流） ============
+
+# 生效条件：node 不为 None 时先把 node 追加进 out，再对 children/body/then_body/else_body/statements/left/right/value_node/value 字段（值为 list 逐项、非 list 视作单项）及真值 args 中带 type 属性的项递归；node 为 None 时直接返回且不改动 out。
+def _walk(node, out):
+    """递归收集 AST 节点（children 与已知子节点字段）"""
+    if node is None:
+        return
+    out.append(node)
+    for k in ("children", "body", "then_body", "else_body",
+              "statements", "left", "right", "value_node", "value"):
+        v = getattr(node, k, None)
+        if v is None:
+            continue
+        items = v if isinstance(v, list) else [v]
+        for item in items:
+            if hasattr(item, "type"):
+                _walk(item, out)
+    args = getattr(node, "args", None)
+    if args:
+        for a in args:
+            if hasattr(a, "type"):
+                _walk(a, out)
+
+
+# 生效条件：ast 为 None 时 visit 早退，函数返回初始 symbols={"variables":{},"functions":{}}；否则递归遍历，type.name=="FUNC_DEF" 时以 getattr(node,"name","") 为键、params 取 getattr(node,"params",[]) or []（假值回落 []）存入 functions，type.name=="ASSIGN_STMT" 时以 getattr(node,"target","") 为键（空串也记录）存入 variables，值为 value_node 为 None 时的 "unknown" 或 infer(value_node) 的返回，其余节点仅递归不记录；
+def symbol_table(ast) -> dict:
+    """F3 符号表转储：变量（赋值目标+函数参数）与函数签名完整视图。
+
+    生效条件：ast 为 ProgramNode
+    子功能：① 收集赋值目标变量 ② 收集函数名与参数 ③ 类型推断（数值/文本）
+    执行：递归遍历 + 类型推断（字面量数值→number、引号→string）
+    不适用条件：宏/元编程结构不在静态分析范围
+    """
+    symbols = {"variables": {}, "functions": {}}
+
+# 生效条件：node 的 literal_value 属性（getattr 缺省为 None）为 int/float（含 bool）时返回 "number"，为 str 时返回 "string"，其余（含属性缺失/None/其他类型）返回 "unknown"；
+    def infer(node):
+        v = getattr(node, "literal_value", None)
+        if isinstance(v, (int, float)):
+            return "number"
+        if isinstance(v, str):
+            return "string"
+        return "unknown"
+
+    def visit(node):
+        if node is None:
+            return
+        t = getattr(node, "type", None)
+        nt = t.name if t is not None else ""
+        if nt == "FUNC_DEF":
+            params = getattr(node, "params", []) or []
+            symbols["functions"][getattr(node, "name", "")] = {
+                "params": params}
+        elif nt == "ASSIGN_STMT":
+            target = getattr(node, "target", "")
+            val = getattr(node, "value_node", None)
+            vtype = infer(val) if val is not None else "unknown"
+            symbols["variables"][target] = vtype
+        for k in ("children", "body", "then_body", "else_body",
+                  "left", "right", "value_node", "value"):
+            v = getattr(node, k, None)
+            if hasattr(v, "type"):
+                visit(v)
+            elif isinstance(v, list):
+                for item in v:
+                    if hasattr(item, "type"):
+                        visit(item)
+
+    visit(ast)
+    return symbols
+
+
+# 生效条件：ast 从 current=None 起递归，遇 FUNC_DEF 把 current 换成该函数名并 graph.setdefault(name, [])，仅当 current 为真值且 callee（CALL_EXPR 的 name）未在 graph[current] 中时追加 callee，返回 graph。
+def call_graph(ast) -> dict:
+    """F4 调用图：函数名 → [被调用的函数名]（含主程序段调用）。"""
+    graph = {}
+
+    def visit(node, current):
+        if node is None:
+            return
+        t = getattr(node, "type", None)
+        nt = t.name if t is not None else ""
+        if nt == "FUNC_DEF":
+            current = getattr(node, "name", "")
+            graph.setdefault(current, [])
+        if nt == "CALL_EXPR":
+            callee = getattr(node, "name", "")
+            if current and callee not in graph.setdefault(current, []):
+                graph[current].append(callee)
+        for k in ("children", "body", "then_body", "else_body",
+                  "left", "right", "value_node", "value"):
+            v = getattr(node, k, None)
+            if hasattr(v, "type"):
+                visit(v, current)
+            elif isinstance(v, list):
+                for item in v:
+                    if hasattr(item, "type"):
+                        visit(item, current)
+
+    visit(ast, None)
+    return graph
+
+
+# 生效条件：ast 为 None 时 visit 早退，函数返回初始空 chains {}；否则递归遍历，type.name=="ASSIGN_STMT" 且 getattr(node,"target","") 为真值时对 chains[target]["def"] 增 1，type.name=="IDENTIFIER" 且 getattr(node,"value","") 为真值时对 chains[name]["use"] 增 1，返回变量到 {"def": 次数, "use": 次数} 的 chains，其余节点仅递归不记录；
+def def_use_chains(ast) -> dict:
+    """F5 数据流：变量 → {'def': 次数, 'use': 次数}（定义-使用链统计）。"""
+    chains = {}
+
+    def visit(node):
+        if node is None:
+            return
+        t = getattr(node, "type", None)
+        nt = t.name if t is not None else ""
+        if nt == "ASSIGN_STMT":
+            target = getattr(node, "target", "")
+            if target:
+                chains.setdefault(target, {"def": 0, "use": 0})
+                chains[target]["def"] += 1
+        if nt == "IDENTIFIER":
+            name = getattr(node, "value", "")
+            if name:
+                chains.setdefault(name, {"def": 0, "use": 0})
+                chains[name]["use"] += 1
+        for k in ("children", "body", "then_body", "else_body",
+                  "left", "right", "value_node", "value"):
+            v = getattr(node, k, None)
+            if hasattr(v, "type"):
+                visit(v)
+            elif isinstance(v, list):
+                for item in v:
+                    if hasattr(item, "type"):
+                        visit(item)
+
+    visit(ast)
+    return chains
+
+
+# 生效条件：传入 ast，返回仅含 'symbol_table'、'call_graph'、'def_use_chains' 三键的字典，各值分别以同一 ast 调用 symbol_table/call_graph/def_use_chains 得到。
+def full_analysis(ast) -> dict:
+    """三合一：F3 符号表 + F4 调用图 + F5 数据流。"""
+    return {"symbol_table": symbol_table(ast),
+            "call_graph": call_graph(ast),
+            "def_use_chains": def_use_chains(ast)}

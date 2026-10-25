@@ -1,0 +1,139 @@
+# @furongjun1999/dsh-memory 插件配置示例
+# 复制到 DSH profile 的 cordis.patch.yml（或 cordis.yml）启用
+#
+# 说明：
+# - !!js process.env.X 语法在加载期求值，密钥不入库
+# - 记忆写入路径（下面 mdcg.root）默认落在**用户级状态根**（~/.dsh/.dsh-memory/data），
+#   与进程 cwd、**插件包目录**都解耦——历史事故①：cwd 落在别的仓时相对路径会把
+#   记忆真源写偏；事故②：默认曾锚定插件包内 data/，而 pnpm 更新包会整目录替换，
+#   包内数据每次更新成功即被删掉（详见 src/lib/datapath.ts 头注）。目录不存在会
+#   自动创建。想换位置有三种方式（优先级由高到低）：
+#     ① 环境变量 MDCG_DATA_ROOT（数据根）/ MDCG_ROOT（认知图根）
+#     ② 编辑 <用户级状态根>/paths.json 的 "data_root" / "root"
+#        （旧版包内 data/paths.json 仍兼容读，但会被下次 pnpm 更新删除）
+#     ③ 本文件的 mdcg.root（填绝对路径或相对插件仓的路径）
+#   查当前解析结果（解释器按平台：Windows python / Linux·macOS python3，下同）：
+#     python md_cg/datapath.py
+#   旧版数据迁移：包内 data/ 仍有内容时，插件首启会**复制**（不删除）到用户级根；
+#   也可手动执行 python md_cg/datapath.py --migrate-legacy
+
+- id: furongjun1999-dsh-memory
+  name: '@furongjun1999/dsh-memory'
+  config:
+    # 工具命名空间：Agent 看到的工具名是 cg / stg（记忆面已基元化）
+    serverName: 'lingshu'
+
+    # ⚠️ 遗留项：SQLite 库文件路径（经环境变量 AEIS_DB 传给子进程）。
+    # 大脑真源已统一到 md_cg 认知图（见下面的 mdcg 块）；此项现仅供角色
+    # 数据目录 roleDataDir（由它的父目录推导）使用，**不再存记忆**，
+    # md_cg server 也不读取它。
+    dbPath: 'data/lingshu.db'
+
+    # 灵枢身份标识
+    identity: '灵枢'
+
+    # Python 与启动参数（默认即可；md_cg 随插件自带，无需 pip 安装第三方包）
+    # 解释器**无需配置**：默认按平台自动选——Windows → python，Linux/macOS → python3。
+    # 为什么不能照抄 'python'（issue #19）：Linux/macOS 发行版按 PEP 394 只提供
+    # python3（这是默认状态，不是环境损坏），写死 python 会让桥 spawn ENOENT，
+    # 重试 8 次后进终态——插件看起来装好了，但工具不注册、记忆永不落盘且不自愈。
+    # 解释器名特殊（如 python3.12）时：在此显式配置，或设环境变量 MDCG_PYTHON
+    # （优先级：config.python > env MDCG_PYTHON > 平台默认）。
+    # python: 'python'
+    # 大脑进程：md_cg（主仓自带，不再依赖 pip aeis）
+    moduleArgs: ['-m', 'md_cg.mcp_server']
+
+    # 暴露的工具集合：'core'（默认，仅 cg/stg 两基元）| 'brain' | 'all' | 自定义数组
+    # 进程侧 MDCG_MCP_SURFACE=full 暴露 cg/stg 基元 + mdcg_* 细粒度工具（共 33）；
+    # 此处选择表再筛一遍：'core' = 2 基元；'brain' = 完整认知面（30，排除管理类
+    # forget/restore/review_decide）；'all' 同样排除管理类（RISK_TOOLS）。
+    tools: 'core'
+
+    # 「身体」能力后端（可选）：角色扮演生成等「身」的生成能力。
+    # 默认关闭 → 主仓保持**纯大脑单进程**（只起 md_cg）。开启后额外起一个
+    # 能力库子进程（如 AEIS），仅角色扮演生成使用；记忆真源仍是 md_cg。
+    # 未开启时 /roleplay 的生成接口 fail-closed（返回明确原因，不编造回复），
+    # 但转录 / 历史 / 翻译 / 落图始终可用（走大脑）。
+    # capability:
+    #   enabled: false
+    #   python: ''              # 留空 = 跟随上面的 python（平台默认）
+    #   args: ['-m', 'aeis.mcp.server']
+
+    # 自动记忆（对话沉淀进灵枢）
+    memory:
+      userMessage: true        # 用户消息 → remember
+      assistantMessage: false  # agent 回复（默认关，防噪音）
+      toolResult: false        # 工具结果（默认关）
+      importance: 0.6
+
+    # 密钥经环境变量注入（不进配置库）
+    env:
+      BOCHA_API_KEY: !!js process.env.BOCHA_API_KEY
+      # AEIS_DESIGNER_KEY: !!js process.env.AEIS_DESIGNER_KEY   # 设计者裁决工具所需
+
+      # ── 认知图写入凭据：默认【关闭】，由你决定是否打开 ──────────────
+      # md_cg 是 fail-closed：不配凭据时插件以**只读 guest** 运行 ——
+      # 读取 / 召回 / 时间线照常，但自动记忆、对话转录、角色落图**全部不落盘**
+      # （插件启动时会打印一条告警提醒，不会静默）。
+      #
+      # 想打开：取消注释下面任一方案，然后重启 DSH。
+      #
+      # ① 功能完整（推荐，已收窄）：覆盖插件全部 9 个调用点，但无管理权、
+      #    不写 anchor 保护层。签发：
+      #    python -m md_cg.tokens issue --role designer --actor dsh-memory \
+      #      --clearance internal \
+      #      --ops-allow info,route,read,write,recent,goal,identity,whitebox,verify \
+      #      --layers-allow knowledge,contextual,structural,self,goals,unresolved,rejected
+      # MDCG_TOKEN: !!js process.env.MDCG_TOKEN
+      #
+      # ② 最小权限：--role recorder --actor dsh-memory
+      #    只能自动记忆 / 转录 / 角色定义；whitebox、identity、verify 与
+      #    写 self 层（角色 anchors 导入）会被 AccessDenied。
+      # MDCG_TOKEN: !!js process.env.MDCG_TOKEN
+      #
+      # ③ 兼容旧部署（不推荐：明文身份、无令牌可吊销）：
+      #    recorder 可写 contextual/knowledge/structural；
+      #    要写 self 层再加 MDCG_CAN_ADMIN: '1'（→ designer）
+      # MDCG_LEGACY_ENV_AUTH: '1'
+      #
+      # 令牌明文怎么给进去（二选一）：
+      #   · 推荐：设环境变量后引用（明文不进配置文件）
+      #       setx MDCG_TOKEN "mdcg1.xxxxx"   然后重启 DSH
+      #   · 或直接写明文：MDCG_TOKEN: 'mdcg1.xxxxx'
+
+    # 容错
+    toolCallTimeoutMs: 60000
+    maxRetryDelayMs: 30000
+    failOnStartupError: false
+
+    # 互维维护（Mutual Sustain Loop v1.1）：心跳10min写戳 + 守护A + 任务验证双通道
+    # 需在双沙箱环境中启用（与 A 侧 guardian 对称）；单实例可关
+    mutual:
+      enabled: true
+      heartbeatMs: 600000        # 10min，任务不阻塞心跳
+
+    # 认知图（md_cg）= 记忆唯一真源；AEIS 降为能力库。
+    # 插件侧唯一显式入口：src/lib/mdcg_client.ts（每个方法 = 一条 MCP 调用：
+    # 记忆写入走 mdcg_remember，读取/召回/时间线走 cg/stg 基元）。
+    # ⚠️ 写入需上面的 MDCG_LEGACY_ENV_AUTH / MDCG_TOKEN 凭据，否则只读 guest。
+    # 功能 → 代码 对照见 docs/功能调用映射表_v0.1.md
+    mdcg:
+      enabled: true
+      # root = 记忆写入路径（用户可改）。留空 '' = 走解析优先级，默认落在
+      # **用户级状态根** data/mdcg（与 cwd、插件包目录都解耦）：
+      #   env MDCG_ROOT > <用户级状态根>/paths.json 的 "root" > 本项
+      #   > 默认 ~/.dsh/.dsh-memory/data/mdcg
+      # 想换位置：填绝对路径（如 'D:/lingshu/mdcg'），或改 paths.json。
+      root: ''
+      actor: 'dsh-memory'        # MDCG_ACTOR：私有内容按 (tenant, actor) 派生 DEK
+      tenant: 'default'          # MDCG_TENANT：须与迁移脚本 --tenant 一致
+      clearance: 'private'       # MDCG_CLEARANCE：可读写密级上限
+
+# 多实例示例：第二个灵枢（不同记忆库/身份/命名空间）
+# - id: furongjun1999-dsh-memory-2
+#   name: '@furongjun1999/dsh-memory'
+#   config:
+#     serverName: 'lingshu2'
+#     dbPath: 'data/lingshu2.db'
+#     identity: '灵枢二号'
+#     tools: ['cg', 'stg']

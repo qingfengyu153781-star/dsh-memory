@@ -1,0 +1,334 @@
+# -*- coding: utf-8 -*-
+"""test_rust_codegen.py · Rust 原生后端验收（v0.4 · VM 路线）
+荣 2026-09-06 裁定验收：双后端语义等价（同一 .pbc，Python VM vs Rust VM 终态一致）
++ cargo build/clippy 零警告 + 既有测试基线不破坏。
+用例：trust 样例 / 循环 / 递归阶乘(CALL tag6) / 多函数互调 / 旧 .pbc 格式兼容。
+"""
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from compiler.compiler import compile_source
+from compiler.condition_vm import ConditionVM, Opcode
+from compiler.pbc import compile_to_pbc, deserialize, load_pbc, run_pbc, serialize
+from swarm.rust_codegen import (build_and_run, build_rust_exe,
+                                generate_rust_project)
+
+pass_n = fail_n = 0
+
+
+def check(name, ok, detail=""):
+    global pass_n, fail_n
+    if ok:
+        pass_n += 1
+    else:
+        fail_n += 1
+    print(f'[{"✓" if ok else "✘"}] {name}{" — " + detail if detail else ""}')
+
+
+def num_eq(a, b):
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return abs(float(a) - float(b)) < 1e-9
+    return a == b
+
+
+def state_equiv(py, rs):
+    """双后端终态等价：trust 容差 / halt / symbols 数值等价 / condition_space 同构"""
+    ok = abs(py["trust"] - rs["trust"]) < 1e-9
+    ok = ok and py["halt"] == rs["halt"]
+    ok = ok and set(py["symbols"]) == set(rs["symbols"])
+    if ok:
+        for k in py["symbols"]:
+            ok = ok and num_eq(py["symbols"][k], rs["symbols"][k])
+    pc, rc = py["condition_space"], rs["condition_space"]
+    ok = ok and len(pc) == len(rc)
+    if ok:
+        for (a, b) in zip(pc, rc):
+            ok = ok and a["name"] == b["name"] \
+                and num_eq(a["trust_at_create"], b["trust_at_create"])
+    return ok
+
+
+def equiv_case(name, source, symbols=None, trust=0.0, expect=None):
+    """标准等价用例：compile → 双后端执行 → 对照 →（可选）期望断言"""
+    tmp = tempfile.mkdtemp(prefix="rust_eq_")
+    pbc = os.path.join(tmp, "o.pbc")
+    code, r = compile_to_pbc(source, pbc, strict=False)
+    if not r["ok"]:
+        check(f"{name} 编译", False, str(r.get("errors", []))[:60])
+        return None
+    py = run_pbc(pbc, symbols=dict(symbols or {}), trust=trust)
+    gen = generate_rust_project(source, os.path.join(tmp, "proj"), strict=False)
+    if not gen["ok"]:
+        check(f"{name} Rust 生成", False)
+        return None
+    rr = build_and_run(gen["project_dir"], symbols=symbols, trust=trust)
+    if not rr["ok"]:
+        check(f"{name} Rust 运行", False,
+              f"[{rr.get('stage')}] {rr.get('stderr', '')[-200:]}")
+        return None
+    check(f"{name} 双后端语义等价", state_equiv(py, rr["state"]),
+          f"py={json.dumps({k: py[k] for k in ('trust', 'halt')}, default=str)} "
+          f"rs={json.dumps({k: rr['state'][k] for k in ('trust', 'halt')})}")
+    if expect:
+        for k, v in expect.items():
+            got = rr["state"]["symbols"].get(k)
+            check(f"{name} 期望 {k}={v}", num_eq(got, v), f"得 {got}")
+    return rr["state"]
+
+
+# ============ ① trust 样例（examples/trust.proto 同源） ============
+print("=== ① trust：道/德/若/止 ===")
+_st1 = equiv_case(
+    "trust",
+    open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                      "examples", "trust.proto"), encoding="utf-8-sig").read()
+    if os.path.exists(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "examples", "trust.proto")) else """问曰：如何验证信任？
+答曰：信任值大于0.7。
+术曰：
+1。道 新信任路径；
+2。德 0.3；
+3。若 信任值 大于 0.2，则 德 0.5；
+4。止。
+""",
+    symbols={"信任值": 0.5})
+# 缺陷②修复后（双后端同一契约）：注入的 信任值 归一为**寄存器初值**，
+# 与 德(DE) 同源 → 0.5 + 0.3 = 0.8 > 0.2 → +0.5 = 1.3。
+# 修复前 符号与寄存器互不通信：条件读符号 0.5、德 只加寄存器 → 终态 0.8，
+# 且符号表残留 信任值=0.5（旧 expect 固化了该脱钩行为）。
+check("① 信任终态 1.3（0.5+0.3=0.8>0.2 → +0.5；名实同源）",
+      bool(_st1) and abs(_st1["trust"] - 1.3) < 1e-9,
+      f'trust={_st1["trust"] if _st1 else None}')
+
+# ============ ② 循环（当…执行） ============
+print("=== ② 循环：计数 0→3 ===")
+equiv_case(
+    "loop",
+    """
+术曰：
+1。当 计数 小于 3 执行 计数 = 计数 + 1；
+2。德 0.6。
+""",
+    symbols={"计数": 0}, expect={"计数": 3})
+
+# ============ ③ 递归阶乘（CALL tag6 序列化路径） ============
+print("=== ③ 递归：4! = 24 ===")
+equiv_case(
+    "fact",
+    """
+定义 阶乘（n）：若 n 小于 2，则 返回 1，否则 返回 n 乘 阶乘（n 减 1）；
+结果 = 阶乘（4）；
+止。
+""", expect={"结果": 24})
+
+# ============ ④ 多函数互调 ============
+print("=== ④ 多函数：双倍/计算 ===")
+equiv_case(
+    "multifn",
+    """
+定义 双倍（x）：返回 x 乘 2；
+定义 计算（y）：返回 双倍（y）加 1；
+结果 = 计算（5）；
+止。
+""", expect={"结果": 11})
+
+# ============ ⑤ tag6 序列化/反序列化往返 ============
+print("=== ⑤ .pbc tag6 往返 ===")
+sig = ("CALL", (12, ["n", "甲"]))
+rt = deserialize(serialize([sig]))
+check("tag6 往返保真", rt[0][0] == "CALL" and rt[0][1] == (12, ["n", "甲"]),
+      str(rt))
+
+# ============ ⑥ 旧格式兼容（tag5 老字节码仍可读） ============
+print("=== ⑥ 旧格式兼容 ===")
+old_src = """问曰：如何验证信任？
+答曰：信任值大于0.7。
+术曰：
+1。道 新信任路径；
+2。德 0.3；
+3。若 信任值 大于 0.2，则 德 0.5；
+4。止。
+"""
+tmp6 = tempfile.mkdtemp(prefix="pbc_old_")
+code6, r6 = compile_to_pbc(old_src, os.path.join(tmp6, "old.pbc"))
+st6 = run_pbc(os.path.join(tmp6, "old.pbc"), symbols={"信任值": 0.5})
+check("旧格式（含 tag5 ZHIZU 路径）可读可执行",
+      r6["ok"] and st6["trust"] >= 0.7 and st6["halt"] == "halt",
+      f"trust={st6['trust']}")
+
+# ============ ⑦ 模板 clippy 零警告 ============
+print("=== ⑦ clippy 零警告（rust_runtime 模板） ===")
+rt_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                      "rust_runtime")
+has_cargo = shutil.which("cargo") is not None
+if has_cargo and os.path.isdir(rt_dir):
+    # 模板目录缺 program.pbc（构建期嵌入）——生成一个最小项目代替 clippy 检查
+    tmp7 = tempfile.mkdtemp(prefix="clippy_")
+    gen7 = generate_rust_project(old_src, tmp7)
+    clip = subprocess.run(["cargo", "clippy", "--release"], cwd=gen7["project_dir"],
+                          capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=180)
+    warn_lines = [l for l in clip.stdout.splitlines() + clip.stderr.splitlines()
+                  if l.startswith("warning")]
+    check("clippy 零警告", clip.returncode == 0 and not warn_lines,
+          f"警告数 {len(warn_lines)}")
+else:
+    check("cargo 不可用 → 跳过 clippy（环境声明）", True)
+
+# ============ ⑧ Python 侧既有 VM 行为不被 pbc 扩展破坏 ============
+print("=== ⑧ 既有 VM 基线 ===")
+code8, r8 = compile_source("""
+术曰：
+1。当 计数 小于 3 执行 计数 = 计数 + 1；
+2。德 0.6。
+""", strict=False)
+ops8 = [op for op, _ in code8] if r8["ok"] else []
+check("循环字节码含 JUMP_IF_FALSE/JUMP/ADD",
+      Opcode.JUMP_IF_FALSE in ops8 and Opcode.JUMP in ops8 and Opcode.ADD in ops8)
+vm8 = ConditionVM()
+st8 = vm8.run(code8, symbols={"计数": 0})
+check("Python VM 循环基线 计数=3 信任=0.6",
+      st8["symbols"].get("计数") == 3 and st8["trust"] == 0.6)
+
+# ============ ⑨ 独立/库形态（--no-default-features + 运行期 --pbc） ============
+print("=== ⑨ 独立形态：--no-default-features ===")
+if has_cargo and os.path.isdir(rt_dir):
+    ind = subprocess.run(["cargo", "build", "--release", "--no-default-features"],
+                         cwd=rt_dir, capture_output=True, text=True, timeout=300,
+                         encoding="utf-8", errors="replace")
+    check("独立形态构建（关闭 embed）", ind.returncode == 0, (ind.stderr or "")[-200:])
+    exe9 = os.path.join(rt_dir, "target", "release",
+                        "protocol_vm.exe" if os.name == "nt" else "protocol_vm")
+    tmp9 = tempfile.mkdtemp(prefix="pbc_ind_")
+    pbc9 = os.path.join(tmp9, "trust.pbc")
+    _, r9 = compile_to_pbc(old_src, pbc9)
+    if r9["ok"] and os.path.exists(exe9):
+        py9 = run_pbc(pbc9, symbols={"信任值": 0.5})
+        run9 = subprocess.run(
+            [exe9, "--pbc", pbc9, "--symbols",
+             json.dumps({"信任值": 0.5}, ensure_ascii=False)],
+            capture_output=True, text=True, timeout=60,
+            encoding="utf-8", errors="replace")
+        rs9 = json.loads(run9.stdout) if run9.returncode == 0 and run9.stdout else {}
+        check("独立形态双后端语义等价", bool(rs9) and state_equiv(py9, rs9),
+              f"exit={run9.returncode} {(run9.stderr or '')[-160:]}")
+        # 独立形态不持有嵌入字节码：缺 --pbc 须引导性报错退出，而非 panic
+        no9 = subprocess.run([exe9], capture_output=True, text=True, timeout=60,
+                             encoding="utf-8", errors="replace")
+        check("独立形态缺 --pbc 时报错退出(2)", no9.returncode == 2,
+              f"exit={no9.returncode}")
+    else:
+        check("独立形态可执行产物存在", False, exe9)
+else:
+    check("cargo 不可用 → 跳过独立形态（环境声明）", True)
+
+# ============ ⑩ build_rust_exe 新鲜度：换源重跑必须重建（N-high 2026-09-26） ============
+# 缺陷：exe 存在即短路返回——同 project 换源重跑时 generate 只覆写
+# program.pbc（embed 是编译期 include_bytes! 嵌 exe 的），旧 exe 照跑旧程序
+# 且全绿假成功；fresh build 返回值还可能是无后缀不存在路径（v5 N26①）。
+# 修复面：pbc 较新（mtime 严格大于，相等不触发）→ 强制 cargo 重建；构建后
+# 重探真实产物路径。配套：generate 同内容不覆写 pbc（幂等重入不假重建）。
+print("=== ⑩ build_rust_exe 新鲜度（换源重建/返回路径/重入短路） ===")
+
+SRC_A = "术曰：\n1。德 0.5；\n"
+SRC_B = "术曰：\n1。德 0.9；\n"
+
+
+def _e2e_trust(exe):
+    """直接运行嵌入形态 exe → 终态 trust（None=运行失败）。"""
+    r = subprocess.run([exe], capture_output=True, text=True, timeout=60,
+                       encoding="utf-8", errors="replace")
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    return json.loads(r.stdout.strip().splitlines()[-1]).get("trust")
+
+
+if has_cargo:
+    tmp10 = tempfile.mkdtemp(prefix="fresh_exe_")
+    proj10 = os.path.join(tmp10, "proj")
+    check("⑩0 A 源生成", generate_rust_project(SRC_A, proj10)["ok"])
+    p1 = build_rust_exe(proj10)
+    check("⑩a fresh build 返回真实产物路径（v5 N26① 无后缀面）",
+          os.path.exists(p1), p1)
+    t_a = _e2e_trust(p1)
+    check("⑩a' 首建 exe 语义 = A（trust=0.5，守卫前提）",
+          t_a is not None and abs(t_a - 0.5) < 1e-9, f"trust={t_a}")
+    # 换源重跑：pbc 覆写 + 确定性回拨 exe mtime 60s（陈旧形态不靠时钟粒度）
+    generate_rust_project(SRC_B, proj10)
+    exe10 = p1
+    m_old = os.path.getmtime(exe10)
+    os.utime(exe10, (m_old - 60, m_old - 60))
+    pbc10 = os.path.join(proj10, "program.pbc")
+    check("⑩0' 陈旧形态前置（pbc mtime > exe mtime）",
+          os.path.getmtime(pbc10) > os.path.getmtime(exe10))
+    p2 = build_rust_exe(proj10)
+    check("⑩b pbc 较新触发重建（exe mtime 前移，旧码 delta=0）",
+          os.path.exists(p2) and os.path.getmtime(p2) > m_old - 60 + 30,
+          f"delta={os.path.getmtime(p2) - (m_old - 60):.1f}s")
+    t10 = _e2e_trust(p2)
+    check("⑩c 重建后 exe 语义 = 新源 B（trust=0.9；旧码跑旧程序得 0.5）",
+          t10 is not None and abs(t10 - 0.9) < 1e-9, f"trust={t10}")
+    m_b = os.path.getmtime(p2)
+    p3 = build_rust_exe(proj10)
+    check("⑩d exe 新于 pbc 重入短路（不重建，mtime 不变）",
+          p3 == p2 and abs(os.path.getmtime(p3) - m_b) < 1e-6)
+    # 同内容不覆写：幂等重入（同源再次 generate）保 pbc mtime
+    m_pbc = os.path.getmtime(pbc10)
+    generate_rust_project(SRC_B, proj10)
+    check("⑩e 同源重跑 generate 不覆写 pbc（mtime 不变 → 连带不假重建）",
+          abs(os.path.getmtime(pbc10) - m_pbc) < 1e-6)
+    shutil.rmtree(tmp10, ignore_errors=True)
+else:
+    check("cargo 不可用 → 跳过 ⑩ 新鲜度验收（环境声明）", True)
+
+# ============ ⑪ trust 舍入口径：十进制半偶（N246） ============
+print("=== ⑪ trust 舍入：Rust 与 Python round(x,3) 同口径（N246）===")
+# 缺陷：Rust 侧终态 trust 走 `(x * 1000.0).round() / 1000.0`（**半数远离零**），
+# Python 侧走 `round(x, 3)`（**十进制半偶**）——并列点（0.0625/0.3125/0.5625/
+# 0.8125 等精确可表示的二进制小数）两后端读数不同（0.063 vs 0.062），破坏
+# SEMANTICS.md §5 双后端契约，并让本文件的 `abs(差) < 1e-9` 等价判据判红。
+# 本组：同一份源码构建一次，逐个并列点/非并列点比对两后端终态 trust。
+_ROUND_SRC = """问曰：如何验证信任？
+答曰：信任值大于0.7。
+术曰：
+1。止。
+"""
+# 期望值即 CPython round(x, 3)；含「看着像并列、二进制实际高于/低于」者，
+# 第 2/3 条断言同时钉住 Python 侧口径（两侧一起漂移也会被拦下）。
+_ROUND_CASES = [
+    (0.0625, 0.062), (0.3125, 0.312), (0.5625, 0.562), (0.8125, 0.812),
+    (-0.0625, -0.062), (-0.3125, -0.312), (-0.5625, -0.562), (-0.8125, -0.812),
+    (0.0015, 0.002), (0.0155, 0.015), (0.1235, 0.123), (0.9995, 1.0),
+    (2.675, 2.675), (1.2345, 1.234), (0.3 + 0.1, 0.4), (0.1 + 0.8, 0.9),
+]
+if has_cargo:
+    tmp_r = tempfile.mkdtemp(prefix="rust_round_")
+    pbc_r = os.path.join(tmp_r, "r.pbc")
+    _code_r, _res_r = compile_to_pbc(_ROUND_SRC, pbc_r, strict=False)
+    _gen_r = generate_rust_project(_ROUND_SRC, os.path.join(tmp_r, "proj"),
+                                   strict=False)
+    check("⑪ 项目生成", bool(_res_r["ok"] and _gen_r["ok"]),
+          str(_res_r.get("errors", []))[:60])
+    for _t, _want in _ROUND_CASES:
+        _py = run_pbc(pbc_r, trust=_t)["trust"]
+        _rr = build_and_run(_gen_r["project_dir"], trust=_t)
+        _rs = _rr["state"]["trust"] if _rr["ok"] else None
+        check(f"⑪ trust={_t!r} 双后端等价且 = round(x,3)={_want!r}",
+              _rs is not None and abs(_py - _rs) < 1e-9
+              and abs(_py - _want) < 1e-9 and abs(_rs - _want) < 1e-9,
+              f"py={_py!r} rs={_rs!r}")
+    shutil.rmtree(tmp_r, ignore_errors=True)
+else:
+    check("cargo 不可用 → 跳过 ⑪ 舍入口径验收（环境声明）", True)
+
+print(f"\n{pass_n} passed, {fail_n} failed")
+sys.exit(1 if fail_n else 0)

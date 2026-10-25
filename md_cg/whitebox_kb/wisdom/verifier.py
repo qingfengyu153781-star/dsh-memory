@@ -1,0 +1,1918 @@
+# -*- coding: utf-8 -*-
+"""verifier.py · 白箱本地校验器（Zero-LLM Verifier）v1
+
+目标：把「白箱写代码 → 外部校验（是否符合规范/能否执行）」全部本地化，
+彻底抛开大模型依赖。重复校验走本地缓存（替代 99.9% 的 LLM 缓存命中）。
+
+设计：docs/白箱本地校验器_ZeroLLM_Verifier.md
+
+校验链（六层，全部确定性）：
+  ① 校验指纹 → 本地缓存（已校验过 → 直接返回）
+  ② L1 语法：ast.parse + 结构规则（纯静态，不执行被校验代码）
+  ③ L2 样例：输入→期望断言运行（物理基底裁决）
+  ④ L3 边界：额外边界用例
+  ⑤ 规范符合性：condition_kb 语义对齐 + 结构规范（白箱规则）
+  ⑥ 集成测试：依赖单元组装 + 回归
+
+执行面（③④⑥）的**两条边界**（issue #91）：
+  · 能力边界——被校验代码跑在 `SAFE_NS()` 的内建白名单命名空间里（碰不到外面）；
+  · 时间边界——一律经 `_run_guarded` 在**受控时限子进程**中运行，超时即 fail-closed
+    （`EXEC_TIMEOUT_S`），不可能再把调用方永久挂死。
+
+用法：
+  python verifier.py --verify "os_112|工作窃取|<code文件路径>"   # 校验单个
+  python verifier.py --cache-stats                                # 缓存统计
+  python verifier.py --self-test                                   # 自测
+"""
+from __future__ import annotations
+
+import ast
+import copy
+import hashlib
+import importlib
+import json
+import marshal
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+import types
+from dataclasses import dataclass, field, asdict
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+CACHE_FILE = os.path.join(HERE, "..", "data", "verify_cache.json")
+SAVINGS_LOG = os.path.join(HERE, "..", "data", "verify_savings.jsonl")
+DATA_DIR = os.path.join(HERE, "..", "data")
+
+
+# ============ 一、数据结构 ============
+
+def _stable_serialize(obj: Any) -> Any:
+    """任意类型确定性序列化（缓存键基础）。
+
+    cases 里可能出现 set/bytes/lambda 等 json 不可序列化类型（如集合推导的
+    {1,2,3} 与 lambda、帧解析的 bytes）——指纹必须对它们稳定：
+      set/frozenset → 元素 str 排序化（去重保稳定）
+      bytes/bytearray → hex
+      callable（lambda/函数）→ __code__ 确定性摘要（co_code+常量+名，跨进程稳定，
+        不含内存地址——lambda 的 repr 含地址会导致重启后指纹漂移、缓存失效）
+    其余 → repr 回退（域单元 cases 无自定义类实例，足够）。
+    """
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, (list, tuple)):
+        return [_stable_serialize(x) for x in obj]
+    if isinstance(obj, (set, frozenset)):
+        return {"__set__": sorted(str(_stable_serialize(x)) for x in obj)}
+    if isinstance(obj, dict):
+        return {"__dict__": {str(k): _stable_serialize(v)
+                             for k, v in sorted(obj.items(), key=lambda kv: str(kv[0]))}}
+    if isinstance(obj, (bytes, bytearray)):
+        return {"__bytes__": bytes(obj).hex()}
+    if isinstance(obj, types.CodeType):
+        # 嵌套 code 对象（lambda 的 co_consts 里可能含 <listcomp>/嵌套 lambda）：
+        # repr 含内存地址（<code object at 0x…>）跨进程漂移——必须确定性摘要
+        digest = hashlib.sha256(json.dumps(
+            [obj.co_code.hex(), list(obj.co_consts), list(obj.co_names)],
+            ensure_ascii=False, sort_keys=True, default=_stable_serialize,
+        ).encode("utf-8")).hexdigest()[:16]
+        return {"__code__": digest}
+    if callable(obj):
+        co = getattr(obj, "__code__", None)
+        if co is not None:
+            digest = hashlib.sha256(json.dumps(
+                [co.co_code.hex(), list(co.co_consts), list(co.co_names)],
+                ensure_ascii=False, sort_keys=True, default=_stable_serialize,
+            ).encode("utf-8")).hexdigest()[:16]
+            return {"__fn__": digest}
+        return {"__fn__": repr(obj)}
+    try:
+        return {"__obj__": repr(obj)}
+    except Exception:
+        return {"__obj__": type(obj).__name__}
+
+
+def _assert_match(got: Any, exp: Any) -> bool:
+    """结果断言：dict 期望做子集匹配（got 包含 exp 全部键值即可）。
+
+    白箱单元常返回完整状态字典（如 VM 执行循环返回
+    {'trust':…, 'symbols':…, 'cond':…, 'stack':…}），而样例期望只关心其中
+    关键字段（如 {'trust': 0.8}）——完整相等会误判，子集匹配符合「状态断言」语义。
+
+    **语义真源**：L2/L3 的实际断言现在跑在受控时限子进程里（`_EXEC_RUNNER_SRC`
+    的 `_match` 与之逐字同义）；本函数保留为可读的语义定义与父侧直调入口。
+    （集成层是严格相等 `!=`，不经本函数——与改造前一致。）"""
+    if isinstance(exp, dict) and isinstance(got, dict):
+        return all(got.get(k) == v for k, v in exp.items())
+    return got == exp
+
+
+@dataclass
+class VerifyRequest:
+    """校验请求：白箱生成的代码 + 单元定义。
+
+    cases/deps 做深拷贝（不可变快照）——被校验代码可能原地修改输入
+    （如排序 arr[j], arr[j+1] = ...），若引用外部共享 list 会污染原始数据，
+    导致相同请求产生不同指纹（缓存失效）。
+    """
+    task: str                       # 任务描述（排序/循环编译/图遍历…）
+    code: str                       # 白箱生成的代码
+    unit_id: str = ""               # 单元标识（域+序号，如 os_112）
+    lang: str = "python"            # 语言
+    cases: List[Tuple[Any, Any]] = field(default_factory=list)  # (输入, 期望)
+    deps: List[str] = field(default_factory=list)               # 依赖单元
+    expected_structure: Dict[str, Any] = field(default_factory=dict)  # 规范约束
+
+    def __post_init__(self) -> None:
+        """深拷贝防污染 + 指纹预计算（外部原地修改会让指纹漂移·缓存错配——P0 纪律）。"""
+        # 深拷贝可变字段——防止被校验代码原地修改污染外部共享对象
+        self.cases = copy.deepcopy(self.cases)
+        self.deps = list(self.deps)
+        self.expected_structure = dict(self.expected_structure)
+
+    def fingerprint(self) -> str:
+        """确定性指纹：相同请求 → 相同指纹（缓存键）。
+
+        先整体经 _stable_serialize 归一化再 dumps——json.dumps 的 default 钩子
+        只处理值、不处理 dict 键（tuple 键如事件委托的 {('btn','click'):...}
+        直接崩溃），故必须把整个结构（含键）先递归归一化。
+        """
+        payload = json.dumps(_stable_serialize({
+            "task": self.task, "code": self.code, "unit_id": self.unit_id,
+            "lang": self.lang, "cases": self.cases, "deps": self.deps,
+            "structure": self.expected_structure,
+        }), ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+@dataclass
+class VerifyResult:
+    """校验结果。"""
+    ok: bool
+    checks: List[Dict[str, Any]] = field(default_factory=list)  # [{level, ok, evidence}]
+    fingerprint: str = ""
+    cached: bool = False
+    reason: str = ""
+    verified_at: str = ""     # 校验时间戳（ISO）
+    version: int = 0          # 校验器规则版本（VERIFIER_VERSION 快照）
+
+    def summary(self) -> str:
+        parts = [f"✅ 通过" if self.ok else f"❌ 失败"]
+        for c in self.checks:
+            mark = "✓" if c["ok"] else "✗"
+            parts.append(f"{mark} {c['level']}")
+        if self.reason:
+            parts.append(f"原因: {self.reason}")
+        if self.version:
+            parts.append(f"v{self.version}")
+        return " | ".join(parts)
+
+
+# ============ 二、本地缓存（替代 LLM 缓存命中） ============
+
+# 校验器规则版本：L1/L2/L3/规范/集成规则升级时必须 +1——
+# 旧版本缓存结果在规则已变的场景下不再可信，强制全部失效重验
+# （等价于「协议升级 → 相关缓存刷新」，GLM 建议的 protocol_version 落地）。
+# v6（2026-08-31）：cases 形态修复（list→tuple）后指纹归一化同值，旧 False
+# 条目对修复免疫；bump 版本作废全部旧缓存——长驻进程内存快照复活毒条目的
+# 终局解（版本不符整体清空，任何进程加载即重建）。
+VERIFIER_VERSION = 12  # v12（issue #185 附带发现）：白名单补 `__build_class__`、
+                       # 命名空间补模块级 `__name__`（Py3 `class` 语句的两处必需
+                       # 依赖）——L2/L3 的执行环境因此改变，旧缓存（含「__build_class__
+                       # not found」时代的失败条目）不可信，bump 作废（同 v11 口径）。
+                       # v11（issue #91 根因③）：L2/L3/集成三处执行一律改走**受控
+                       # 时限子进程**（超时 fail-closed，不再可能永久挂死）；判据面
+                       # 变更（执行环境与用例过境编码）故 bump 作废旧缓存。v10：结构规范的字面匹配改大小写不敏感——该表是语言无关的
+                       # 任务语义判据（要求去重结构出现），字面取自 Python 命名习惯
+                       # （set/seen），JS 标准 API 写作 `new Set(arr)`，敏感匹配把正确
+                       # 实现判为「未见对应结构」（实测 code-js/去重 假失败）。v9：
+                       # Python 模板（含 {fn} 占位符）先展开占位符再走 Python
+                       # 判据——逐字复用 _render_placeholders（模板不再降级为文本判据，
+                       # R1/R2/R3/R4 全量生效）。v8：非 Python 源码改走文本判据（Rust/JS
+                       # 不再静默跳过假通过）+ `_audit_all` 审计面纳入语言单元表；
+                       # v7：R3/R4 由死代码转为软模式恒执行 + 判据校准（入口/窗口/顶层）
+                       # + evidence 诚实化——判据变更必须 bump，否则旧判定被缓存复用
+_CACHE_VERSION_KEY = "_verifier_version"
+_STATS_KEY = "_stats"
+
+
+def estimate_tokens(text: str) -> int:
+    """确定性 token 估算（用于「减少的 LLM 输入」度量，非精确计费）。
+
+    中文混合内容：中文字符按 1.2 token/字（中文 1 字 ≈ 1-1.5 token），
+    其余（代码/英文/标点）按 0.3 token/字符（英文/代码 1 token ≈ 3-4 字符）。
+    """
+    cjk = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff')
+    other = len(text) - cjk
+    return int(cjk * 1.2 + other * 0.3)
+
+
+def _table_payload_chars() -> int:
+    """「整张表」内容量：六域单元库定义（pattern+cases）总字符数。
+
+    设计文档背景：原方案「每次把整张表塞进 LLM 上下文查一次」——
+    表 = 白箱单元库（规则/模式/样例），本地化后表不再输入 LLM。
+    """
+    from compiler_code_units import COMPILER_UNITS
+    from python_code_units import PYTHON_UNITS
+    from graph_db_units import GRAPH_UNITS
+    from os_units import OS_UNITS
+    from browser_units import BROWSER_UNITS
+    from net_units import NET_UNITS
+    total = 0
+    for units in (COMPILER_UNITS, PYTHON_UNITS, GRAPH_UNITS,
+                  OS_UNITS, BROWSER_UNITS, NET_UNITS):
+        for uid, u in units.items():
+            total += len(uid) + len(u.get("task", "")) + len(u.get("pattern", "")) \
+                     + len(str(u.get("cases", [])))
+    return total
+
+
+# issue #91（2026-10-09 DSH 端）：被校验代码的执行命名空间——**限 builtins 白名单**。
+# 原实现三处 exec(compile(...), ns) 里 ns 未限 __builtins__ ⇒ 模块顶层代码在判定**之前**
+# 就已执行（实测 open() 载荷：ok=False 但副作用文件已创建）。
+# 本白名单保留常用纯函数与异常类型，**去掉** open / __import__ / eval / exec / compile /
+# globals / locals / vars / dir / input / breakpoint —— 即「能算出答案，但碰不到外面」。
+#
+# issue #185 附带发现（2026-10-09 DSH 端）：上面这份白名单缺 `__build_class__` ⇒ Py3 里
+# 一切含 `class` 的被测代码都在 L2 样例以「__build_class__ not found」判负（本批递归
+# 发现新收进门的三个生态测试，其红由此第一次暴露）。
+# 为何补它：`class` 语句先向 builtins 取 `__build_class__`，再由它执行类体；类体头两条
+# 指令是 `LOAD_NAME __name__` → `STORE_NAME __module__`，故受限命名空间还须给一个
+# 模块级 `__name__`（纯字符串全局；见下方 `_safe_builtins()`/SAFE_NS() 与子进程执行器）。
+# 安全边界：`__build_class__` 只是「定义类」的定义钩子，不提供文件/网络/进程能力；
+# 上面明令去掉的 open / __import__ / eval / exec / compile 等**不得**因此被放开。
+# 无超时（#91 根因③）已由本文件同批的「受控时限子进程」补齐——见下方 EXEC_TIMEOUT_S 段；
+# 该白名单被**父侧 SAFE_NS() 与子进程侧 `_EXEC_RUNNER_SRC` 共用同一份**（单一真源）。
+import builtins as _bi
+_SAFE_BUILTIN_NAMES = (
+    "abs", "all", "any", "bool", "chr", "dict", "divmod", "enumerate",
+    "filter", "float", "format", "frozenset", "getattr", "hasattr",
+    "hash", "int", "isinstance", "issubclass", "iter", "len",
+    "list", "map", "max", "min", "next", "object", "ord",
+    "pow", "print", "range", "repr", "reversed", "round",
+    "set", "slice", "sorted", "str", "sum", "tuple", "type", "zip",
+    "__build_class__",
+    "Exception", "ValueError", "TypeError", "KeyError",
+    "IndexError", "ZeroDivisionError", "StopIteration",
+    "ArithmeticError", "AttributeError", "AssertionError",
+    "NotImplementedError", "RuntimeError", "True", "False", "None")
+
+
+_SAFE_MODULE_NAME = "__mdcg_verify__"
+# ↑ 执行命名空间的**模块级** `__name__`：class 体的 `LOAD_NAME __name__` 需要它。
+#   它是纯字符串全局，**不是** builtin —— builtins 白名单边界不因此放宽。
+
+
+# ============ 纯计算模块白名单 + 受控 __import__（issue #187） ============
+# 背景：白箱单元模板里存在 `import re as _re` 这类**纯计算**标准库导入；#185 把
+# `__import__` 从 builtins 白名单里去掉（当时是正确的加固），于是 import 语句在
+# 受限命名空间里一律 `ImportError: __import__ not found`（实测：
+# "✗ L2样例 样例1 崩溃: … → __import__ not found"）。
+#
+# 本块**不是**放开危险能力——只放行「纯计算模块白名单」：
+#   re（正则）/ math（数学）/ json（内存内序列化）/ itertools / functools /
+#   collections / decimal / fractions / statistics / string / heapq / bisect /
+#   typing / dataclasses / abc
+# 逐项理由：它们都只在**内存里算**，不提供文件（open / os.path / io / shutil /
+# pathlib / tempfile）、网络（socket / http / urllib / ftplib）、进程（subprocess /
+# os.system / ctypes / multiprocessing）、动态导入（importlib / runpy / builtins）
+# 能力——危险能力**仍不可用**。该白名单是既有 L1 静态门 `_STDLIB_OK` 的子集
+# （运行时允许的 ⊂ 静态允许的），不引入 L1 之外的新面。
+#
+# 边界（逐条）：白名单外一律抛 ImportError（**不**静默回落到真 `__import__`）；
+# os / sys / subprocess / builtins / importlib / ctypes / socket / shutil /
+# pathlib / io / pickle 等逃逸路径由 `_SAFE_IMPORT_DENY` 显式拦截，并在守卫里
+# 逐项断言。
+# 取道（`__import__("re").__builtins__`）：**真模块的 globals 里确实带
+# `__builtins__``（那是一条逃逸取道），故这里返回的**不是**裸 module 对象，而是
+# `_SafeModule` 代理——只暴露公开属性，一切 `_` 开头（含 `__builtins__` /
+# `__globals__` / `__dict__`）的名字一律 AttributeError。
+# 残留诚实声明：Python 进程内命名空间无法阻断基于 `object.__subclasses__()` 的
+# 反射取道（`object` / `type` / `getattr` 本就在 #185 白名单内，与本笔无关）；那
+# 一层由「受控时限子进程」（#91）的进程/时间边界负责，不靠本白名单兜底。
+_SAFE_MODULE_WHITELIST = (
+    "re", "math", "json", "itertools", "functools", "collections",
+    "decimal", "fractions", "statistics", "string", "heapq", "bisect",
+    "typing", "dataclasses", "abc")
+
+#: 显式拦截清单（白名单外必然 ImportError；列表化是为了让守卫能逐项断言边界）。
+_SAFE_IMPORT_DENY = (
+    "os", "sys", "subprocess", "builtins", "importlib", "ctypes", "socket",
+    "shutil", "pathlib", "io", "pickle", "marshal", "tempfile", "threading",
+    "multiprocessing", "signal", "gc", "inspect", "code", "codeop", "runpy",
+    "site", "pkgutil", "platform", "posix", "nt", "_thread")
+
+#: 包装对象上**禁止**出现的属性名（逃逸取道：module.__builtins__ 等）。
+_MODULE_BLOCKED_ATTRS = frozenset((
+    "__builtins__", "__loader__", "__spec__", "__dict__", "__globals__",
+    "__class__", "__subclasses__", "__bases__", "__mro__", "__reduce__",
+    "__reduce_ex__", "__getattribute__"))
+
+
+class _SafeModule:
+    """受限模块代理：只暴露（白名单模块的）公开属性。
+
+    `__builtins__` / `__globals__` / `__dict__` 等取道一律 AttributeError——
+    `re.search` 这类**纯计算**用法不受影响，逃逸取道全部堵死。
+    """
+
+    __slots__ = ("_m", "_n")
+
+    def __init__(self, mod, name):
+        object.__setattr__(self, "_m", mod)
+        object.__setattr__(self, "_n", name)
+
+    def __getattribute__(self, attr):
+        if attr.startswith("_") or attr in _MODULE_BLOCKED_ATTRS:
+            raise AttributeError("受限模块代理不暴露 %r" % (attr,))
+        return object.__getattribute__(self, attr)
+
+    def __getattr__(self, attr):
+        if attr.startswith("_") or attr in _MODULE_BLOCKED_ATTRS:
+            raise AttributeError("受限模块代理不暴露 %r" % (attr,))
+        v = getattr(object.__getattribute__(self, "_m"), attr)
+        # issue #187 补漏：子模块属性（`json.decoder` / `json.scanner`）是**普通
+        # module 对象**，它自带真 `__builtins__` —— 必须继续套代理，否则上面那道
+        # 拦截只在**一层**内成立：`proxy.decoder.__builtins__["open"]` 可直达真
+        # open / __import__ / os.system（实测已复现）。递归后 `proxy.decoder` 仍是
+        # `_SafeModule`，其 `__builtins__` 照常 AttributeError；`re.search` 这类
+        # 纯计算用法不受影响。
+        if isinstance(v, types.ModuleType):
+            return _SafeModule(v, object.__getattribute__(self, "_n") + "." + attr)
+        return v
+
+    def __repr__(self):
+        return "<受限模块 %s>" % (object.__getattribute__(self, "_n"),)
+
+
+def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+    """受控 `__import__`：仅纯计算模块白名单，其余一律 ImportError。
+
+    签名与内建 `__import__` 一致（import 语句按 5 参调用）。相对导入直接拒——
+    受限命名空间里没有包上下文。
+    """
+    if level:
+        raise ImportError("受限执行环境不支持相对导入（level=%r）" % (level,))
+    top = str(name).split(".")[0]
+    if top in _SAFE_IMPORT_DENY or top not in _SAFE_MODULE_WHITELIST:
+        raise ImportError("受限执行环境禁止导入 %r（仅允许纯计算模块白名单: %s）"
+                          % (name, ", ".join(_SAFE_MODULE_WHITELIST)))
+    return _SafeModule(_bi.__import__(name, globals, locals, fromlist, level), top)
+
+
+def _safe_builtins() -> Dict[str, Any]:
+    """受限 builtins 白名单映射——**单一真源**（父侧 SAFE_NS() 与子进程执行器同用一份）。
+
+    安全边界（issue #185）：本映射只提供「算得出答案」的纯函数与异常类型。
+    `__build_class__` 仅是 `class` 语句的**定义钩子**——CPython 在类体执行前由
+    builtins 查表调用它，它不提供文件/网络/进程能力。危险能力（open /
+    eval / exec / compile / globals / locals / vars / dir / input /
+    breakpoint）**一律不在**本映射内，且不得因本项而放开。
+    issue #187：`__import__` 由本函数**受控**注入（`_guarded_import`）——仅
+    纯计算模块白名单，白名单外一律 ImportError，且返回受限代理而非裸 module；
+    文件/网络/进程/动态导入能力**仍不可用**，真内置 `__import__` 仍不可达。
+    """
+    d = {k: getattr(_bi, k) for k in _SAFE_BUILTIN_NAMES if hasattr(_bi, k)}
+    # issue #187：受控 `__import__`（纯计算模块白名单，见上方 `_guarded_import`）。
+    # 它**不进** `_SAFE_BUILTIN_NAMES`——子进程执行器按该元组逐个 `getattr(_bi, k)`
+    # 重建白名单，把 `__import__` 放进元组会让子进程拿到**真内置**（边界失效）；
+    # 故父侧与子进程侧各自显式注入受控包装。
+    d["__import__"] = _guarded_import
+    return d
+
+
+def SAFE_NS() -> Dict[str, Any]:
+    """被校验代码的执行命名空间：受限 builtins + 模块级 `__name__`（class 体需要）。"""
+    return {"__builtins__": _safe_builtins(), "__name__": _SAFE_MODULE_NAME}
+
+
+# 白箱被校验代码允许导入的标准库（其余一律 L1 拒——见 `_check_l1_syntax`）。
+# issue #91（2026-10-09 DSH 端）：原表含 os / sys / socket / threading —— 它们足以在
+# **判定之前**产生副作用（os.system / 起线程 / 连网），故一并移除。原为
+# `_check_l1_syntax` 的**局部变量**，本笔提到模块级：守卫要能直接断言本表内容
+# （防回退），局部变量钉不住。
+_STDLIB_OK = {"collections", "typing", "functools", "itertools", "math",
+              "random", "json", "re", "string", "dataclasses", "abc",
+              "struct", "heapq", "queue",
+              "hashlib", "uuid", "base64",
+              "statistics", "bisect", "decimal", "fractions"}
+
+
+# ============ 受控时限执行（issue #91 根因③：被校验代码原先无任何时限） ============
+#
+# 形态选择＝**子进程 + subprocess 超时**。论证（本机 win32，且须在 Linux 上同样成立）：
+#   · 同进程 `signal.alarm` / `setitimer`：**Windows 无 `signal.SIGALRM`**——该形态
+#     在本机根本无法成立，直接排除；
+#   · 同进程看门狗线程：CPython 只能向目标线程投递一次异步异常
+#     （`PyThreadState_SetAsyncExc`），被 `while True` 里的裸 `except` 吞掉即永久
+#     挂死——线程泄漏、吃满 GIL，后续所有校验在同一进程里一起劣化；
+#   · 独立进程可被无条件终止（POSIX `kill` / Windows `TerminateProcess`），
+#     `subprocess` 的超时路径**先 kill 再 wait**，不留僵尸、不阻塞后续调用。
+#     ⇒ 「必须被真正中断」在 win32 与 POSIX 上唯一同时可靠的形态。
+# 代价：每次执行付一次解释器启动（本机实测 ~25 ms）。收益：被校验代码（模型可控
+# 输入）从此既碰不到外面（SAFE_NS），也**跑不出时限**。
+EXEC_TIMEOUT_S = 20.0
+
+
+class _UnencodableCase(Exception):
+    """用例元素无法安全跨进程承载（执行器能力边界，**不是**代码缺陷）。"""
+
+
+def _enc_value(v: Any) -> Dict[str, Any]:
+    """用例元素 → JSON-safe 节点（子进程侧 `_EXEC_RUNNER_SRC::_dec` 逆向还原）。
+
+    为什么不用 pickle：用例里实测存在 **lambda**（74 处，回调注入型单元）与
+    **动态类对象**（`type('狗', (), {})`，2 处）——pickle 对前者抛
+    PicklingError、对后者按限定名找不到。故走本编码器：
+      · 字面量 → `repr` ＋ 子进程侧 `ast.literal_eval`（**不** eval 任意文本）；
+      · float → `hex()` 往返（`repr(inf)` == 'inf' 在受限命名空间里求不出值）；
+      · 可调用对象 → `marshal`（输入是**父进程内存里**的 code object，非字符串注入），
+        子进程侧以**同一份白名单**重建 globals；
+      · 类对象 → 内建走名字查表；非内建走 `type(name, bases, dict)` 配方重建。
+    不可表达的形态 → `_UnencodableCase` ⇒ 调用方 fail-closed（不静默跳过/不静默通过）。
+    """
+    if v is None or isinstance(v, bool):
+        return {"t": "lit", "r": repr(v)}
+    if isinstance(v, (int, str, bytes)):
+        return {"t": "lit", "r": repr(v)}
+    if isinstance(v, float):
+        return {"t": "float", "h": v.hex()}
+    if isinstance(v, complex):
+        return {"t": "lit", "r": repr(v)}
+    if isinstance(v, bytearray):
+        return {"t": "ba", "h": bytes(v).hex()}
+    if isinstance(v, tuple):
+        return {"t": "tuple", "v": [_enc_value(x) for x in v]}
+    if isinstance(v, list):
+        return {"t": "list", "v": [_enc_value(x) for x in v]}
+    if isinstance(v, set):
+        return {"t": "set", "v": [_enc_value(x) for x in v]}
+    if isinstance(v, frozenset):
+        return {"t": "fset", "v": [_enc_value(x) for x in v]}
+    if isinstance(v, dict):
+        return {"t": "dict",
+                "v": [[_enc_value(k), _enc_value(x)] for k, x in v.items()]}
+    if isinstance(v, types.FunctionType):
+        return {"t": "fn", "code": marshal.dumps(v.__code__).hex(),
+                "name": v.__name__}
+    if isinstance(v, type):
+        if v.__module__ == "builtins":
+            return {"t": "bi", "n": v.__qualname__}
+        return _enc_dyn_class(v)
+    raise _UnencodableCase(f"不支持的用例元素类型: {type(v).__name__}")
+
+
+def _enc_dyn_class(cls: type) -> Dict[str, Any]:
+    """非内建类 → `type(name, bases, dict)` 配方（成员逐个编码）。
+
+    `__dict__` / `__weakref__` 是 `type()` 自动生成的描述符
+    （`getset_descriptor`，本编码器不表达），显式提供反而会与 `type()` 冲突，
+    故按「自动生成」跳过——**仅**这两项；其余成员编码失败即 fail-closed
+    （`_UnencodableCase`），不静默丢成员。
+    """
+    members = []
+    for k, val in vars(cls).items():
+        if k in ("__dict__", "__weakref__"):
+            continue
+        try:
+            members.append([k, _enc_value(val)])
+        except _UnencodableCase as e:
+            raise _UnencodableCase(f"类 {cls.__name__} 的成员 {k} 不可传输：{e}")
+    return {"t": "cls", "n": cls.__name__,
+            "b": [_enc_value(b) for b in cls.__bases__], "d": members}
+
+
+#: 子进程侧执行器源码（自包含：只用 stdlib；载荷的 stdout 由父侧接 DEVNULL，
+#: 故 `print` 污染不了结果通道——结果一律走 out.json）。用法：
+#:     python -X utf8 -c <本源码> <req.json> <out.json>
+_EXEC_RUNNER_SRC = r'''
+import ast
+import builtins as _bi
+import json
+import marshal
+import sys
+import types
+
+_SAFE_NAMES = __SAFE_BUILTIN_NAMES__
+_SAFE_MODS = __SAFE_MODULE_WHITELIST__
+_DENY_MODS = __SAFE_IMPORT_DENY__
+
+
+class _SafeModule:
+    """受限模块代理：只暴露公开属性；`__builtins__` 等取道一律 AttributeError。"""
+
+    __slots__ = ("_m", "_n")
+
+    def __init__(self, mod, name):
+        object.__setattr__(self, "_m", mod)
+        object.__setattr__(self, "_n", name)
+
+    def __getattribute__(self, attr):
+        if attr.startswith("_") or attr in _BLOCKED_ATTRS:
+            raise AttributeError("受限模块代理不暴露 %r" % (attr,))
+        return object.__getattribute__(self, attr)
+
+    def __getattr__(self, attr):
+        if attr.startswith("_") or attr in _BLOCKED_ATTRS:
+            raise AttributeError("受限模块代理不暴露 %r" % (attr,))
+        v = getattr(object.__getattribute__(self, "_m"), attr)
+        # issue #187 补漏（与父侧同款）：子模块属性是普通 module，自带真
+        # `__builtins__` ⇒ 继续套代理，否则 `proxy.decoder.__builtins__` 可直达
+        # 真 open / __import__。
+        if isinstance(v, types.ModuleType):
+            return _SafeModule(v, object.__getattribute__(self, "_n") + "." + attr)
+        return v
+
+    def __repr__(self):
+        return "<受限模块 %s>" % (object.__getattribute__(self, "_n"),)
+
+
+_BLOCKED_ATTRS = frozenset((
+    "__builtins__", "__loader__", "__spec__", "__dict__", "__globals__",
+    "__class__", "__subclasses__", "__bases__", "__mro__", "__reduce__",
+    "__reduce_ex__", "__getattribute__"))
+
+
+def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+    """受控 `__import__`：仅纯计算模块白名单，其余一律 ImportError。"""
+    if level:
+        raise ImportError("受限执行环境不支持相对导入（level=%r）" % (level,))
+    top = str(name).split(".")[0]
+    if top in _DENY_MODS or top not in _SAFE_MODS:
+        raise ImportError("受限执行环境禁止导入 %r（仅纯计算模块白名单）" % (name,))
+    return _SafeModule(_bi.__import__(name, globals, locals, fromlist, level), top)
+
+
+def _safe_builtins():
+    # 与父侧 SAFE_NS() 的**同一份**白名单
+    d = {k: getattr(_bi, k) for k in _SAFE_NAMES if hasattr(_bi, k)}
+    # issue #187：与父侧同款受控 `__import__`（纯计算模块白名单）。
+    d["__import__"] = _guarded_import
+    return d
+
+
+def _dec(n):
+    t = n["t"]
+    if t == "lit":
+        return ast.literal_eval(n["r"])
+    if t == "float":
+        return float.fromhex(n["h"])
+    if t == "ba":
+        return bytearray.fromhex(n["h"])
+    if t == "tuple":
+        return tuple(_dec(x) for x in n["v"])
+    if t == "list":
+        return [_dec(x) for x in n["v"]]
+    if t == "set":
+        return set(_dec(x) for x in n["v"])
+    if t == "fset":
+        return frozenset(_dec(x) for x in n["v"])
+    if t == "dict":
+        return {_dec(k): _dec(v) for k, v in n["v"]}
+    if t == "fn":
+        code = marshal.loads(bytes.fromhex(n["code"]))
+        return types.FunctionType(code, {"__builtins__": _safe_builtins()},
+                                  n["name"])
+    if t == "bi":
+        if n["n"] not in _SAFE_NAMES:
+            raise ValueError("内建类不在白名单：%s" % n["n"])
+        return getattr(_bi, n["n"])
+    if t == "cls":
+        return type(n["n"], tuple(_dec(x) for x in n["b"]),
+                    {k: _dec(v) for k, v in n["d"]})
+    raise ValueError("未知用例节点：%s" % t)
+
+
+def _match(got, exp):
+    # 与父侧 _assert_match 同语义：dict 期望做子集匹配
+    if isinstance(exp, dict) and isinstance(got, dict):
+        return all(got.get(k) == v for k, v in exp.items())
+    return got == exp
+
+
+# 受限名（执行 / 动态求值 / 反射面）——取**逃逸必需**的那几个。
+# 与 scripts/bootstrap_loop.py 的 `_GEN_BANNED_NAMES`（P1-7 批次 26）同源，
+# 但按其自举场景收窄：那边是「LLM 产出代码」的沙箱，可从严；
+# 本处是**白箱单元表**的执行面，表中有合法单元正常使用 getattr / vars
+# （见 _ESCAPE_ATTRS 下方的实测说明），且这两个名字**单独不构成逃逸**
+# （逃逸必需的是 `__subclasses__` + `__globals__` 属性链，已由 _ESCAPE_ATTRS 拦下）。
+_BANNED_NAMES = frozenset({
+    "eval", "exec", "compile", "open", "__import__", "breakpoint", "input",
+    "globals", "locals", "setattr", "delattr",
+    "exit", "quit", "memoryview",
+})
+
+#: 反射逃逸链**专项**属性名（issue #544）——取**最小充分集**，不照搬
+#: bootstrap_loop 的「一切 dunder 皆拒」（`attr.startswith("__")`）。
+#:
+#: 为什么必须收窄（实测数据，Windows/Python 3.11.15，清缓存后）：
+#:   · 基线 `--audit`：675/686 通过（98.4%）
+#:   · 按「一切 dunder」判据：额外拒掉 19 条**正在通过**的单元 ⇒ 不可用
+#:   · 按下方最小集：额外拒掉 **0 条**正在通过的单元（仍 675/686）
+#:
+#: 最小集的推导：PoC 逃逸链只需
+#:   `object.__subclasses__()` → `getattr(_c,'__init__').__globals__` → `['__builtins__']`
+#: 故**必需**的只有 `__subclasses__` / `__globals__` / `__builtins__` 三条；
+#: 其余为**同类旁路**（经类层级上溯 / 直接取代码对象），一并拦以堵等价取道。
+#:
+#: 刻意**不**列入 `getattr` / `vars` / `__class__` / `__bases__` 等**名称**：
+#: 单元表中有 4 条**合法**单元正常使用它们（元编程-动态建类 / 元编程-元类定制 /
+#: 面向对象-运算符重载 / 异常-异常链），拦掉即误伤——而它们**单独不足以**
+#: 构成逃逸（上面的必需集已覆盖组合面）。
+_ESCAPE_ATTRS = frozenset({
+    "__subclasses__", "__globals__", "__builtins__",
+    "__mro__", "__baseclasses__",
+    "__dict__", "__getattribute__", "__reduce__", "__reduce_ex__",
+    "__code__", "__closure__", "__func__", "__loader__", "__spec__",
+})
+
+
+# 生效条件：code 为待校验源码文本；ast.parse 失败抛原语法异常，ast.walk 命中
+# Name.id 属 _BANNED_NAMES、Attribute.attr 属 _ESCAPE_ATTRS 或为 ("system","popen")
+# 任一即抛 ValueError（**不执行**）；全部通过时无返回。
+def _ast_gate(code: str) -> None:
+    """issue #544：受限命名空间之外的第二道门——反射逃逸链 AST 门。
+
+    为什么必须另立此门：builtins 白名单**对反射取道无解**。白名单里
+    `object`/`type` 本就在（#185 的决定），于是
+    `object.__subclasses__()` → `__init__.__globals__['__builtins__']`
+    可取回**真 builtins**，再用它 `open()` 写任意文件 —— 而 L1/L2/L3 三层
+    全部仍报 ok:true（逃逸对校验结论不可见）。本函数在 exec **之前**拦掉该链。
+
+    判据取**最小充分集**（见 `_ESCAPE_ATTRS` 说明），而非「一切 dunder」：
+    后者会误伤单元表里多条合法单元（实测差 19 条），故不用。
+    AST 全遍历，lambda/推导式内的同名调用同样覆盖。
+    """
+    tree = ast.parse(code)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in _BANNED_NAMES:
+            raise ValueError("沙箱拒绝受限名 %s（行 %s）——反射逃逸链入口"
+                             % (node.id, getattr(node, "lineno", "?")))
+        if isinstance(node, ast.Attribute):
+            if node.attr in _ESCAPE_ATTRS or node.attr in ("system", "popen"):
+                raise ValueError(
+                    "沙箱拒绝受限属性 .%s（行 %s）——反射逃逸链入口"
+                    % (node.attr, getattr(node, "lineno", "?")))
+
+
+def main():
+    with open(sys.argv[1], "r", encoding="utf-8") as f:
+        p = json.load(f)
+    out = {"exec": "ok", "exec_err": "", "found": False, "results": [],
+           "ran": 0}
+
+    def dump():
+        with open(sys.argv[2], "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False)
+
+    mode = p.get("mode") or "samples"
+    tag = "边界用例" if mode == "boundary" else "样例"
+    try:
+        cases = [_dec(n) for n in (p.get("cases") or [])]
+    except Exception as e:
+        out["exec"] = "error"
+        out["exec_err"] = str(e)
+        dump()
+        return
+    ns = {"__builtins__": _safe_builtins(), "__name__": "__mdcg_verify__"}
+    try:
+        # issue #544（P1）：受限命名空间的 builtins 白名单**挡不住反射取道** ——
+        # `object.__subclasses__()` → `__init__.__globals__['__builtins__']`
+        # 可取回**真 builtins**，进而 open/exec 任意代码（实测：逃逸后写出仓库外
+        # 标记文件，且 L1/L2/L3 三层仍报 ok:true —— 逃逸对校验结论不可见）。
+        # 白名单里 type/object/getattr 本就在（#185 决定），故补**AST 门**：
+        # 拒绝 dunder 属性访问与受限名——与 scripts/bootstrap_loop.py 的
+        # `_safe_exec_gen`（P1-7 批次 26）同款判据，那边**已实测守住**同一取道。
+        _ast_gate(p["code"])
+        exec(compile(p["code"], "<verify>", "exec"), ns)
+    except Exception as e:
+        out["exec"] = "error"
+        out["exec_err"] = str(e)
+        dump()
+        return
+    fn = ns.get(p.get("func")) if p.get("func") else None
+    if fn is None and mode == "compose":
+        # 组合生成面（issue #491）：与 `code_compose.verify_code` 的既有语义一致——
+        # 取命名空间里**第一个可调用**对象（按 exec 后的插入序），不是 AST 首函数。
+        fn = next((v for k, v in ns.items()
+                   if callable(v) and not k.startswith("__")), None)
+    if not callable(fn):
+        dump()
+        return
+    out["found"] = True
+    for i, pair in enumerate(cases, 1):
+        try:
+            inp, exp = pair
+        except Exception:
+            out["results"].append({"kind": "fail",
+                                   "detail": "样例%d 结构非法: %r" % (i, pair)})
+            break
+        if mode in ("samples", "compose") and inp == "call":
+            continue
+        out["ran"] += 1
+        try:
+            got = (fn(*inp) if (isinstance(inp, tuple) and p.get("unpack", True))
+                   else fn(inp))
+        except Exception as e:
+            if mode == "boundary" and exp == "any":
+                continue          # 边界用例允许异常返回
+            out["results"].append({"kind": "fail",
+                                   "detail": "%s%d 崩溃: %s → %s"
+                                             % (tag, i, inp, e)})
+            break
+        if mode == "integration":
+            if got != exp:        # 集成层是**严格相等**（非子集匹配）
+                out["results"].append(
+                    {"kind": "fail",
+                     "detail": "组装后首样例失败: %s → %s（期望 %s）"
+                               % (inp, got, exp)})
+            break
+        if mode == "boundary" and exp == "any":
+            continue
+        # compose：与 `code_compose.verify_code` 原语义一致——严格相等。
+        # samples/boundary 的 dict 子集匹配**不得**用于组合生成面，否则判据被放宽。
+        ok_match = (got == exp) if mode == "compose" else _match(got, exp)
+        if not ok_match:
+            out["results"].append({"kind": "fail",
+                                   "detail": "%s%d 失败: %s → %s（期望 %s）"
+                                             % (tag, i, inp, got, exp)})
+            break
+    dump()
+
+
+main()
+'''.replace("__SAFE_BUILTIN_NAMES__", repr(tuple(_SAFE_BUILTIN_NAMES))).replace(
+    "__SAFE_MODULE_WHITELIST__", repr(tuple(_SAFE_MODULE_WHITELIST))).replace(
+    "__SAFE_IMPORT_DENY__", repr(tuple(_SAFE_IMPORT_DENY)))
+
+
+def _first_func_info(code: str) -> Tuple[Optional[str], Optional[int],
+                                         Optional[str]]:
+    """(首个函数名, 形参个数, 首个形参名)——纯 ast 解析，不执行任何代码。"""
+    try:
+        tree = ast.parse(code)
+        funcs = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+        if not funcs:
+            return None, None, None
+        f = funcs[0]
+        names = [a.arg for a in list(f.args.posonlyargs) + list(f.args.args)]
+        return f.name, len(names), (names[0] if names else None)
+    except Exception:
+        return None, None, None
+
+
+def _guard_fail(res: Dict[str, Any], level: str) -> Optional[Dict[str, Any]]:
+    """执行器侧失败（超时／能力边界／执行器不可用）→ 明确的失败 check。
+
+    `guard_blocked=True` 是给 `verify()` 看的**不缓存标记**：这些读数是资源/环境
+    态，不是「代码缺陷」的确定性判据——固化成永久判负会让一次抖动永久生效。
+    判定本身**仍是 fail-closed**（本次判负，不静默回退、不静默通过）。
+    """
+    kind = res.get("exec")
+    if kind == "timeout":
+        return {"level": level, "ok": False, "guard_blocked": True,
+                "evidence": f"执行超时（超过 {res.get('timeout')}s 未返回，"
+                            f"已强制终止；被校验代码须在受控时限内返回）"}
+    if kind == "unencodable":
+        return {"level": level, "ok": False, "guard_blocked": True,
+                "evidence": f"用例超出受控执行器的承载边界: {res.get('exec_err')}"}
+    if kind == "runner_error":
+        return {"level": level, "ok": False, "guard_blocked": True,
+                "evidence": f"受控执行器不可用: {res.get('exec_err')}"}
+    return None
+
+
+def _run_guarded(code: str, cases: List[Any], func_name: Optional[str],
+                 mode: str, timeout: float, unpack: bool = True) -> Dict[str, Any]:
+    """在**受控时限**内于子进程执行 `code`（并按 mode 跑用例），返回结果 dict。
+
+    `exec` ∈ {ok, error, timeout, unencodable, runner_error}：
+      · ok            —— 执行完成（用例结果在 results / ran）；
+      · error         —— 代码自身的编译/执行异常（exec_err 与旧文本同形）；
+      · timeout       —— 超时被强制终止（fail-closed）；
+      · unencodable   —— 用例元素无法跨进程承载（fail-closed）；
+      · runner_error  —— 执行器起不来/未产出结果（fail-closed）。
+    `unpack`：tuple 入参是否展开为多参调用。verifier 六层恒为 True；组合生成面
+    （`code_compose.verify_code`）按原语义分派——Python 模板 True、py_ref False。
+    超时路径：`proc.kill()` 后**必须再 wait/communicate 回收**——只 kill 不 wait 会
+    留僵尸；返回值里的 `pid`/`reaped` 是该路径的**可断言残留**（守卫据此判不泄漏）。
+    """
+    try:
+        payload = {"code": code,
+                   "cases": [_enc_value(c) for c in cases],
+                   "func": func_name, "mode": mode, "unpack": bool(unpack)}
+    except _UnencodableCase as e:
+        return {"exec": "unencodable", "exec_err": str(e), "found": False,
+                "results": [], "ran": 0}
+
+    env = dict(os.environ)
+    env["PYTHONUTF8"] = "1"                      # 纪律 15：显式 UTF-8 环境
+    try:
+        with tempfile.TemporaryDirectory(prefix="mdcg_verify_") as d:
+            req_p = os.path.join(d, "req.json")
+            out_p = os.path.join(d, "out.json")
+            with open(req_p, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            proc = subprocess.Popen(
+                [sys.executable, "-X", "utf8", "-c", _EXEC_RUNNER_SRC,
+                 req_p, out_p],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,       # 载荷的 print 污染不了结果通道
+                stderr=subprocess.PIPE, env=env)
+            timed_out = False
+            try:
+                proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                proc.kill()
+                try:
+                    proc.communicate(timeout=10.0)   # 回收（kill 后仍须 wait）
+                except Exception:                    # noqa: BLE001
+                    pass
+            reaped = proc.poll() is not None
+            if timed_out:
+                return {"exec": "timeout", "exec_err": "", "found": False,
+                        "results": [], "ran": 0, "timeout": timeout,
+                        "pid": proc.pid, "reaped": reaped}
+            try:
+                with open(out_p, "r", encoding="utf-8") as f:
+                    res = json.load(f)
+            except Exception:                        # noqa: BLE001
+                tail = (proc.stderr.read() if proc.stderr else b"") or b""
+                return {"exec": "runner_error", "reaped": reaped, "pid": proc.pid,
+                        "exec_err": "执行器未产出结果（rc=%s）：%s"
+                                    % (proc.returncode,
+                                       tail.decode("utf-8", "replace")[-300:]),
+                        "found": False, "results": [], "ran": 0}
+            res["pid"] = proc.pid
+            res["reaped"] = reaped
+            return res
+    except Exception as e:                           # noqa: BLE001
+        return {"exec": "runner_error", "exec_err": str(e), "found": False,
+                "results": [], "ran": 0}
+
+
+def run_guarded(code: str, cases: List[Any], func_name: Optional[str],
+                mode: str, timeout: float, unpack: bool = True) -> Dict[str, Any]:
+    """公开执行入口——**委托** `_run_guarded`（同一份沙箱/超时实现，非第二套）。
+
+    供同族生成面复用（`code_compose.verify_code` 的 L2，issue #491）：受限内建
+    白名单（`SAFE_NS`）+ 子进程 + `subprocess` 超时全部由 `_run_guarded` 提供，
+    调用方不得自行 `exec`/自建进程。`mode="compose"` 的语义见 `_EXEC_RUNNER_SRC`。
+    """
+    return _run_guarded(code, cases, func_name, mode, timeout, unpack)
+
+
+class VerifyCache:
+    """校验结果本地缓存。相同指纹 → 零计算返回。
+
+    hits/misses 为进程内命中计数；「减少的 LLM 输入」以 append-only JSONL
+    审计日志持久化（data/verify_savings.jsonl，每行一次校验的输入度量）——
+    跨进程累计、可审计、可重放（复现证据）。
+    """
+
+    def __init__(self, path: str = CACHE_FILE, version: int = VERIFIER_VERSION,
+                 savings_log: Optional[str] = SAVINGS_LOG):
+        """组装：缓存句柄注入（默认新建；变异测试可传隔离缓存）。"""
+        self.path = path
+        self.version = version
+        self.savings_log = savings_log
+        self._data: Dict[str, Dict[str, Any]] = {}
+        self.hits = 0
+        self.misses = 0
+        self._table_chars: Optional[int] = None
+        self._load()
+
+    def _load(self) -> None:
+        """从磁盘回放缓存快照（版本不符整体作废防脏读）。"""
+        try:
+            if os.path.exists(self.path):
+                with open(self.path, "r", encoding="utf-8") as f:
+                    self._data = json.load(f)
+        except Exception:
+            self._data = {}
+        # 版本不符 → 规则已变，旧缓存结果不可信，清空重建
+        if self._data.get(_CACHE_VERSION_KEY) != self.version:
+            self._data = {_CACHE_VERSION_KEY: self.version}
+            self._flush()
+
+    def record_input(self, payload_chars: int, hit: bool) -> None:
+        """记录一次经本地校验的输入度量（append-only 审计日志）。
+
+        每次校验（含缓存命中）都意味着：该内容（表 + 请求）不再输入 LLM →
+        省下的 token 计入日志。hit 标记是否为缓存命中（重复校验零计算）。
+        savings_log=None（隔离模式，如变异测试）时不写日志。
+        """
+        if not self.savings_log:
+            return
+        table = self._table_chars
+        if table is None:
+            try:
+                table = _table_payload_chars()
+            except Exception:
+                table = 0
+            self._table_chars = table
+        text = payload_chars + table
+        half = text // 2
+        tokens = estimate_tokens("中" * half + "x" * (text - half))
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(self.savings_log, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "t": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "payload_chars": payload_chars, "table_chars": table,
+                    "saved_chars": text, "saved_tokens": tokens,
+                    "hit": bool(hit),
+                }, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    def savings(self) -> Dict[str, Any]:
+        """跨进程累计：从审计日志聚合「减少的 LLM 输入」。
+
+        读 self.savings_log（与写入同源）——此前误读模块常量 SAVINGS_LOG，
+        自定义 savings_log 路径时写入 A 聚合读 B，聚合恒 0（issue #4 审计发现）。
+        """
+        total_chars = total_tokens = hits = reqs = 0
+        log = self.savings_log
+        try:
+            if log and os.path.exists(log):
+                for line in open(log, encoding="utf-8"):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    d = json.loads(line)
+                    total_chars += d.get("saved_chars", 0)
+                    total_tokens += d.get("saved_tokens", 0)
+                    reqs += 1
+                    if d.get("hit"):
+                        hits += 1
+        except Exception:
+            pass
+        return {"requests": reqs, "hits": hits,
+                "saved_chars": total_chars, "saved_tokens": total_tokens}
+
+    def get(self, fingerprint: str) -> Optional[VerifyResult]:
+        """按指纹取缓存校验结果：命中计 hits 并标记 cached=True；未命中计 misses 返回 None。"""
+        entry = self._data.get(fingerprint)
+        if entry is None:
+            self.misses += 1
+            return None
+        self.hits += 1
+        r = VerifyResult(ok=entry["ok"], fingerprint=fingerprint, cached=True)
+        r.checks = entry.get("checks", [])
+        r.reason = entry.get("reason", "")
+        r.verified_at = entry.get("verified_at", "")
+        r.version = entry.get("version", 0)
+        return r
+
+    def put(self, result: VerifyResult) -> None:
+        """写入指纹→结果映射并落盘持久化（附版本键防跨版本脏读）。"""
+        self._data[result.fingerprint] = {
+            "ok": result.ok,
+            "checks": result.checks,
+            "reason": result.reason,
+            "verified_at": result.verified_at,
+            "version": result.version,
+        }
+        self._data[_CACHE_VERSION_KEY] = self.version
+        self._flush()
+
+    def _flush(self) -> None:
+        """内存态刷盘：读-合并-原子替换（多进程并发写友好）。
+
+        bootstrap 循环进程与交互进程共用同一缓存文件——先吸收磁盘上
+        他进程新增的条目再写，消除「整文件写覆盖」；临时文件+os.replace
+        原子替换，消除「读到半写状态」。残余窗口仅剩同指纹同时写的
+        几毫秒，缓存可重建（最坏=丢条目重跑 verify），工程可接受。
+        """
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            try:
+                if os.path.exists(self.path):
+                    with open(self.path, "r", encoding="utf-8") as f:
+                        disk = json.load(f)
+                    # 版本一致性守卫：磁盘条目版本与本实例不同 → 全部忽略
+                    # （版本 bump 即整体作废，不能被合并逻辑复活旧条目）
+                    if isinstance(disk, dict) and disk.get(_CACHE_VERSION_KEY) == self.version:
+                        for k, v in disk.items():
+                            if k not in self._data:
+                                self._data[k] = v
+            except Exception:
+                pass  # 磁盘半写/损坏 → 以内存为准
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, self.path)
+        except Exception:
+            pass
+
+    def stats(self) -> Dict[str, Any]:
+        """聚合统计：条目总数、通过数、命中率（hits/(hits+misses)）。"""
+        entries = {k: v for k, v in self._data.items() if k != _CACHE_VERSION_KEY}
+        n = len(entries)
+        n_pass = sum(1 for v in entries.values() if v.get("ok"))
+        total_reqs = self.hits + self.misses
+        hit_rate = round(100.0 * self.hits / total_reqs, 1) if total_reqs else 0.0
+        return {"total": n, "passed": n_pass, "failed": n - n_pass,
+                "hits": self.hits, "misses": self.misses,
+                "hit_rate": hit_rate}
+
+
+# ============ 三、校验器 ============
+
+#: 唯一真源（codeindex._body_comments）的解析缓存：None=未解析，False=不可用
+_CI_BODY = None
+
+
+def _ci_body_comments():
+    """解析并缓存 `codeindex._body_comments`（body 窗口的唯一真源）。
+
+    三种加载形态各试一次；全部失败返回 None（调用方走等价兜底）。
+    缓存避免每次校验都付一次 import 代价（暖缓存路径要求零额外开销）。
+    """
+    global _CI_BODY
+    if _CI_BODY is None:
+        fn = False
+        cands = ["md_cg.codeindex"]
+        pkg = __package__ or ""
+        if pkg.count(".") >= 2:                     # 如 md_cg.whitebox_kb.wisdom
+            cands.insert(0, pkg.rsplit(".", 1)[0].rsplit(".", 1)[0] + ".codeindex")
+        for mod in cands:
+            try:
+                fn = getattr(importlib.import_module(mod), "_body_comments", False)
+            except Exception:                       # noqa: BLE001
+                continue
+            if fn:
+                break
+        _CI_BODY = fn or False
+    return _CI_BODY or None
+
+
+class Verifier:
+    """本地校验器：六层校验链，零 LLM。"""
+
+    def __init__(self, cache: Optional[VerifyCache] = None,
+                 exec_timeout: Optional[float] = None):
+        """组装：缓存句柄注入（默认新建；变异测试可传隔离缓存）；
+        `exec_timeout` 注入受控执行时限（缺省 `EXEC_TIMEOUT_S`；守卫用小值
+        构造必超时载荷，避免把整套测试拖长）。
+        """
+        self.cache = cache or VerifyCache()
+        self.exec_timeout = (EXEC_TIMEOUT_S if exec_timeout is None
+                             else float(exec_timeout))
+
+    # ---------- 主入口 ----------
+    def verify(self, req: VerifyRequest) -> VerifyResult:
+        """六层校验入口：深拷贝请求→算指纹→命中直返；未命中逐层校验并记录 token 节省度量。
+        
+                （深拷贝防调用方原地修改污染指纹空间——见 P0 修复记录。）"""
+        # 不可变快照：verify 内部运行样例可能原地修改输入（如排序
+        # arr[j], arr[j+1] = ...），必须深拷贝防止污染原始 req 对象
+        # （否则同一 req 第二次校验指纹变化，缓存失效）
+        req = copy.deepcopy(req)
+        fp = req.fingerprint()
+
+        # ① 缓存命中 → 直接返回
+        cached = self.cache.get(fp)
+
+        # 输入度量：经本地校验的请求内容量（本应输入 LLM 的「表 + 请求」——
+        # 无论命中与否，走本地 = 不再输入 LLM = 省下的 token；append 审计日志）
+        try:
+            self.cache.record_input(len(req.task) + len(req.code)
+                                    + len(str(req.cases)) + len(req.unit_id),
+                                    hit=(cached is not None))
+        except Exception:
+            pass
+
+        if cached is not None:
+            return cached
+
+        checks: List[Dict[str, Any]] = []
+
+        # ② L1 语法
+        checks.append(self._check_l1_syntax(req))
+
+        # 注入型单元（expected_structure.inject，如编译-类型检查/图遍历-BFS）：
+        # 函数依赖外部注入（Graph/infer_fn/组装单元），单独运行 L2/L3 无意义
+        # （与 code_compose verify_code 的 needs_inject 语义一致——由集成测试覆盖）
+        injected = req.expected_structure.get("inject")
+
+        # ③ L2 样例（语法通过才运行；注入型跳过）
+        if checks[-1]["ok"] and not injected:
+            checks.append(self._check_l2_samples(req))
+
+        # ④ L3 边界（注入型跳过）
+        if checks[-1]["ok"] and not injected:
+            checks.append(self._check_l3_boundary(req))
+
+        # ⑤ 规范符合性
+        checks.append(self._check_spec_compliance(req))
+
+        # ⑥ 集成测试（有 deps 才做）
+        if req.deps:
+            checks.append(self._check_integration(req))
+
+        ok = all(c["ok"] for c in checks)
+        reason = ""
+        if not ok:
+            failed = [c for c in checks if not c["ok"]]
+            reason = failed[0]["evidence"] if failed else "未知失败"
+
+        result = VerifyResult(ok=ok, checks=checks, fingerprint=fp, reason=reason,
+                              verified_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+                              version=VERIFIER_VERSION)
+        # 写缓存（**例外**：受控执行器侧的资源态失败——超时/能力边界/执行器不可用
+        # ——不固化。它们是环境读数而非「代码缺陷」的确定性判据，固化成永久判负
+        # 会让一次抖动（机器繁忙／临时目录不可用）永久生效。判定本身仍是
+        # fail-closed（本次返回失败），不因不缓存而静默通过。）
+        if not any(c.get("guard_blocked") for c in checks):
+            self.cache.put(result)
+        return result
+
+    # ---------- L1 语法 ----------
+    def _check_l1_syntax(self, req: VerifyRequest) -> Dict[str, Any]:
+        """ast.parse + 结构规则（函数定义/占位残留/括号平衡）。"""
+        code = req.code
+        # 语法解析
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as e:
+            return {"level": "L1语法", "ok": False,
+                    "evidence": f"语法错误: {e}"}
+
+        # 结构规则
+        errors = []
+        funcs = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+        if not funcs:
+            errors.append("无函数定义")
+        # 占位残留（{fn} 等模板占位符未替换）
+        if "{fn}" in code or "{param" in code:
+            errors.append("存在未替换的模板占位符")
+        # 括号平衡：ast.parse 已通过即证明语法合法（字符串/注释内括号
+        # 不应计入——字符计数会误判，如 pattern 注释含裸括号）
+        # 禁止裸 import（白箱代码应自包含）——但允许标准库
+        imports = [n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))]
+        # issue #91（2026-10-09 DSH 端）：白名单已去掉 os / sys / socket / threading
+        # ——表体见模块级 `_STDLIB_OK`（提到模块级是为了让守卫能直接断言它）。
+        STDLIB_OK = _STDLIB_OK
+        if imports and not req.expected_structure.get("allow_import"):
+            bad = []
+            for n in imports:
+                if isinstance(n, ast.ImportFrom):
+                    top = (n.module or "").split(".")[0]
+                    if top and top not in STDLIB_OK:
+                        bad.append(n.module)
+                else:
+                    for alias in n.names:
+                        top = alias.name.split(".")[0]
+                        if top not in STDLIB_OK:
+                            bad.append(alias.name)
+            if bad:
+                return {"level": "L1语法", "ok": False,
+                        "evidence": f"存在非标准库导入: {bad}"}
+
+        if errors:
+            return {"level": "L1语法", "ok": False, "evidence": "; ".join(errors)}
+        return {"level": "L1语法", "ok": True,
+                "evidence": f"语法通过（{len(funcs)} 个函数定义）"}
+
+    # ---------- L2 样例 ----------
+    def _check_l2_samples(self, req: VerifyRequest) -> Dict[str, Any]:
+        """每个 (输入, 期望) 运行断言。**执行在受控时限子进程中**（issue #91 根因③）。"""
+        if not req.cases:
+            return {"level": "L2样例", "ok": True, "evidence": "无样例（跳过）"}
+
+        func_name, _n_args, _a0 = _first_func_info(req.code)
+        # 找被测函数（第一个函数定义）——父侧 ast 判定（原语义：函数名不在命名空间即判负）
+        res = _run_guarded(req.code, list(req.cases), func_name, "samples",
+                           self.exec_timeout)
+        blocked = _guard_fail(res, "L2样例")
+        if blocked:
+            return blocked
+        if res["exec"] == "error":
+            return {"level": "L2样例", "ok": False,
+                    "evidence": f"代码编译/执行失败: {res['exec_err']}"}
+        if not res["found"]:
+            return {"level": "L2样例", "ok": False,
+                    "evidence": f"找不到被测函数（期望 {func_name}）"}
+        for r in res["results"]:
+            return {"level": "L2样例", "ok": False, "evidence": r["detail"]}
+        if res["ran"] == 0:
+            return {"level": "L2样例", "ok": True,
+                    "evidence": "注入型单元（样例均为 call 标记，由集成测试覆盖）"}
+        return {"level": "L2样例", "ok": True,
+                "evidence": f"{res['ran']} 组样例全部通过"}
+
+    # ---------- L3 边界 ----------
+    def _check_l3_boundary(self, req: VerifyRequest) -> Dict[str, Any]:
+        """额外边界用例：None/空/极端值（仅单参数函数——多参数函数
+        边界形态依赖参数语义，统一生成会误判，由单元自带样例覆盖）。"""
+        extra_cases = self._gen_boundary_cases(req.task)
+        if not extra_cases:
+            return {"level": "L3边界", "ok": True, "evidence": "无额外边界用例"}
+
+        func_name, n_args, _a0 = _first_func_info(req.code)
+
+        if not func_name:
+            return {"level": "L3边界", "ok": True, "evidence": "跳过（无函数）"}
+
+        if n_args is not None and n_args != 1:
+            return {"level": "L3边界", "ok": True,
+                    "evidence": f"跳过（函数 {n_args} 个参数，边界形态依赖参数语义）"}
+
+        # 单参数但参数是图/状态/字典类（adj/graph/table/state…）→ 边界形态
+        # 依赖具体语义（如 [] 传 max_clique(adj) 是类型错误而非代码缺陷）——
+        # 由单元自带样例覆盖，不统一生成边界
+        DICTISH_ARGS = {"adj", "graph", "g", "table", "state", "env", "cond",
+                        "nodes", "node", "map", "units", "db", "queue",
+                        "buffer", "registry", "cert"}
+        if n_args == 1 and _a0 in DICTISH_ARGS:
+            return {"level": "L3边界", "ok": True,
+                    "evidence": f"跳过（参数 {_a0} 为图/状态类，边界由样例覆盖）"}
+
+        # 执行在受控时限子进程中（issue #91 根因③）
+        res = _run_guarded(req.code, list(extra_cases), func_name, "boundary",
+                           self.exec_timeout)
+        blocked = _guard_fail(res, "L3边界")
+        if blocked:
+            return blocked
+        if res["exec"] == "error":
+            return {"level": "L3边界", "ok": False,
+                    "evidence": f"执行失败: {res['exec_err']}"}
+        if not res["found"]:
+            return {"level": "L3边界", "ok": True, "evidence": "跳过（无函数）"}
+        for r in res["results"]:
+            return {"level": "L3边界", "ok": False, "evidence": r["detail"]}
+        return {"level": "L3边界", "ok": True,
+                "evidence": f"{len(extra_cases)} 组边界用例通过"}
+
+    def _gen_boundary_cases(self, task: str) -> List[Tuple[Any, Any]]:
+        """根据任务类型生成边界用例（白箱规则，非 LLM）。
+
+        注意：不带「反转」——字典反转等单元收 dict（值变键），序列边界
+        [] 是类型错误而非代码缺陷；反转边界由单元自带样例覆盖。
+        """
+        t = task.lower()
+        if any(w in t for w in ("排序", "sort", "去重", "dedup")):
+            return [([], []), ([1], [1]), (None, "any")]
+        if any(w in t for w in ("最大", "max", "最小", "min")):
+            return [([], None), ([5], 5), (None, "any")]  # 空列表→None（与单元语义一致）
+        if any(w in t for w in ("求和", "sum")):
+            return [([], 0), (None, "any")]
+        if any(w in t for w in ("计数", "count", "频率", "freq")):
+            return [([], {}), (None, "any")]  # Counter 语义：空列表 → {}
+        # 字符串族：拆分/替换/拼接/判断/对齐/哈希/分词/格式化——空串语义因函数而异
+        # （分词空串→[]、拼接空列表→''），统一断言会误判 → 只查「空串处理不崩溃」
+        if any(w in t for w in ("字符串", "拆分", "替换", "拼接", "判断", "对齐",
+                                "哈希", "分词", "格式化")):
+            return [("", "any")]
+        # 数学族：舍入/统计/数学函数/均值/众数/分位数——零输入形态因函数而异
+        # （列表统计收 []、数值函数收 0），统一断言会误判 → 只查「零输入不崩溃」
+        if any(w in t for w in ("舍入", "统计", "数学函数", "均值", "众数", "分位数")):
+            return [(0, "any")]
+        return []
+
+    # ---------- ⑤ 规范符合性（白箱规则 + condition_kb） ----------
+    def _check_spec_compliance(self, req: VerifyRequest) -> Dict[str, Any]:
+        """结构规范 + 语义对齐（condition_kb 查条件路由表）。"""
+        errors = []
+
+        # 结构规范：任务关键词 → 应包含的结构（白箱规则）
+        # 注意：只保留「强信号」结构（排序/去重/反转有字面可查的典型结构）。
+        # 「循环」类任务在编译器域以字节码/展开形式实现（无 for/while 字面量），
+        # 统一强查会误判——循环语义由 L2 样例裁决，不在此字面强查。
+        # 排序：接受比较符、sorted(key=) 键控、reorder 重排（排序键控/报文重排序）
+        # 反转：排除「字典反转」（值变键语义，无序列反转结构）
+        structure_rules = {
+            "排序": ["<", ">", "sorted", "key=", "reorder"],
+            "sort": ["<", ">", "sorted", "key=", "reorder"],
+            "去重": ["set", "seen"], "dedup": ["set", "seen"],
+            "反转": ["::-1", "reverse", "reversed"],
+        }
+        for kw, patterns in structure_rules.items():
+            if kw in req.task and req.expected_structure.get("skip_structure"):
+                continue
+            if kw in req.task:
+                if kw in ("反转",) and "字典" in req.task:
+                    continue  # 字典反转：值变键语义，无序列反转结构
+                # 大小写不敏感：本表是**语言无关的任务语义判据**（要求「去重结构
+                # 出现」这一事实），而字面取自 Python 命名习惯（set/seen）——
+                # JS 标准 API 写作 `new Set(arr)`，敏感匹配把正确实现判为
+                # 「未见对应结构」（实测 code-js/去重 假失败，v10 修正）。
+                # 放宽仅限大小写，令牌本身仍必须出现（不弱化判据强度）。
+                hit = any(p.lower() in req.code.lower() for p in patterns)
+                if not hit and not req.expected_structure.get("structure_optional"):
+                    errors.append(f"任务含「{kw}」但代码未见对应结构 {patterns}")
+
+        # 语义对齐：condition_kb 查该任务的条件规律，代码应有对应处理
+        try:
+            from condition_kb import ConditionKB
+            kb = ConditionKB()
+            sem = kb.lookup(req.task)
+            if sem and sem.get("match"):
+                # 查到的规律描述包含条件词 → 代码应体现条件分支
+                cond_words = ["如果", "若", "when", "if", "条件", "情况"]
+                has_cond = any(w in req.code for w in cond_words)
+                if any(w in sem.get("match", "") for w in ["条件", "如果", "当"]) \
+                        and not has_cond \
+                        and not req.expected_structure.get("no_cond_needed"):
+                    errors.append(f"condition_kb 提示「{sem.get('match', '')[:30]}」需条件处理但代码无分支")
+        except Exception:
+            pass  # condition_kb 不可用时跳过（不影响主校验）
+
+        # 条件论注释规范（WB-SPEC v1.2，用户条件论要求）：
+        # R1 函数/类等抽象的总体功能必须中文注释（docstring 或紧跟 # 中文注释）
+        # R2 注释须为中文语境（英文缩写嵌入中文说明；纯英文注释行违规）
+        # R3/R4（六要素契约）恒执行并回报达标率——见 _check_comment_spec 的纪律说明
+        self._comment_notes = []
+        self._ccg_stat = {}
+        errors.extend(self._check_comment_spec(req))
+
+        if errors:
+            return {"level": "规范符合性", "ok": False, "ccg": self._ccg_stat,
+                    "evidence": "; ".join(errors)}
+        # evidence 必须**如实**：改造前无论 R3/R4 是否执行都写「条件论注释通过」，
+        # 等于把「没检查」冒充「检查通过」（固化记录里留下了这类伪证）。
+        detail = "；".join(self._comment_notes) or "R3/R4 无可检符号"
+        return {"level": "规范符合性", "ok": True, "ccg": self._ccg_stat,
+                "evidence": f"结构规范 + 语义对齐 + 条件论注释 R1/R2 通过（{detail}）"}
+
+    def _check_comment_spec(self, req: VerifyRequest) -> list:
+        """条件论注释规范（WB-SPEC v1.2）：R1 函数/类中文注释 + R2 注释中文语境。
+
+        R1：每个 FunctionDef/AsyncFunctionDef/ClassDef 必须有 docstring 或
+            紧跟的 # 中文注释描述其总体功能。
+        R2：注释行必须为中文语境（含中文字符）——英文缩写嵌入中文说明；
+            纯英文注释行（无任何中文）违规。
+        非 Python 源码分两档（见下方 except 分支）：Python 模板（含 `{fn}` 占位符）
+        展开后走本函数的**全量**判据；真·非 Python（Rust/JS）走文本判据。
+        expected_structure.no_comment_spec=True 可豁免（如注入型组装片段）。
+        """
+        if req.expected_structure.get("no_comment_spec"):
+            return []
+        code = req.code
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            # 分支 A·Python 模板：`*_UNITS` 的 pattern 是**带占位符的模板**
+            # （`def {fn}(arr):`），ast.parse 必然 SyntaxError。改造前这类模板
+            # 与 Rust/JS 一样落到 `return []` 静默跳过；v8 起落到文本判据——
+            # 但那是**降级判据**（只查三要素字面，不查 R1 逐符号中文注释 / R2
+            # 纯英文注释行）。故此优先展开占位符再进 Python 判据（v9），
+            # 使 Python 模板与六域单元获得同强度判据。
+            rendered = self._render_placeholders(code, req)
+            if rendered != code:
+                try:
+                    tree = ast.parse(rendered)
+                except SyntaxError:
+                    return self._check_comment_spec_text(req)
+                code = rendered
+            else:
+                # 分支 B·真非 Python 源码（Rust / JavaScript 模板）：ast 无法解析。
+                # 改造前此处 `return []` = **静默跳过**，等于给多语言单元发
+                # 「假通过」——实测 RUST_UNITS/JS_UNITS 各 5 单元的 CCG 契约 0/5
+                # 达标，而 verifier 报「R3 缺 0」（`_ccg_stat` 留空、不进分母）
+                # → 审计报告完全隐身。
+                return self._check_comment_spec_text(req)
+        src_lines = code.splitlines()
+        _has_cn = lambda s: any('\u4e00' <= c <= '\u9fff' for c in s)
+        errs = []
+        # R1：函数/类中文注释
+        missing = []
+        for f in ast.walk(tree):
+            if not isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                  ast.ClassDef)):
+                continue
+            doc = ast.get_docstring(f)
+            if doc and _has_cn(doc):
+                continue
+            ok = False
+            # 查 def/class 前后各 2 行内的 # 中文注释（docstring 已单独检查）
+            for ln in src_lines[max(0, f.lineno - 2):f.lineno + 3]:
+                if ln.strip().startswith('#') and _has_cn(ln):
+                    ok = True
+                    break
+            if not ok:
+                missing.append(f.name)
+        if missing:
+            errs.append(f"函数/类缺中文注释（条件论 R1）: {missing[:5]}")
+        # R2：注释行中文语境
+        bad_lines = []
+        for i, ln in enumerate(src_lines, 1):
+            s = ln.strip()
+            if s.startswith('#') and not _has_cn(s) and len(s) > 3:
+                bad_lines.append(f"L{i}")
+        if bad_lines:
+            errs.append(f"纯英文注释行（条件论 R2，须中文说明）: {bad_lines[:5]}")
+        # R3/R4：CCG 六要素注释——**默认软模式恒执行**（2026-09-17 修复）。
+        #
+        # 改造前的缺陷（「规范没有被执行」的机械根因，用户 2026-09-17 定性）：
+        #   ① R3/R4 被包在 `require_cond_comment` / `require_not_cond` 开关内，
+        #      而全仓**无任何调用方**传入这两个键 → 判据为**死代码**，恒不执行；
+        #   ② 但 evidence 恒写「条件论注释通过」——R1/R2 通过即谎报六要素达标，
+        #      于是 code_solidified.json 留下「零标记却通过」的**伪证**；
+        #   ③ 判据自身只查**首个** def、窗口只覆盖 def 前 2 行——与既有单元库
+        #      104+ 处标记的实际形态（`# 生效条件：` 紧跟 def 行之后）物理不相容。
+        # 现纪律：软模式**恒执行**并把达标率写入 evidence（诚实报告，不静默），
+        # 硬拦截仅在开关被显式传入时（全库升级完成后由调用方开启）。
+        r3_missing, total = self._cond_comment_missing(tree, src_lines)
+        if total:
+            self._comment_notes.append(
+                f"R3 三要素 {total - len(r3_missing)}/{total} 达标")
+        r4_missing, _ = self._not_cond_missing(tree, src_lines)
+        # 结构化留痕：软模式不拦截，若只把结论写进 evidence **字符串**，
+        # `--audit` 就无法机械汇总缺失清单——「规范没被执行」正是这样隐身的。
+        self._ccg_stat = {"r3_total": total, "r3_missing": r3_missing,
+                          "r4_missing": r4_missing}
+        if r3_missing:
+            msg = f"条件论三要素注释缺失（R3）: {r3_missing[:5]}"
+            if req.expected_structure.get("require_cond_comment"):
+                errs.append(msg)
+            else:
+                self._comment_notes.append(msg + "（软模式，不拦截）")
+        if r4_missing:
+            msg = f"不适用条件缺失（R4·代码语义条件协议）: {r4_missing[:5]}"
+            if req.expected_structure.get("require_not_cond"):
+                errs.append(msg)
+            else:
+                self._comment_notes.append(msg + "（软模式，不拦截）")
+        return errs
+
+    def _render_placeholders(self, code: str, req: VerifyRequest) -> str:
+        """展开单元模板占位符（`{fn}` → 具体标识符），使模板可被 ast 解析。
+
+        为什么需要：`*_UNITS` 的 pattern 是模板形态（`def {fn}(arr):`），
+        未经 `code_compose.compose_code` 替换前**不是合法 Python**——直接
+        ast.parse 必 SyntaxError，判据就会降级（v7 静默跳过 / v8 文本判据）。
+        展开后 template 与「运行时真实生成的代码」同形，R1/R2/R3/R4 全量判据
+        才真正作用于模板本体（v9）。
+
+        占位符名真源：`expected_structure["params"]`（调用方传单元声明的参数名），
+        缺省回退约定名 `("fn",)`（`code_compose` 第 17 行声明的模板约定）。
+        只替换**声明过的**占位符——不做正则通配，避免误伤 f-string / dict 字面量
+        （`{x}`、`{1: 1}` 形态）。
+        返回值与输入相同 = 无占位符可展开（调用方据此判定「真·非 Python」）。
+        """
+        names = req.expected_structure.get("params") or ("fn",)
+        out = code
+        for p in names:
+            out = out.replace("{" + str(p) + "}", "solve")
+        return out
+
+    def _check_comment_spec_text(self, req: VerifyRequest) -> list:
+        """非 Python 源码的 CCG 契约判据（Rust / JavaScript，`//` 或 `#` 注释）。
+
+        存在理由：`ast.parse` 对非 Python 源码抛 `SyntaxError`。改造前该分支直接
+        `return []` = **静默跳过**——多语言单元在校验器眼里永远「合规」，
+        `_ccg_stat` 留空不进分母，缺口在审计报告里完全隐身
+        （实测：verifier 报 R3 缺 0，文本实缺 5/5）。
+
+        判据与 Python 分支**同口径**（分层不重复）：
+          · 入口符号 = 首个非空非注释行（Rust `fn {fn}(...)`、JS `function {fn}(...)`）；
+          · 注释块 = 入口行之后的连续 `//`/`#` 行；
+          · R3 三要素（生效条件/子功能/执行）+ R4 不适用条件——软模式，恒执行；
+          · R1/R2 精神：注释块须含中文（缺失则硬拦截，与 Python 分支一致）。
+        """
+        lines = req.code.splitlines()
+        entry = next((i for i, ln in enumerate(lines)
+                      if ln.strip() and not ln.strip().startswith(("//", "#"))),
+                     None)
+        if entry is None:
+            return []
+        block = []
+        for ln in lines[entry + 1:]:
+            s = ln.strip()
+            if s.startswith(("//", "#")):
+                block.append(s.lstrip("/#").strip())
+            elif not s:
+                continue
+            else:
+                break
+        joined = " ".join(block)
+        _has_cn = lambda s: any('\u4e00' <= c <= '\u9fff' for c in s)
+        errs = []
+        if not block or not _has_cn(joined):
+            errs.append(f"入口符号缺中文注释（条件论 R1/R2）: L{entry + 1}")
+        need = ("生效条件", "子功能", "执行")
+        r3_missing = [k for k in need if k not in joined]
+        r4_missing = [] if "不适用条件" in joined else [f"L{entry + 1}"]
+        # 与 Python 分支同款结构化留痕（分母记 1 = 入口符号，不是「整个文件」）
+        self._ccg_stat = {"r3_total": 1, "r3_missing": r3_missing,
+                          "r4_missing": r4_missing, "mode": "text"}
+        if r3_missing:
+            msg = f"条件论三要素注释缺失（R3·文本判据）: {r3_missing}"
+            if req.expected_structure.get("require_cond_comment"):
+                errs.append(msg)
+            else:
+                self._comment_notes.append(msg + "（软模式，不拦截）")
+        if r4_missing:
+            msg = "不适用条件缺失（R4·文本判据）"
+            if req.expected_structure.get("require_not_cond"):
+                errs.append(msg)
+            else:
+                self._comment_notes.append(msg + "（软模式，不拦截）")
+        return errs
+
+    def _ccg_scope(self, tree) -> list:
+        """R3/R4 共同判定面：CCG 注释的**检查对象** = 单元入口（唯一口径）。
+
+        三处判据校准（2026-09-17，依据 `--audit` 实测暴露的噪声）：
+          ① **只用 `tree.body` 顶层**——改造前用 `ast.walk`，会把**类内方法**
+             也展开计入（实测 `Cat` 与 `Cat.speak` 同现、`speak` 重复两次）；
+          ② **排除 `*_test` / `test_*` / `_` 前缀**——测试样例代码与私有辅助
+             不是契约对象（实测 `closure_test`/`gen_test`/`with_test` 等被计入分母）；
+          ③ **取首个合格符号 = 单元对外入口**——`*_units.py` 的既有约定：
+             pattern 首符号承载「何时可调 / 做什么 / 怎么用」，内部辅助
+             （dfs/walk/find/h1/up/down）无外部调用方，由 R1 中文注释覆盖。
+        与改造前注释声明的设计意图一致（「检查首个 def/class；内部辅助函数由
+        R1 覆盖」），修的是**窗口错位与谎报**，不是检查面。
+        """
+        for n in getattr(tree, "body", []):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                nm = n.name
+                if (nm.startswith("_") or nm.endswith("_test")
+                        or nm.startswith("test_")):
+                    continue
+                return [n]
+        return []
+
+    def _ccg_block(self, f, src_lines) -> tuple:
+        """读取单个符号的 CCG 注释块：返回 (注释行文本列表, docstring)。
+
+        窗口 = def/class 签名行之后、**函数体首个语句之前**的 `#` 注释
+        （多行签名的续行非 `#` 起始，自然跳过）+ docstring。
+        该窗口即既有单元库 104+ 处标记的实际物理位置（`# 生效条件：` 紧贴
+        def 行下一行）；`f.body[0].lineno` 保证多行签名下窗口仍正确。
+
+        **唯一真源**（2026-09-17 裁决 A）：窗口计算委托
+        `codeindex._body_comments`。历史问题：本函数曾自述「与
+        `codeindex._body_comments` 同款语义」，而该名当时**并不存在**——
+        悬空引用即第二份真相，已由本次收敛坐实。
+
+        兜底（第 7 条）：本模块有三种加载形态——`-m md_cg.whitebox_kb.wisdom.verifier`、
+        顶层 `wisdom.verifier`（wheel 发布态，见 code_compose.py）、直跑
+        `python verifier.py`；后两者 import 不到 `md_cg.codeindex`，故保留
+        **逐字等价的兜底**，等价性由 `md_cg/test_codeindex.py` 机械守卫。
+        """
+        body = getattr(f, "body", None)
+        body_lineno = body[0].lineno if body else f.lineno
+        raw = None
+        fn = _ci_body_comments()
+        if fn is not None:
+            raw = fn(src_lines, f.lineno, body_lineno)
+        if raw is None:
+            # 兜底（第 7 条）：与唯一真源**逐字等价**，等价性由
+            # md_cg/test_codeindex.py 的委托等价断言机械守卫。
+            raw = [ln.strip()
+                   for ln in src_lines[f.lineno:max(f.lineno, body_lineno - 1)]
+                   if ln.strip().startswith("#")]
+        out = [s.lstrip("#").strip() for s in raw]
+        doc = (ast.get_docstring(f) or "").strip()
+        return out, doc
+
+    def _cond_comment_missing(self, tree, src_lines) -> tuple:
+        """R3：缺「生效条件/子功能/执行」三要素的符号清单；返回 (missing, total)。
+
+        要素名真源 = `nodefile.CCG_CONTRACT_ROLES`（六要素接口契约）；
+        R3 只抽其中三要素——功能名由 R1 覆盖、验证方式与不适用条件由
+        `codeindex.render` 落槽（分层不重复，改造前此三要素从未被检查过）。
+        """
+        funcs = self._ccg_scope(tree)
+        need = ("生效条件", "子功能", "执行")
+        missing = []
+        for f in funcs:
+            block, doc = self._ccg_block(f, src_lines)
+            joined = " ".join(block) + " " + doc
+            if not all(k in joined for k in need):
+                missing.append(f.name)
+        return missing, len(funcs)
+
+    def _not_cond_missing(self, tree, src_lines) -> tuple:
+        """R4：缺「不适用条件」的符号清单；返回 (missing, total)。
+
+        不适用条件 = 拒绝域 rejection_domain（何时**不能**调用）——
+        知道边界才敢调用，与「何时能调用」同等重要。
+        """
+        funcs = self._ccg_scope(tree)
+        missing = []
+        for f in funcs:
+            block, doc = self._ccg_block(f, src_lines)
+            joined = " ".join(block) + " " + doc
+            if "不适用条件" not in joined:
+                missing.append(f.name)
+        return missing, len(funcs)
+
+    # ---------- ⑥ 集成测试 ----------
+    def _check_integration(self, req: VerifyRequest) -> Dict[str, Any]:
+        """依赖单元组装 + 端到端运行（简化：deps 代码拼接后执行）。
+
+        **执行在受控时限子进程中**（issue #91 根因③）；deps 与 req.code 拼接后
+        一并送入，故依赖代码的顶层语句同样跑不出时限、也碰不到外面。
+        """
+        if not req.deps:
+            return {"level": "集成", "ok": True, "evidence": "无依赖（跳过）"}
+        try:
+            combined = "\n\n".join(req.deps) + "\n\n" + req.code
+            func_name, _n, _a0 = _first_func_info(req.code)
+            first_case = list(req.cases[:1])
+            res = _run_guarded(combined, first_case, func_name, "integration",
+                               self.exec_timeout)
+            blocked = _guard_fail(res, "集成")
+            if blocked:
+                return blocked
+            if res["exec"] == "error":
+                return {"level": "集成", "ok": False,
+                        "evidence": f"组装失败: {res['exec_err']}"}
+            for r in res["results"]:
+                return {"level": "集成", "ok": False, "evidence": r["detail"]}
+            return {"level": "集成", "ok": True,
+                    "evidence": f"{len(req.deps)} 个依赖组装 + 端到端通过"}
+        except Exception as e:
+            return {"level": "集成", "ok": False,
+                    "evidence": f"组装失败: {e}"}
+
+
+# ============ 四、CLI ============
+
+def _build_request_from_file(path: str) -> VerifyRequest:
+    """从 JSON 文件构建校验请求。"""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return VerifyRequest(
+        task=data.get("task", ""),
+        code=data.get("code", ""),
+        unit_id=data.get("unit_id", ""),
+        lang=data.get("lang", "python"),
+        cases=[tuple(c) for c in data.get("cases", [])],
+        deps=data.get("deps", []),
+        expected_structure=data.get("structure", {}),
+    )
+
+
+def _self_test() -> bool:
+    """自测：排序单元应通过，错误代码应失败。"""
+    v = Verifier()
+    passed = 0
+
+    # 正确代码（含中文注释——条件论注释规范 R1）
+    good_code = (
+        "def solve(arr):\n"
+        "    # 排序：冒泡法（相邻比较交换，最小元素浮到头部）\n"
+        "    n = len(arr)\n"
+        "    for i in range(n):\n"
+        "        for j in range(n-1-i):\n"
+        "            if arr[j] > arr[j+1]:\n"
+        "                arr[j], arr[j+1] = arr[j+1], arr[j]\n"
+        "    return arr\n"
+    )
+    r1 = v.verify(VerifyRequest(
+        task="排序", code=good_code, unit_id="test_sort",
+        cases=[([3, 1, 2], [1, 2, 3]), ([], []), ([1], [1])],
+    ))
+    print(f"[1] 排序正确代码: {r1.summary()}")
+    passed += 1 if r1.ok else 0
+
+    # 错误代码（冒泡逻辑反了）
+    bad_code = good_code.replace("if arr[j] > arr[j+1]", "if arr[j] < arr[j+1]")
+    r2 = v.verify(VerifyRequest(
+        task="排序", code=bad_code, unit_id="test_sort_bad",
+        cases=[([3, 1, 2], [1, 2, 3]), ([], []), ([1], [1])],
+    ))
+    print(f"[2] 排序错误代码: {r2.summary()}")
+    passed += 1 if not r2.ok else 0
+
+    # 缓存命中
+    r3 = v.verify(VerifyRequest(
+        task="排序", code=good_code, unit_id="test_sort",
+        cases=[([3, 1, 2], [1, 2, 3]), ([], []), ([1], [1])],
+    ))
+    print(f"[3] 缓存命中: cached={r3.cached} {r3.summary()}")
+    passed += 1 if r3.cached else 0
+
+    # 语法错误
+    r4 = v.verify(VerifyRequest(
+        task="排序", code="def solve(arr):\n  return ", unit_id="test_syntax",
+        cases=[([1], [1])],
+    ))
+    print(f"[4] 语法错误: {r4.summary()}")
+    passed += 1 if not r4.ok else 0
+
+    # 规范符合性（排序但无比较结构）
+    r5 = v.verify(VerifyRequest(
+        task="排序", code="def solve(arr):\n    return arr", unit_id="test_nosort",
+        cases=[([3, 1, 2], [3, 1, 2])],
+    ))
+    print(f"[5] 规范不符（排序无比较）: {r5.summary()}")
+    passed += 1 if not r5.ok else 0
+
+    print(f"\n自测: {passed}/5 通过")
+    return passed == 5
+
+
+def _audit_all() -> None:
+    """全量审计：六域单元库 → 本地校验器 → 报告（通过率/失败清单/缓存/耗时）。"""
+    from compiler_code_units import COMPILER_UNITS
+    from python_code_units import PYTHON_UNITS
+    from graph_db_units import GRAPH_UNITS
+    from os_units import OS_UNITS
+    from browser_units import BROWSER_UNITS
+    from net_units import NET_UNITS
+    domains = [('compiler', COMPILER_UNITS), ('pylang', PYTHON_UNITS),
+               ('graph', GRAPH_UNITS), ('os', OS_UNITS),
+               ('browser', BROWSER_UNITS), ('net', NET_UNITS)]
+    # 语言单元表（白箱自举主干）：改造前**不在审计面**——`_audit_all` 只遍历六域
+    # `*_units.py`，而模板生产的 CODE_UNITS/RUST_UNITS/JS_UNITS 从不进报告。
+    # 「规范没被执行」正是这样隐身的：生成端零契约 + 审计端不看它。
+    from code_compose import CODE_UNITS, RUST_UNITS, JS_UNITS
+    lang_domains = [('code-py', CODE_UNITS), ('code-rust', RUST_UNITS),
+                    ('code-js', JS_UNITS)]
+    t0 = time.time()
+    v = Verifier()
+    total = ok = 0
+    fails = []
+    by_domain = {}
+    ccg_total = ccg_missing = 0
+    ccg_gaps = []          # [(uid, r3_missing, r4_missing)] —— 软模式缺失清单
+    for dname, units in domains:
+        d_ok = d_fail = 0
+        for uid, u in units.items():
+            total += 1
+            req = VerifyRequest(
+                task=u['task'], code=u['pattern'], unit_id=uid,
+                cases=list(u.get('cases', [])),
+                expected_structure={'inject': True} if u.get('needs_inject') else {})
+            r = v.verify(req)
+            # CCG 六要素（软模式）汇总：R3/R4 缺失**不拦截**，故不能只看 r.ok——
+            # 必须单独取「规范符合性」check 里的结构化 ccg 块；否则「规范未执行」
+            # 会再次隐身（改造前 evidence 恒写「条件论注释通过」，无从发现）。
+            spec = next((c for c in r.checks if isinstance(c, dict)
+                         and c.get("level") == "规范符合性"), None)
+            st = (spec or {}).get("ccg") or {}
+            if st.get("r3_total"):
+                ccg_total += st["r3_total"]
+                ccg_missing += len(st.get("r3_missing") or [])
+                if st.get("r3_missing") or st.get("r4_missing"):
+                    ccg_gaps.append((uid, st.get("r3_missing") or [],
+                                     st.get("r4_missing") or []))
+            if r.ok:
+                ok += 1; d_ok += 1
+            else:
+                fails.append((uid, r.reason[:80])); d_fail += 1
+        by_domain[dname] = (d_ok, d_fail)
+    s = v.cache.stats()
+    print(f"=== 全量审计（verifier v{VERIFIER_VERSION}）: {ok}/{total} 通过 "
+          f"({100.0 * ok / total:.1f}%） 耗时 {time.time() - t0:.1f}s ===")
+    print("各域:", by_domain)
+    # CCG 六要素报告必须**显式打印**：单元"校验通过"只代表 L1-L3 + R1/R2 过了，
+    # 六要素接口契约是否达成是另一件事——两者混为一谈正是问题根源。
+    rate = (100.0 * (ccg_total - ccg_missing) / ccg_total) if ccg_total else 0.0
+    print(f"CCG 三要素（R3 软模式）: {ccg_total - ccg_missing}/{ccg_total} 符号达标"
+          f"（{rate:.1f}%） | 有缺失的单元 {len(ccg_gaps)}/{total} 个")
+    if ccg_gaps:
+        print("--- CCG 注释缺失清单（软模式，不拦截）---")
+        for uid, m3, m4 in ccg_gaps:
+            print(f"[{uid}] R3缺={m3[:6]} R4缺={m4[:4]}")
+    # --- 语言单元表（自举主干）CCG 契约审计 ---
+    # 与六域**分开统计**，原因有二：
+    #   ① RUST/JS 模板非 Python 语法，L1 语法必失败属正常（校验器与目标语言
+    #      不匹配），此处只问「契约是否写进模板」——走文本判据
+    #      （`_check_comment_spec_text`，mode="text"）；
+    #   ② CODE_UNITS 是 Python 模板但含 `{fn}` 占位符（未替换前非法 Python），
+    #      v9 起由 `_render_placeholders` 展开后走**全量 Python 判据**
+    #      （mode="python"：R1 逐符号中文注释 + R2 注释语境 + R3/R4），
+    #      故本节 `params` 必须透传单元声明的占位符名。
+    # 两档判据强度不同但**达标口径一致**（三要素 + 不适用条件齐备）。
+    lang_total = lang_ok = 0
+    lang_gaps = []
+    lang_modes = {}        # 判据档位计数（python=全量判据 / text=文本判据）
+    for dname, units in lang_domains:
+        for uid, u in units.items():
+            lang_total += 1
+            r = v.verify(VerifyRequest(task=u.get('task', ''), code=u['pattern'],
+                                       unit_id=uid, cases=[],
+                                       expected_structure={
+                                           'params': u.get('params') or ['fn']}))
+            spec = next((c for c in r.checks if isinstance(c, dict)
+                         and c.get("level") == "规范符合性"), None) or {}
+            st = spec.get("ccg") or {}
+            r3m = st.get("r3_missing") or []
+            r4m = st.get("r4_missing") or []
+            md = st.get("mode", "python")
+            lang_modes[md] = lang_modes.get(md, 0) + 1
+            # 「达标」= 判据产出 + 无硬失败 + 契约齐备，三者缺一不可——
+            # 只统计 ccg 缺失会漏报 R1/R2 硬失败（spec.ok=False 但 ccg 齐备
+            # 仍会被算作达标）= 新的谎报面（同 v7「没检查冒充检查通过」同构）。
+            if not st.get("r3_total"):
+                lang_gaps.append((dname, uid, md, "判据未产出（ccg 块为空）"))
+            elif not spec.get("ok"):
+                lang_gaps.append((dname, uid, md,
+                                  f"硬失败: {str(spec.get('evidence'))[:90]}"))
+            elif r3m or r4m:
+                lang_gaps.append((dname, uid, md, f"R3缺={r3m} R4缺={r4m}"))
+            else:
+                lang_ok += 1
+    lrate = (100.0 * lang_ok / lang_total) if lang_total else 0.0
+    print(f"=== 语言单元表 CCG 契约: {lang_ok}/{lang_total} 达标（{lrate:.1f}%）"
+          f" | 判据档位 {lang_modes}（python=展开占位符后全量判据 / text=文本判据）===")
+    for dname, uid, md, desc in lang_gaps:
+        print(f"   [{dname}/{uid}] mode={md} {desc}")
+    print(f"缓存: 共 {s['total']} 条（通过 {s['passed']} / 失败 {s['failed']}）"
+          f" | 本进程命中 {s['hits']} / 未命中 {s['misses']}（命中率 {s['hit_rate']}%）")
+    if fails:
+        print("--- 失败清单 ---")
+        for uid, reason in fails:
+            print(f"[{uid}] {reason}")
+
+
+def _cost_model(daily_tokens: float = 1.3e9, hit_rate: float = 0.999,
+                price_hit: float = 2.0, price_full: float = 2.0,
+                days: int = 30) -> None:
+    """本地化成本对照模型（阶段 5 替换测算器）。
+
+    「原 LLM 校验环节」= 白箱自举的外部校准角色（LLM 查表校验）：白箱自举
+    总消耗 13 亿 token（用户实测），其中 99.9% 是重复查表校验（反复读同样
+    的单元/代码/规则表——即 LLM 缓存命中）。本地校验器（六层确定性规则 +
+    sha256 指纹缓存）接管后，这部分 token 归零；仅剩 0.1% 为真·新任务
+    （新单元设计/语义校准）保留 LLM 价值。
+
+    默认参数取自设计文档实测：13 亿 token/天、99.9% 缓存命中、GLM 缓存价
+    2 元/百万。原方案：全部 token 经 LLM（命中按缓存价计费）；
+    本地化后：命中部分走本地磁盘（≈0 成本），仅未命中部分保留 LLM 兜底。
+    """
+    per_m = 1e6
+    orig = daily_tokens * (hit_rate * price_hit + (1 - hit_rate) * price_full) / per_m
+    local = daily_tokens * (1 - hit_rate) * price_full / per_m
+    saved = orig - local
+    print(f"=== 本地化成本对照（LLM 查表校验 → 本地校验缓存）===")
+    print(f"背景: 白箱自举外部校准（LLM 查表校验）日消耗 {daily_tokens:.3g} token，"
+          f"其中 {hit_rate*100:.1f}% 为重复查表（缓存命中）")
+    print(f"输入: 每日 token {daily_tokens:.3g} | 命中率 {hit_rate*100:.1f}% "
+          f"| 命中价 {price_hit} 元/百万 | 未命中价 {price_full} 元/百万")
+    print(f"原方案（LLM 缓存命中付费）: {orig:,.2f} 元/天 ≈ {orig*days:,.0f} 元/{days}天")
+    print(f"本地化后（命中零成本，仅未命中 LLM 兜底）: {local:,.2f} 元/天 "
+          f"≈ {local*days:,.0f} 元/{days}天")
+    print(f"节省: {saved:,.2f} 元/天 ≈ {saved*days:,.0f} 元/{days}天 "
+          f"（省 {(100*saved/orig if orig else 0):.1f}%）")
+    print(f"对照: 白箱自举 {daily_tokens:.3g} token 中 "
+          f"{daily_tokens*hit_rate:.3g} token（{hit_rate*100:.1f}%）为重复查表校验，"
+          f"由 verifier 本地缓存接管后 token 归零")
+    if hit_rate == 1.0:
+        print("命中率 100% → 本地化后每日成本归零（磁盘 I/O 可忽略）")
+
+
+def main() -> None:
+    import argparse
+    ap = argparse.ArgumentParser(description="白箱本地校验器（零 LLM）")
+    ap.add_argument("--verify", type=str, help="校验请求 JSON 文件路径")
+    ap.add_argument("--cache-stats", action="store_true", help="缓存统计")
+    ap.add_argument("--audit", action="store_true", help="全量审计（六域单元）")
+    ap.add_argument("--cost-model", action="store_true", help="本地化成本对照模型")
+    ap.add_argument("--tokens", type=float, default=1.3e9, help="每日 token 量")
+    ap.add_argument("--hit-rate", type=float, default=0.999, help="缓存命中率")
+    ap.add_argument("--price-hit", type=float, default=2.0, help="命中价 元/百万")
+    ap.add_argument("--price-full", type=float, default=2.0, help="未命中价 元/百万")
+    ap.add_argument("--days", type=int, default=30, help="测算天数")
+    ap.add_argument("--self-test", action="store_true", help="自测")
+    args = ap.parse_args()
+
+    if args.self_test:
+        sys.exit(0 if _self_test() else 1)
+
+    if args.cost_model:
+        _cost_model(args.tokens, args.hit_rate, args.price_hit,
+                    args.price_full, args.days)
+        return
+
+    if args.audit:
+        _audit_all()
+        return
+
+    if args.cache_stats:
+        stats = VerifyCache().stats()
+        sv = VerifyCache().savings()
+        print(f"缓存统计: 共 {stats['total']} 条（通过 {stats['passed']} / 失败 {stats['failed']}）")
+        print(f"命中计数: 本进程命中 {stats['hits']} / 未命中 {stats['misses']}（命中率 {stats['hit_rate']}%）")
+        print(f"审计日志: {sv['requests']} 次校验（缓存命中 {sv['hits']} 次）")
+        print(f"减少的 LLM 输入: 累计 {sv['saved_chars']:,} 字符"
+              f" ≈ {sv['saved_tokens']:,} token（表+请求内容经本地处理，不再输入 LLM）")
+        print("（每次命中 = 一次本该发生的 LLM 查表 → 本地零计算返回）")
+        return
+
+    if args.verify:
+        req = _build_request_from_file(args.verify)
+        result = Verifier().verify(req)
+        print(json.dumps(asdict(result), ensure_ascii=False, indent=1))
+        return
+
+    ap.print_help()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,63 @@
+# npm 打包排除清单（子目录 .npmignore 优先于 package.json 的 files 白名单）
+#
+# 背景：package.json 的 files 白名单包含整个 md_cg/ 目录，而 npm 打包不看 .gitignore，
+# 导致本地 Python 字节码缓存（124 个 .pyc）被一并打进发布产物。
+# 教训：白名单粒度到目录时，须在目录内用 .npmignore 显式回收本地构建副产物。
+
+# Python 字节码缓存（递归任意层级：__pycache__/、aeis_core/、wisdom/ 等）
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 本地运行副产物
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+*.log
+*.tmp
+*.bak
+.DS_Store
+
+# ⚠️ 本地运行时状态 —— 绝不入包（2026-09-14 修复）
+# 背景：_keys.json 是写入凭据信封（含全部密钥包裹），_audit.jsonl 是操作留痕。
+# 二者随认知图运行生成，npm 打包不看 .gitignore，故必须在目录内显式排除。
+# 实证：修复前 npm pack 清单含 md_cg/_keys.json (294B) + md_cg/_audit.jsonl (788B)。
+# 影响面：0.4.6 未受影响（_keys.json 创建于 2026-09-13，晚于 0.4.6 发布）；
+#         但 0.4.7 若按修复前状态发布将泄露凭据到公开 registry。
+_keys.json
+_keys.*.json
+_audit.jsonl
+_index.json
+_index.json.lock
+_index_log/
+_refindex.json
+_index_log*
+# ─────────────────────────────────────────────────────────────────────────────
+# 发版门禁收口（PUBLISH-GATE-CLOSE-20260920）：私有数据面与含本机路径文件 —— 绝不入包
+#
+# 根因：package.json 的 files 白名单粒度到目录，而 npm 在存在 files 白名单时不读
+# .gitignore（本仓 2026-09-15 实证：根级 .npmignore 被整体忽略，仅白名单目录自身
+# 的 .npmignore 生效）。故 .gitignore 已忽略的白箱 KB 运行时数据与 md_cg/knowledge
+# 仍随白名单整体入包 —— 门禁 R2 命中 2449、R4 命中 2449（2026-09-20 实测）。
+# 本段规则与 .gitignore 对应条目同源，改 .gitignore 时须同步此处（第 6 条双副本）。
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 白箱 KB 运行时数据（SQLite / 嵌入 / 索引 / 审计 / 本地数据面）
+whitebox_kb/**/*.db
+whitebox_kb/**/*.db-shm
+whitebox_kb/**/*.db-wal
+whitebox_kb/**/*.npz
+whitebox_kb/**/neural_index.json
+whitebox_kb/knowledge/_ccg_dump.json
+whitebox_kb/knowledge/_index.json
+whitebox_kb/data/
+whitebox_kb/wisdom/audit_log/
+
+# 本地认知图数据（.gitignore 已整体忽略该目录：孤节点等本地记忆不入包）
+knowledge/
+
+# 含本机绝对路径的测试脚本（门禁 R3；本地路径常量由调用侧以 --root/env 传入）
+test_conformance.py
+test_mr_m1.py

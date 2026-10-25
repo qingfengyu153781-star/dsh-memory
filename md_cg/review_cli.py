@@ -1,0 +1,422 @@
+# -*- coding: utf-8 -*-
+"""review_cli · 审核队列裁决命令行（设计者/管理权限专用）
+
+**包内入口**（2026-09-24 修复）：原实现只在 `scripts/review_cli.py`，而出货包
+`files` 不含 `scripts/` —— 于是包内所有给用户/智能体的提示（writepipe 的
+「已入审核队列 → 请裁决」）都指向一个安装态不存在的文件。本模块把同一实现
+搬进包内，统一入口 `python -m md_cg.review_cli`；`scripts/review_cli.py`
+在源码树内仍可用（同一代码路径：那里 _HERE 同为插件根）。
+
+背景：本机未配置外部验证器（MDCG_VERIFIER_MODULES）时，写入恒判 DEFER
+入审核队列——这是诚实行为（不假装通过）。裁决权专属 can_admin 角色
+（写入者不得自裁自决），agent 端被 AccessDenied 拒绝是设计行为；
+由设计者在本机直接运行本命令完成裁决。
+
+用法（root 须与待裁决部署一致：--root 或环境变量 MDCG_ROOT）：
+  python -m md_cg.review_cli list
+  python -m md_cg.review_cli accept  <pid> --session <会话id> --reason "实跑测试证据"
+  python -m md_cg.review_cli reject  <pid> --reason "内容有误"
+  python -m md_cg.review_cli edit    <pid> --content "修正后内容" --reason "..."
+  python -m md_cg.review_cli merge   <pid> --into <已有节点id> --reason "..."
+  python -m md_cg.review_cli noop    <pid> --reason "已评估，判定无需改动"
+  python -m md_cg.review_cli rounds  <pid>        # 某提案裁决轮次历史
+  python -m md_cg.review_cli stats                # 裁决动作统计（含 noop）
+
+noop 语义：**已评估、判定不改变任何现有记忆**——只留痕（decisions.jsonl +
+审计 md 节点）并关闭提案，不落业务节点、不进负记忆。它与 reject 的区别是
+「评估过了、无需改动」而非「否掉这条候选」，故不可借 noop 绕过 accept 门控。
+
+变更单（三档自治批次②，kind=mutation）：队列里除「提案」外还有**变更单**
+——对既有记忆的 B 合并 / C 改写 / D 删除（设计 v0.2 §四）。`list` 会把它显式
+标为 `变更单(动作名→目标)`：accept = **执行**对应动作（B reinforce/converge、
+C 覆写落盘、D 软删），reject = 原样留痕不执行；edit/merge/noop 对变更单未定义
+（fail-closed 报错，不会静默当已处理）。存量条目无 `kind` 键，一律按提案走原
+路径（零迁移）。
+
+裁决留痕：decisions.jsonl + 审计 md 节点（由 review_decide 内部完成）。
+
+落盘归因（P1 修复，2026-09-26，DSH 端在役实测回告；2026-10-07 三态收口）：
+  · 会话：--session（各子命令通用）缺省取环境变量 MDCG_SESSION，仍无则落
+    **'unattributed'**（写归因三态第三态，MdCGSecure._attributed_session 单点；
+    不再使用随机会话 id）并 stderr 告警一行。同一批裁决传同一 session，落盘
+    节点的 frontmatter.session 才稳定一致（原实录为每次随机 sess_<uuid12>，
+    同批 5 节点 5 个会话 id——三态收口后消除）。
+  · 写入者：accept/edit 落盘节点的 frontmatter.writer 保留**提案原始写入者**
+    （propose 时库端快照的 actor，如 dsh-memory）；裁决者身份不丢失，记入
+    frontmatter.reviewer（designer-cli）。
+  · DSH 前置条件（环境侧自行核对，本 CLI 不校验）：MCP 写入面对 DSH 形态会话
+    id（session-<8>-<4>-<4>-<4>-<12>）有 `_normalize_session` 防编造校验
+    （md_cg/mcp_server.py）——会话目录须真存在于 MDCG_DSH_SESSIONS_ROOT 或
+    ~/.dsh/sessions 之下，否则该会话在 MCP 面降级为 anonymous。本 CLI 直构
+    Principal 不经该校验，但若裁决的会话 id 与 MCP 面共用，请先确认目录在位，
+    否则两侧归因对不上。
+"""
+import argparse
+import time
+import json
+import os
+import sys
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except AttributeError:
+    pass
+
+_HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from md_cg.mdcos import MdCGSecure        # noqa: E402
+# #69 契约面（本批唯一动作）：正文/摘要的取数**单点**——本 CLI 不再自写一份截断逻辑，
+# 将来契约若从甲改乙/丙，只改 mdcos 里那两个函数，CLI 自动跟随。
+from md_cg.mdcos import pending_digest    # noqa: E402
+from md_cg.security import Principal      # noqa: E402
+
+
+# 生效条件：args 的 root 属性为真值（含 getattr 缺省 None 时回落）否则回落 os.environ.get("MDCG_ROOT", "")，两者皆空串或该值经 os.path.isdir 判定不是目录时 sys.exit 退出，否则返回该 root。
+def _root(args):
+    root = getattr(args, "root", None) or os.environ.get("MDCG_ROOT", "")
+    if not root:
+        sys.exit("错误：未指定存储根（--root 或环境变量 MDCG_ROOT）。\n"
+                 "root 必须与待裁决的部署一致——猜错会裁决到另一个空库。")
+    if not os.path.isdir(root):
+        sys.exit("错误：root 不存在：%s" % root)
+    return root
+
+
+# 生效条件：args 的 session 属性为真值（含 getattr 缺省 None 回落）或环境变量 MDCG_SESSION 去空白后非空时返回该值（前者优先），两者皆无返回 None。
+def _session_of(args):
+    """裁决会话归属：--session > 环境变量 MDCG_SESSION > None（落 unattributed + 告警）。"""
+    s = str(getattr(args, "session", None)
+            or os.environ.get("MDCG_SESSION", "") or "").strip()
+    return s or None
+
+
+# 生效条件：args 就绪时先经 _session_of 取裁决会话归属，取到 None 时向 stderr 告警一行（缺省归属 unattributed、同批裁决请传同一 --session）后维持现状；随后构造写死权限的 Principal(actor="designer-cli", clearance="secret", can_write=True, can_admin=True, role="designer", auth_mode="local-cli", session=<上述归属>)，再以 _root(args) 取到的存储根返回 MdCGSecure(root, principal=p, autoflush=1)。
+def _cg(args):
+    session = _session_of(args)
+    if session is None:
+        # P1 归因（2026-09-26 取证；2026-10-07 设计者「会话身份三态」裁定收口）：
+        # 缺省不再落进程随机 sess_* ——写入归属经 MdCGSecure._attributed_session
+        # 三态解析落 'unattributed'（显式、可辨认；原实录「5 节点 5 个随机
+        # sess_*」由此消除）。同一批裁决要稳定归属仍请显式传同一 --session。
+        # 告警保留一行：缺省归属表达的是「无声明」，不是真实会话。
+        sys.stderr.write("警告：未指定 --session / 环境变量 MDCG_SESSION，"
+                         "本次裁决落盘会话归属为 unattributed（不再使用随机会话 id）"
+                         "——同一批裁决请传同一 --session 以稳定归属。\n")
+    p = Principal(actor="designer-cli", clearance="secret",
+                  can_write=True, can_admin=True, role="designer",
+                  auth_mode="local-cli", session=session)
+    # 索引可见性（P1b，2026-09-26）：autoflush=1 —— 与 mcp_server.py:3695-3702
+    # 同款（server 级兜底 2026-09-16 已修），本处是同一兜底的**第二落点**，
+    # DSH 端在役实测 read null 后补齐。根因：缺省 autoflush=64 时写入先经
+    # _stage 入内存 _dirty，攒够阈值才 flush() 落分片日志 `_index_log/`；
+    # 本 CLI 正常退出有 main 的 finally cg.close() 与库层 atexit 双兜底
+    # （mdcg.py _LIVE_CGS），但兜底刻意只覆盖正常退出——被 kill / 崩溃时
+    # 两者都不执行，裁决节点停在内存索引、日志从未落，盘面文件在而索引
+    # 链路断，在役旧读面 `_load_index` 盲信既有快照即 read null。逐条落
+    # 日志后任意退出形态下写入对其它进程立即可见（review_decide 自身的
+    # 显式 flush 只覆盖其目标/审计节点，且与节点文件落盘之间仍有窗口）。
+    return MdCGSecure(_root(args), principal=p, autoflush=1)
+
+
+# 生效条件：rec 支持 .get 时，取 rec.get("content") 为假值则取 rec.get("statement")、再为假值则取空串，把其中的换行替换为空格，并按 width（缺省 66）切片后仅当 len(text) > width 才追加 "…"，返回该字符串。
+def _brief(rec, width=66):
+    # #69 单点委派（2026-10-16）：取正文/statement、换行压平、截断加省略号——实现只在
+    # `mdcos.pending_digest` 一处；本函数保留为既有调用方的兼容入口（输出逐位不变）。
+    return pending_digest(rec, width)
+
+
+# 生效条件：rec 支持 .get 且其 kind 为 "mutation" 时返回「变更单(动作名→目标)」标签，其余（含缺键 = 存量提案）返回「提案」；本函数只读，不产生任何副作用；
+def _kind_label(rec):
+    """队列条目类型标签（三档自治批次②：变更单与提案在同一队列里可分辨）。
+
+    为什么要有：设计 §四「两类条目共用一个队列，靠类型字段区分」——显示面若
+    不区分，裁决者面对一张 `[pid] pending · contextual 层` 的单子看不出它是
+    「新写入候选」还是「对既有记忆的 B/C/D 变更单」，也无从知道确认后会发生
+    什么。缺键（存量条目）一律按提案显示（零迁移）。
+    """
+    try:
+        kind = str(rec.get("kind") or "").strip()
+        slot = (rec.get("extra") or {}).get("mutation") or {}
+    except AttributeError:
+        return "提案"
+    if kind != "mutation":
+        return "提案"
+    name = slot.get("action_name") or slot.get("action") or "?"
+    tgt = slot.get("target") or rec.get("id")
+    return "变更单(%s%s)" % (name, ("→ " + str(tgt)) if tgt else "")
+
+
+# ---- issue #71（2026-10-09 DSH 端）：待审队列的**单向索引**与**分级** ----
+# 索引由 cg.review_list() **单向派生**（inbox -> 索引），可随时重建；
+# **只放摘要（首行截 80 字）与元数据，不放正文**——正文留在 inbox（#69 甲：内部可追溯）。
+INDEX_REL = ("hippocampus", "inbox.index.json")
+SUMMARY_MAX = 80
+
+
+def _index_path(root):
+    return os.path.join(root, *INDEX_REL)
+
+
+def _build_index(cg):
+    """从 review_list() 派生索引条目（单向、可重建、不含正文）。"""
+    items = []
+    for r in (cg.review_list() or []):
+        items.append({
+            "pid": r.get("pid"),
+            "kind": _kind_label(r),
+            "verdict": r.get("status"),
+            "layer": r.get("layer"),
+            "tags": list(r.get("tags") or []),
+            "round": r.get("round") or 0,
+            "created_at": (r.get("created_at")
+                           or r.get("t") or None),
+            "summary": (_brief(r, SUMMARY_MAX) or ""),
+        })
+    return items
+
+
+def _age_days(item, now=None):
+    """积压龄（天）；无时间戳返回 None。"""
+    ts = item.get("created_at")
+    if ts is None:
+        return None
+    try:
+        return max(0.0, ((now or time.time()) - float(ts)) / 86400.0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _filter_sort(items, args):
+    """按 list 的分级参数过滤与排序（默认 age：最久未裁决优先）。"""
+    out_ = list(items)
+    q = (getattr(args, "query", None) or "").strip().lower()
+    if q:
+        out_ = [x for x in out_ if q in json.dumps(x, ensure_ascii=False).lower()]
+    tag = (getattr(args, "tag", None) or "").strip()
+    if tag:
+        out_ = [x for x in out_ if tag in (x.get("tags") or [])]
+    kind = (getattr(args, "kind", None) or "").strip()
+    if kind:
+        out_ = [x for x in out_ if str(x.get("kind") or "").startswith(kind)]
+    older = getattr(args, "older_than", None)
+    if older is not None:
+        out_ = [x for x in out_ if (_age_days(x) or 0.0) >= float(older)]
+    sort = (getattr(args, "sort", None) or "age")
+    if sort == "kind":
+        out_.sort(key=lambda x: (str(x.get("kind") or ""), str(x.get("pid") or "")))
+    else:
+        out_.sort(key=lambda x: -( _age_days(x) or 0.0))
+    return out_
+
+
+# issue #71（2026-10-09 DSH 端）：批量处置的**安全红线**——只接受**显式 pid**，
+# 且形态严格（prop_ + 十六进制）。**禁止通配/正则/tag 直批**：那等于把质量闸
+# 改成「自动通过」，与 policy 的必需六要素精神冲突。
+_PID_RE = __import__("re").compile(r"^prop_[0-9a-f]{6,}$")
+
+
+def _load_pids(path):
+    """读取「一行一个显式 pid」的批量清单；含非法形态即整体拒绝（返回 None）。"""
+    try:
+        raw = open(path, encoding="utf-8", errors="replace").read()
+    except OSError as exc:
+        sys.stderr.write("无法读取 --pids-file：%s" % exc + chr(10))
+        return None
+    ids, bad = [], []
+    for line in raw.splitlines():
+        tok = line.strip()
+        if not tok or tok.startswith("#"):
+            continue
+        if not _PID_RE.match(tok):
+            bad.append(tok)
+        else:
+            ids.append(tok)
+    if bad:
+        sys.stderr.write(
+            "拒绝执行：--pids-file 含非显式 pid 形态（禁通配/正则/tag）：%r"
+            "。请只写一行一个的显式 pid（形如 prop_1a2b3c4d）。" % bad[:5])
+        return None
+    if not ids:
+        sys.stderr.write("--pids-file 里没有任何显式 pid。" + chr(10))
+        return None
+    return ids
+
+
+# 生效条件：cg 与 args 就绪时按 args.cmd 分派——"list" 时 cg.review_list() 为空则打印空队列并返回 0、非空则逐条打印（tags 取真值拼接、layer/round 为假值显示 "?"/0）后返回 0；"rounds" 时打印 cg.review_rounds(args.pid) 并返回 0；"stats" 时打印 cg.review_stats() 的记录数/提案数/待审数/已关闭数与动作分布（含 noop 计数）并返回 0；"edit" 时以 args.content 加真值 args.tags（按逗号分割并剔除空项）/args.layer 组成 edits 调 cg.review_decide；其余 cmd（含 noop）以 getattr(args, "into", None) 与 args.reason 调 cg.review_decide；后两类再按 out.get("ok") 为真返回 0，否则打印 out 并返回 1。
+def _execute(cg, args):
+    """按子命令执行裁决（cg 的生命周期由 main 统一收尾）。"""
+    if args.cmd == "list":
+        items = _build_index(cg)
+        # 索引落盘（单向派生自 inbox；每次 list 都刷新，保证与队列一致）
+        idx_written = None
+        try:
+            ip = _index_path(_root(args))
+            os.makedirs(os.path.dirname(ip), exist_ok=True)
+            with open(ip, "w", encoding="utf-8") as f:
+                json.dump({"generated_at": time.time(),
+                           "count": len(items),
+                           "items": items}, f, ensure_ascii=False, indent=1)
+            idx_written = ip
+        except OSError:
+            idx_written = None
+        rows = _filter_sort(items, args)
+        if getattr(args, "rebuild_index", False) and idx_written:
+            print("索引已重建：%s（%d 条）" % (idx_written, len(items)))
+        if not rows:
+            print("没有符合条件的待审条目（队列共 %d 条）。" % len(items))
+            return 0
+        gb = (getattr(args, "group_by", None) or "").strip()
+        print("待审 %d 条：" % len(rows))
+        last_group = None
+        for r in rows:
+            if gb:
+                g = str(r.get(gb) or "?")
+                if g != last_group:
+                    print("  == %s ==" % g)
+                    last_group = g
+            tags = (", tags=" + ",".join(r.get("tags") or [])) if r.get("tags") else ""
+            age = _age_days(r)
+            age_s = ("%.1f 天" % age) if age is not None else "?"
+            print("  [%s] %s · %s · %s 层%s · round=%s · 积压 %s\n      %s" % (
+                r.get("pid"), r.get("verdict"), r.get("kind"),
+                r.get("layer") or "?",
+                tags, r.get("round") or 0, age_s,
+                str(r.get("summary") or "")))
+        print('\n裁决示例：python -m md_cg.review_cli accept <pid> --reason "实跑测试证据"')
+        return 0
+
+    if args.cmd in ("accept", "reject", "noop"):
+        pf = getattr(args, "pids_file", None)
+        if pf:
+            return _batch_decide(cg, args, pf)
+        if not getattr(args, "pid", None):
+            sys.stderr.write("需要 <pid> 或 --pids-file（两者给其一）。" + chr(10))
+            return 1
+
+    if args.cmd == "rounds":
+        print(json.dumps(cg.review_rounds(args.pid), ensure_ascii=False, indent=1))
+        return 0
+
+    if args.cmd == "stats":
+        st = cg.review_stats()
+        by = st.get("by_decision") or {}
+        print("裁决记录 %d 条 · 提案 %d 个 · 待审 %d 条 · 已关闭 %d 个" % (
+            st.get("records", 0), st.get("proposals", 0),
+            st.get("pending", 0), st.get("closed", 0)))
+        print("  动作分布：%s" % ("、".join(
+            "%s=%d" % (k, by[k]) for k in sorted(by)) or "（无记录）"))
+        print("  其中 noop（已评估、判定无需改动）= %d 条" % st.get("noop", 0))
+        return 0
+
+    if args.cmd == "edit":
+        edits = {"content": args.content}
+        if args.tags:
+            edits["tags"] = [t.strip() for t in args.tags.split(",") if t.strip()]
+        if args.layer:
+            edits["layer"] = args.layer
+        out = cg.review_decide(args.pid, "edit", edits=edits, reason=args.reason)
+    else:
+        out = cg.review_decide(args.pid, args.cmd,
+                               merge_into=getattr(args, "into", None),
+                               reason=args.reason)
+
+    if out.get("ok"):
+        print("已裁决：%s → %s%s" % (
+            args.pid, args.cmd,
+            ("，落盘节点 " + out["node_id"]) if out.get("node_id") else ""))
+        return 0
+    print("裁决未生效：%s" % json.dumps(out, ensure_ascii=False))
+    return 1
+
+
+def _batch_decide(cg, args, pids_file):
+    """批量裁决（issue #71）：**先预览、再执行**两段式。"""
+    ids = _load_pids(pids_file)
+    if ids is None:
+        return 1
+    if not getattr(args, "apply", False):
+        print("DRY-RUN：将处置 %d 条（未落盘）。确认后加 --apply。" % len(ids))
+        pend = {r.get("pid"): r for r in (cg.review_list() or [])}
+        for pid in ids:
+            r = pend.get(pid)
+            note = "（不在待审队列）" if r is None else _brief(r)
+            print("  [%s] %s" % (pid, note))
+        return 0
+    rc, done = 0, 0
+    for pid in ids:
+        out = cg.review_decide(pid, args.cmd, reason=args.reason)
+        if out.get("ok"):
+            done += 1
+        else:
+            rc = 1
+            print("  %s 未生效：%s" % (pid, json.dumps(out, ensure_ascii=False)))
+    print("批量裁决完成：%d/%d 条生效。" % (done, len(ids)))
+    return rc
+
+
+# 生效条件：argv 为 None（默认）时由 argparse 解析 sys.argv、否则解析传入的 argv（子命令 dest="cmd" 为 required，已注册 list/accept/reject/edit/merge/rounds 并带 --root 等参数），解析成功后构造 cg=_cg(args) 并返回 _execute(cg, args)，finally 中执行 cg.close()。
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="python -m md_cg.review_cli",
+        description="灵枢审核队列裁决（designer 权限）")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--root", help="存储根目录（默认环境变量 MDCG_ROOT）")
+    common.add_argument("--session", default=None,
+                        help="裁决会话 id（落盘归属 frontmatter.session；缺省取"
+                             "环境变量 MDCG_SESSION，仍无则落 'unattributed' 并 "
+                             "stderr 告警。同一批裁决传同一值即得同一归属）")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sl = sub.add_parser("list", help="列出待审条目（含分级）", parents=[common])
+    sl.add_argument("--query", default=None, help="按关键词过滤（匹配索引条目字段）")
+    sl.add_argument("--tag", default=None, help="按 tag 过滤")
+    sl.add_argument("--kind", default=None, help="按类型前缀过滤（提案/变更单）")
+    sl.add_argument("--older-than", dest="older_than", type=float, default=None,
+                      help="只列积压龄 >= N 天的条目")
+    sl.add_argument("--group-by", dest="group_by", default=None,
+                      help="分组显示（kind/verdict）")
+    sl.add_argument("--sort", default="age",
+                      help="排序：age（默认，最久未裁决优先）/kind")
+    sl.add_argument("--rebuild-index", dest="rebuild_index", action="store_true",
+                      help="重建索引文件（单向派生自 inbox）")
+    sub.add_parser("stats", help="裁决动作统计（含 noop）", parents=[common])
+    for name, help_ in (("accept", "按原样写入落盘"),
+                        ("reject", "丢弃（只记裁决）"),
+                        ("noop", "已评估、判定不改变现有记忆（只留痕）")):
+        s = sub.add_parser(name, help=help_, parents=[common])
+        # issue #71：pid 由必填改可选（批量为 --pids-file），两者须给其一。
+        s.add_argument("pid", nargs="?", default=None)
+        s.add_argument("--pids-file", default=None,
+                        help="批量：一行一个显式 pid（禁通配/正则/tag）")
+        s.add_argument("--apply", action="store_true",
+                        help="批量：确认执行（缺省为 dry-run 只预览）")
+        s.add_argument("--reason", default="", help="裁决理由（进留痕）")
+    s = sub.add_parser("edit", help="修订后写入", parents=[common])
+    s.add_argument("pid")
+    s.add_argument("--content", required=True)
+    s.add_argument("--tags", default=None, help="逗号分隔")
+    s.add_argument("--layer", default=None)
+    s.add_argument("--reason", default="")
+    s = sub.add_parser("merge", help="合并进已有节点", parents=[common])
+    s.add_argument("pid")
+    s.add_argument("--into", required=True, help="目标节点 id")
+    s.add_argument("--reason", default="")
+    s = sub.add_parser("rounds", help="某提案的裁决轮次历史", parents=[common])
+    s.add_argument("pid")
+    args = ap.parse_args(argv)
+
+    cg = _cg(args)
+    try:
+        return _execute(cg, args)
+    finally:
+        # 收尾（2026-09-16 取证）：裁决写入先进内存 _dirty，不落盘则「节点在盘上
+        # 但索引无条目」——已有 _index.json 的根重开不重扫目录，其它进程与重载后的
+        # 长驻进程都检索不到（只能靠某次全量 rebuild 偶然救回）。库层另有 atexit
+        # 兜底，但显式收尾才是正路：兜底只覆盖「正常退出」这一条路径。
+        cg.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

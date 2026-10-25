@@ -1,0 +1,625 @@
+# -*- coding: utf-8 -*-
+"""蜂巢编排器单测（hive/orch.py + exec.py 扩展口 + exec_cmd.py 转发档）。
+
+不打真 API、不起 serve：
+  · 权限侧走**真实 md_cg.tokens 库层**（临时令牌库）
+  · 子任务提交走**真实 _hm._submit 文件机械**（临时 HIVE_JOBS_DIR）
+  · main() 装配组把 `_ex.main` 桩掉，只验「注册了什么、写了什么」
+运行：python hive/test_orch.py   （退出码 0 = 全绿）
+"""
+import contextlib
+import importlib.util
+import io
+import json
+import os
+import sys
+import tempfile
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except AttributeError:
+    pass
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.dirname(_HERE)
+for _p in (_REPO, _HERE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+PASS, FAIL = 0, 0
+
+
+def check(name, cond, detail=""):
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f"  [ok] {name}")
+    else:
+        FAIL += 1
+        print(f"  [FAIL] {name}  {detail}")
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+ex = _load("hive_exec", os.path.join(_HERE, "exec.py"))
+cmd = _load("hive_exec_cmd", os.path.join(_HERE, "exec_cmd.py"))
+orc = _load("hive_orch", os.path.join(_HERE, "orch.py"))
+
+from md_cg import tokens as tk                       # noqa: E402
+from md_cg import security as sec                    # noqa: E402
+
+TMP = tempfile.mkdtemp(prefix="hive_orch_test_")
+STORE = os.path.join(TMP, "tokens.json")
+os.environ["MDCG_TOKEN_FILE"] = STORE
+os.environ["MDCG_ROOT"] = os.path.join(TMP, "root")
+DESIGNER_TOK = tk.issue("designer", actor="t_designer", path=STORE)["token"]
+ORCH_DERIVE = tk.derive(DESIGNER_TOK, tk.ORCH_ROLE, actor="hive-orchestrator",
+                        path=STORE, layers_allow=list(tk.ORCH_LAYERS_ALLOW),
+                        ops_allow=list(tk.ORCH_OPS_ALLOW))
+ORCH_TOK = ORCH_DERIVE["token"]
+
+print("[A] 权限收窄面（md_cg/tokens.py ORCH_* 真源）")
+check("A1 ops 清单 ⊆ ALL_OPS", set(tk.ORCH_OPS_ALLOW) <= set(tk.ALL_OPS),
+      str(set(tk.ORCH_OPS_ALLOW) - set(tk.ALL_OPS)))
+check("A2 layers ⊆ ALL_LAYERS 且不含核心层 anchor/self",
+      set(tk.ORCH_LAYERS_ALLOW) <= set(tk.ALL_LAYERS)
+      and not (set(tk.ORCH_LAYERS_ALLOW) & set(tk.CORE_LAYERS)))
+_danger = [o for o in ("forget", "identity", "protect", "delegate", "maintain",
+                       "consolidate") if o in tk.ALL_OPS]
+check("A3 危险 op 确在 ALL_OPS（防空洞断言）", len(_danger) >= 1, str(_danger))
+check("A4 危险 op 均不在编排器清单", not (set(_danger) & set(tk.ORCH_OPS_ALLOW)),
+      str(set(_danger) & set(tk.ORCH_OPS_ALLOW)))
+check("A5 编排器角色不可再派生（安全收紧：防令牌链蔓延，designer 独占派生权）",
+      tk.ORCH_ROLE not in tk.DELEGABLE_ROLES)
+check("A6 派生 ops/layers 与真源逐位一致",
+      list(ORCH_DERIVE["ops_allow"]) == list(tk.ORCH_OPS_ALLOW)
+      and list(ORCH_DERIVE["layers_allow"]) == list(tk.ORCH_LAYERS_ALLOW))
+check("A7 派生令牌结构上不可再派生（delegable=False）",
+      (tk._load(STORE)["tokens"].get(ORCH_DERIVE["token_id"]) or {})
+      .get("delegable") is False)
+try:
+    tk.derive(ORCH_TOK, "designer", path=STORE)
+    check("A8 二次派生被库层拒", False, "未抛错")
+except Exception as e:                                # noqa: BLE001
+    check("A8 二次派生被库层拒", True, type(e).__name__)
+
+P = tk.verify_token(ORCH_TOK, path=STORE)
+check("A9 校验后身份 ops 收窄一致", list(P.ops_allow or []) == list(tk.ORCH_OPS_ALLOW))
+check("A10 校验后身份 layers 收窄一致",
+      list(P.layers_allow or []) == list(tk.ORCH_LAYERS_ALLOW))
+check("A11 can_admin=False（review 裁决权归设计者；编排器冲突只留痕上报）",
+      P.can_admin is False)
+
+
+def _op_ok(principal, op):
+    """库层是否放行该 op。
+
+    取证口径：`allows_op` 是 **Principal 的方法**（md_cg/security.py:118
+    `def allows_op(self, op)`），不是模块级函数——写成 `sec.allows_op(p, op)`
+    会 AttributeError 并被吞掉，导致所有断言恒为 False（假阴性/空洞通过）。
+    """
+    try:
+        return bool(principal.allows_op(op))
+    except Exception:                                 # noqa: BLE001
+        return False
+
+
+if _danger:
+    check("A12 库层拒清单外 op（give forget）", not _op_ok(P, _danger[0]), _danger[0])
+check("A13 库层放行 review（裁决能力所求）", _op_ok(P, "review"))
+
+_tf = os.path.join(TMP, "designer.token")
+with open(_tf, "w", encoding="utf-8") as f:
+    f.write(DESIGNER_TOK)
+_out = os.path.join(TMP, "orch.token")
+with contextlib.redirect_stdout(io.StringIO()):
+    tk_main_rc = tk.main(["--token-file", STORE, "orch",
+                          "--token-file-in", _tf, "--out", _out])
+check("A14 CLI orch 签发退出码 0", tk_main_rc in (0, None), str(tk_main_rc))
+check("A15 CLI orch 落盘令牌文件", os.path.isfile(_out))
+with open(_out, encoding="utf-8") as f:
+    _cli_tok = f.read().strip()
+_P2 = tk.verify_token(_cli_tok, path=STORE)
+check("A16 CLI 产出令牌 ops/layers 与真源一致",
+      list(_P2.ops_allow or []) == list(tk.ORCH_OPS_ALLOW)
+      and list(_P2.layers_allow or []) == list(tk.ORCH_LAYERS_ALLOW))
+check("A17 CLI 产出令牌可裁决 review", _op_ok(_P2, "review"))
+
+# ------------------------------------------------------- B 工具层（orch.py）
+print("[B] 编排三工具：护栏 / 防递归 / 卡片 / 按需拉取")
+JOBS = os.path.join(TMP, "jobs")
+os.makedirs(JOBS, exist_ok=True)
+JOB_DIR = os.path.join(TMP, "orchjob")
+os.makedirs(JOB_DIR, exist_ok=True)
+os.environ["HIVE_JOBS_DIR"] = JOBS
+orc._CFG.update({"job_id": "orchjob", "job_dir": JOB_DIR, "jobs": JOBS,
+                 "model": "m_test", "max_subtasks": 2, "children": [],
+                 # id 契约 v2（B8）：编排者的四槽之三（身份/任务/单元）——子任务
+                 # 提交走**真实** _hm._submit ⇒ 经 Rust 侧 `hive alloc-id` 分配 id，
+                 # 故槽值必须齐备且单元 ∈ 五单元闭集（否则 alloc-id 显式报错）。
+                 "slots": {"identity": "hive单测", "task": "id契约",
+                           "unit": "记录单元"}})
+
+_t, _added = orc.merge_tools({})
+check("B1 缺省 tools 注入 lingshu_cg + web_search + read_file",
+      {"lingshu_cg", "web_search", "read_file"} <= set(_t))
+check("B2 编排三工具为能力下限（强制并入）", set(orc.ORCH_TOOLS) <= set(_t))
+_t2, _ = orc.merge_tools({"tools": ["lingshu_cg"]})
+check("B3 显式 tools 仍补编排三工具且不重复",
+      set(orc.ORCH_TOOLS) <= set(_t2) and _t2.count("lingshu_cg") == 1)
+
+check("B4 缺 user_prompt 诚实拒", orc._spawn({})["ok"] is False)
+_MODEL_BAK = orc._CFG["model"]
+orc._CFG["model"] = ""
+_b5 = orc._spawn({"user_prompt": "x"})
+orc._CFG["model"] = _MODEL_BAK
+check("B5 无可用 model 诚实拒",
+      _b5["ok"] is False and "model" in _b5["error"], str(_b5))
+_bad = orc._spawn({"user_prompt": "x", "tools": ["spawn_subtask"]})
+check("B6 子代理不可用编排工具（防递归第一道）",
+      _bad["ok"] is False and "不可用工具" in _bad["error"], str(_bad))
+_f = orc._spawn({"user_prompt": "x", "context_files": [os.path.join(TMP, "无此文件")]})
+check("B7 缺 context 文件诚实拒", _f["ok"] is False and "不存在" in _f["error"])
+
+_r1 = orc._spawn({"user_prompt": "子任务甲：统计 A 目录", "tools": ["lingshu_cg"]})
+C1 = _r1.get("job_id", "")
+check("B8 派发成功（毫秒即返，带 job_id）", _r1.get("ok") is True and bool(C1), str(_r1))
+_s1 = json.load(open(os.path.join(JOBS, C1, "spec.json"), encoding="utf-8"))
+check("B9 子 spec 无 orchestrate（结构性防递归）", "orchestrate" not in _s1)
+check("B10 子 spec tools ⊆ 子代理白名单",
+      set(_s1["tools"]) <= set(orc.SUB_TOOLS_ALLOW), str(_s1["tools"]))
+check("B10b read_file 在子代理白名单内且工具描述同步（防漂移）",
+      "read_file" in orc.SUB_TOOLS_ALLOW
+      and "read_file" in orc._spawn_schema()["function"]["parameters"]
+      ["properties"]["tools"]["description"], str(list(orc.SUB_TOOLS_ALLOW)))
+check("B11 子任务默认注入与 MCP 面同源",
+      _s1["timeout_s"] == orc._hm.DEFAULT_TIMEOUT_S
+      and _s1["reasoning_effort"] == orc._hm.DEFAULT_REASONING_EFFORT
+      and _s1["context_budget_tokens"] == orc._hm.DEFAULT_CONTEXT_BUDGET_TOKENS)
+_cf = os.path.join(JOB_DIR, orc.CHILDREN_FILE)
+check("B12 子任务清单落盘（换人续跑不重复派发）",
+      os.path.isfile(_cf)
+      and json.load(open(_cf, encoding="utf-8"))["children"][0]["job_id"] == C1)
+
+_r2 = orc._spawn({"user_prompt": "子任务乙：统计 B 目录"})
+C2 = _r2.get("job_id", "")
+check("B13 并行派发第二个子任务", _r2.get("ok") is True)
+_r3 = orc._spawn({"user_prompt": "子任务丙"})
+check("B14 超上限诚实报错（不静默丢弃）",
+      _r3["ok"] is False and "上限" in _r3["error"], str(_r3))
+
+LONG = "甲" * 500
+with open(os.path.join(JOBS, C1, "result.json"), "w", encoding="utf-8") as f:
+    json.dump({"ok": True, "content": LONG,
+               "tool_trace": [{"tool": "lingshu_cg", "ok": True, "brief": f"b{i}"}
+                              for i in range(10)]}, f, ensure_ascii=False)
+with open(os.path.join(JOBS, C1, "status.json"), "w", encoding="utf-8") as f:
+    json.dump({"job_id": C1, "state": "done"}, f, ensure_ascii=False)
+
+_card = orc._card(C1)
+check("B15 卡片正文头截断到 CARD_CHARS",
+      len(_card.get("content_head", "")) == orc.CARD_CHARS)
+check("B16 默认不回全文（省编排者上下文）", "content" not in _card)
+check("B17 截断标记在位", _card.get("content_truncated") is True)
+check("B18 工具轨迹只留尾部 TRACE_MAX 条",
+      len(_card.get("tool_trace_brief") or []) == orc.TRACE_MAX)
+check("B19 全量调用数仍可审计", _card.get("tool_calls") == 10)
+check("B20 指针 result_path 在位",
+      str(_card.get("result_path", "")).endswith("result.json"))
+check("B21 提示按需拉取 read_full", "read_full" in (_card.get("hint") or ""))
+check("B22 状态透出", _card.get("state") == "done", str(_card.get("state")))
+check("B23 full=True 给全文（编排者显式索取时）",
+      orc._card(C1, full=True).get("content") == LONG)
+
+_rf = orc._read_full({"job_id": C1})
+check("B24 read_full 给原文", _rf.get("ok") is True and _rf.get("raw", "").startswith("{"))
+_rf2 = orc._read_full({"job_id": C1, "max_chars": 40})
+check("B25 超上限截断给头 + 指针",
+      _rf2.get("truncated") is True and len(_rf2.get("head", "")) == 40)
+check("B26 越权读被拒（非本编排者派发的 job）",
+      orc._read_full({"job_id": "h_not_mine"}).get("ok") is False)
+check("B27 缺 job_id 诚实拒", orc._read_full({}).get("ok") is False)
+
+_p1 = orc._poll({})
+check("B28 汇总本编排者全部子任务", _p1.get("count") == 2, str(_p1.get("count")))
+check("B29 done/active 拆分恒等",
+      _p1.get("done", 0) + _p1.get("active", 0) == 2)
+check("B30 指定 job_ids 生效", orc._poll({"job_ids": [C1]}).get("count") == 1)
+_bak = orc._CFG["children"]
+orc._CFG["children"] = []
+_p2 = orc._poll({})
+orc._CFG["children"] = _bak
+check("B31 未派发时诚实空报",
+      _p2.get("count") == 0 and _p2.get("children") == [])
+
+for k in ("HIVE_ORCH_TOKEN", "HIVE_ORCH_TOKEN_FILE"):
+    os.environ.pop(k, None)
+try:
+    orc.load_principal("j")
+    check("B32 令牌缺失 fail-closed（抛 OrcError）", False, "未抛错")
+except orc.OrcError as e:
+    check("B32 令牌缺失 fail-closed（抛 OrcError）", "令牌" in str(e), str(e)[:60])
+os.environ["HIVE_ORCH_TOKEN"] = "mdcg1.zzz.zzz"
+try:
+    orc.load_principal("j")
+    check("B33 无效令牌 fail-closed", False, "未抛错")
+except orc.OrcError:
+    check("B33 无效令牌 fail-closed", True)
+os.environ["HIVE_ORCH_TOKEN"] = ORCH_TOK
+_pp = orc.load_principal("jobz")
+check("B34 正路令牌 → 编排器身份（session/harness 隔离）",
+      _pp is not None and _pp.session == "hive_orch_jobz"
+      and getattr(_pp, "harness", "") == "hive-orch", str(getattr(_pp, "session", None)))
+check("B35 正路身份 ops 与真源一致",
+      list(_pp.ops_allow or []) == list(tk.ORCH_OPS_ALLOW))
+
+# ------------------------------- N235 终态集：needs_review 的编排口语义（与调度面同口径）
+print("[N235] 终态集含 needs_review：锚不可信的上游产物不得让编排器收不了口")
+# 病灶：orch.TERMINAL_STATES 缺 needs_review ⇒ poll_subtasks 把 needs_review 子任务
+# 计为 active（done 不计）⇒ 编排器永远收不了口；而 hive/src/scheduler.rs deps_gate 与
+# orch.py 自己的 spawn schema 文案（:162）都把 needs_review 当**终态失败**传播——
+# 同一状态两侧语义相反。
+check("N235-1 TERMINAL_STATES 与调度面同口径（含 needs_review）",
+      "needs_review" in orc.TERMINAL_STATES, str(orc.TERMINAL_STATES))
+_c2s = os.path.join(JOBS, C2, "status.json")
+_c2_raw = open(_c2s, "rb").read()
+with open(_c2s, "w", encoding="utf-8") as f:
+    json.dump({"job_id": C2, "state": "needs_review",
+               "error": "产物完整性锚缺失（P11）"}, f, ensure_ascii=False)
+try:
+    _p3 = orc._poll({})
+    check("N235-2 needs_review 子任务计入 done（不再挂 active）",
+          _p3.get("count") == 2 and _p3.get("done") == 2 and _p3.get("active") == 0,
+          f"count={_p3.get('count')} done={_p3.get('done')} active={_p3.get('active')}")
+    _c2 = orc._card(C2)
+    check("N235-3 卡片提示按终态口径（不再提示「继续轮询」）",
+          "执行中" not in (_c2.get("hint") or ""), str(_c2.get("hint")))
+    check("N235-4 state 如实透出 needs_review", _c2.get("state") == "needs_review",
+          str(_c2.get("state")))
+finally:
+    with open(_c2s, "wb") as f:      # 还原现场，不干扰后续段
+        f.write(_c2_raw)
+
+# ------------------------------------------- C exec.py 两个扩展口（默认零变更）
+print("[C] exec.py 扩展口：register_tools / set_principal_factory")
+
+
+def _exec_call(name, args_json, job_id):
+    r = ex.execute_tool(name, args_json, job_id)
+    return r[0] if isinstance(r, tuple) else r
+
+
+_base = set(ex.all_schemas())
+check("C1 未注册时工具面 = 内置三工具（零变更）",
+      _base == {"lingshu_cg", "web_search", "read_file"}, str(_base))
+ex.register_tools({"spawn_subtask": {"type": "function",
+                                     "function": {"name": "spawn_subtask"}}},
+                  lambda n, a, j: {"ok": True, "echo": n})
+check("C2 register_tools 后 all_schemas 可见", "spawn_subtask" in ex.all_schemas())
+check("C3 分发到注册 handler",
+      _exec_call("spawn_subtask", "{}", "job_x").get("echo") == "spawn_subtask")
+check("C4 未注册工具仍诚实报错",
+      _exec_call("nope", "{}", "job_x").get("ok") is False)
+
+ex.set_principal_factory(lambda args, jid: tk.verify_token(ORCH_TOK, path=STORE),
+                         ops_allow=tk.ORCH_OPS_ALLOW)
+check("C5 工具层白名单随身份同步收窄",
+      tuple(ex._TOOL_OPS_ALLOW) == tuple(tk.ORCH_OPS_ALLOW))
+_o1 = ex.tool_lingshu_cg({"op": "review", "pid": "p_x"}, "job_t")
+check("C6 收窄后 review 过工具层前置闸（库层另裁）",
+      "未对当前身份开放" not in str(_o1.get("error") or ""), str(_o1)[:120])
+ex.set_principal_factory(None)
+_o2 = ex.tool_lingshu_cg({"op": "review", "pid": "p_x"}, "job_t")
+check("C7 恢复默认后 review 被工具层拒（默认零变更）",
+      _o2.get("ok") is False and "未对当前身份开放" in _o2.get("error", ""),
+      str(_o2)[:120])
+
+# ------------------------------------- D exec_cmd.py 转发档（多态加一档）
+print("[D] exec_cmd.py：spec.orchestrate → orch.py")
+
+
+def _mk_job(spec):
+    d = tempfile.mkdtemp(prefix="hive_job_")
+    with open(os.path.join(d, "spec.json"), "w", encoding="utf-8") as f:
+        json.dump(spec, f, ensure_ascii=False)
+    return d
+
+
+_calls = []
+
+
+class _R:
+    returncode = 0
+    stdout = ""
+    stderr = ""
+
+
+def _fake_run(argv, **kw):
+    _calls.append(list(argv))
+    return _R()
+
+
+from unittest import mock as _mock               # noqa: E402
+
+_j1 = _mk_job({"model": "m", "user_prompt": "p", "orchestrate": {"max_subtasks": 4}})
+_j2 = _mk_job({"model": "m", "user_prompt": "p"})
+with _mock.patch.object(cmd.subprocess, "run", _fake_run):
+    _rc1 = cmd.run_cmd(_j1)
+    _rc2 = cmd.run_cmd(_j2)
+check("D1 orchestrate 真值 → 转发 orch.py",
+      _calls[0][-1] == _j1 and _calls[0][1].endswith("orch.py") and _rc1 == 0, str(_calls[0]))
+check("D2 无 orchestrate → 转发 exec.py（旧行为零变更）",
+      _calls[1][1].endswith("exec.py"), str(_calls[1]))
+os.environ["HIVE_ORCH_PY"] = os.path.join(TMP, "nope_orch.py")
+_j3 = _mk_job({"model": "m", "user_prompt": "p", "orchestrate": True})
+_rc3 = cmd.run_cmd(_j3)
+_err3 = json.load(open(os.path.join(_j3, "result.json"), encoding="utf-8")).get("error", "")
+check("D3 目标 worker 缺失时诚实报错并点名编排器",
+      _rc3 == cmd.EXIT_EXEC and "orch.py（编排器）" in _err3, f"{_rc3} {_err3[:70]}")
+os.environ.pop("HIVE_ORCH_PY", None)
+os.environ["HIVE_LLM_EXEC_PY"] = os.path.join(TMP, "nope_exec.py")
+check("D4 HIVE_LLM_EXEC_PY 覆盖仍生效",
+      cmd.run_cmd(_mk_job({"model": "m", "user_prompt": "p"})) == cmd.EXIT_EXEC)
+os.environ.pop("HIVE_LLM_EXEC_PY", None)
+
+# ----------------------------------- E main() 装配（桩掉 _ex.main，不打 LLM）
+print("[E] orch.main() 装配与 fail-closed")
+_CALLED = {"n": 0}
+_ORIG_MAIN = orc._ex.main
+_ORIG_ARGV = list(sys.argv)
+
+
+def _stub_main():
+    _CALLED["n"] += 1
+    return 0
+
+
+def _run_main(job_dir):
+    sys.argv = ["orch.py", job_dir]
+    try:
+        return orc.main()
+    finally:
+        sys.argv = list(_ORIG_ARGV)
+
+
+_JD = tempfile.mkdtemp(prefix="orch_job_")
+# id 契约 v2（B8）：编排者 spec 带三槽（身份/任务/单元）——`orch.main()` 从**同名键**
+# 读入 `_CFG['slots']` 供 `_spawn` 透传给子任务（spec 带则透传、缺则报错）。
+with open(os.path.join(_JD, "spec.json"), "w", encoding="utf-8") as f:
+    json.dump({"model": "m_orch", "user_prompt": "编排：拆三份",
+               "identity": "hive单测", "task": "编排装配", "unit": "输出单元",
+               "orchestrate": {"max_subtasks": 3}}, f, ensure_ascii=False)
+os.environ["HIVE_ORCH_TOKEN"] = ORCH_TOK
+orc._ex.main = _stub_main
+try:
+    _rc = _run_main(_JD)
+finally:
+    orc._ex.main = _ORIG_MAIN
+check("E1 装配成功交回 exec loop（rc=0，恰好一次）",
+      _rc == 0 and _CALLED["n"] == 1, f"rc={_rc} n={_CALLED['n']}")
+with open(os.path.join(_JD, "spec.json"), encoding="utf-8") as f:
+    _spec2 = json.load(f)
+check("E2 spec 补全编排三工具（写回磁盘可审计）",
+      set(orc.ORCH_TOOLS) <= set(_spec2["tools"]), str(_spec2.get("tools")))
+check("E2b 编排轮次下限补全（迭代项6，删 setdefault 必红）",
+      (_spec2.get("max_tool_rounds") or 0) >= 12,
+      str(_spec2.get("max_tool_rounds")))
+check("E3 缺省注入编排 system_prompt", "编排者" in _spec2.get("system_prompt", ""))
+check("E3b 写后回读纪律在系统提示词（M3.1，删除该行必红）",
+      "写后回读" in _spec2.get("system_prompt", "")
+      and "不信返回的 written 计数" in _spec2.get("system_prompt", ""))
+check("E4 max_subtasks 从 spec.orchestrate 生效", orc._CFG["max_subtasks"] == 3,
+      str(orc._CFG["max_subtasks"]))
+check("E4b 编排者三槽从 spec 同名键读入（id 契约 v2 · B8 透传面）",
+      orc._CFG["slots"] == {"identity": "hive单测", "task": "编排装配",
+                            "unit": "输出单元"},
+      str(orc._CFG["slots"]))
+check("E5 已注册编排工具", set(orc.ORCH_TOOLS) <= set(orc._ex.all_schemas()))
+check("E6 身份工厂已装", orc._ex._PRINCIPAL_FACTORY is not None)
+check("E7 工具层白名单同步收窄",
+      tuple(orc._ex._TOOL_OPS_ALLOW) == tuple(tk.ORCH_OPS_ALLOW))
+
+_JDX = tempfile.mkdtemp(prefix="orch_job_x_")
+with open(os.path.join(_JDX, "spec.json"), "w", encoding="utf-8") as f:
+    json.dump({"model": "m", "user_prompt": "x", "system_prompt": "自定提示"},
+              f, ensure_ascii=False)
+try:
+    _run_main(_JDX)
+finally:
+    pass
+with open(os.path.join(_JDX, "spec.json"), encoding="utf-8") as f:
+    _spec3 = json.load(f)
+check("E8 显式 system_prompt 不被覆盖", _spec3["system_prompt"] == "自定提示")
+
+_JD2 = tempfile.mkdtemp(prefix="orch_job_fail_")
+with open(os.path.join(_JD2, "spec.json"), "w", encoding="utf-8") as f:
+    json.dump({"model": "m", "user_prompt": "x", "orchestrate": True}, f, ensure_ascii=False)
+os.environ.pop("HIVE_ORCH_TOKEN", None)
+os.environ.pop("HIVE_ORCH_TOKEN_FILE", None)
+_CALLED["n"] = 0
+orc._ex.main = _stub_main
+try:
+    _rc2 = _run_main(_JD2)
+finally:
+    orc._ex.main = _ORIG_MAIN
+check("E9 令牌缺失 → EXIT_SPEC 且不交回 loop（不降级）",
+      _rc2 == ex.EXIT_SPEC and _CALLED["n"] == 0, f"rc={_rc2} n={_CALLED['n']}")
+with open(os.path.join(_JD2, "result.json"), encoding="utf-8") as f:
+    _res2 = json.load(f)
+check("E10 result 诚实记 orch_token_unavailable",
+      _res2.get("error_code") == "orch_token_unavailable" and _res2.get("ok") is False)
+
+# ------------------------------------------------------- L M5 纠正链侧车 + 同源标记
+# 能红说明：删 _record_adjudication 的字段校验时 L1-L3 红；删 _spawn/_card 的
+# source_group 时 L4/L5 红；同源组键变化时 L6（同组断言）红。
+print("[L] M5 纠正链侧车 + 同源标记")
+_JD_M5 = tempfile.mkdtemp(prefix="orch_m5_")
+orc._CFG["job_id"] = "orch_m5_probe"
+orc._CFG["job_dir"] = _JD_M5
+orc._CFG["max_subtasks"] = 99   # E 段 main 遗留 3 上限会挡本段两次 spawn
+# E 段 main() 已把 `_CFG['slots']` 覆写成该 spec 的同名键（本段 _JD_M5 无 spec），
+# 故此处显式重置：本段要验的是同源标记与子 spec 提交（真实 _hm._submit），槽值齐备。
+orc._CFG["slots"] = {"identity": "hive单测", "task": "m5纠正链",
+                     "unit": "反思单元"}
+
+_l0 = orc.orch_handler("record_adjudication", {"kind": "supersede"}, "orch_m5_probe")
+check("L1 缺 subject/evidence/note 诚实拒",
+      _l0["ok"] is False and "subject" in _l0["error"], str(_l0)[:120])
+_l0b = orc.orch_handler("record_adjudication",
+                        {"kind": "replace", "subject": "s1",
+                         "evidence": ["s2"], "verdict_note": "n"}, "orch_m5_probe")
+check("L2 非法 kind 诚实拒", _l0b["ok"] is False and "kind" in _l0b["error"])
+_l1 = orc.orch_handler("record_adjudication", {
+    "kind": "supersede", "subject": "job_child_a",
+    "evidence": ["job_child_a", "job_child_b"],
+    "verdict_note": "乙的结论覆盖甲（甲缺边界核对）"}, "orch_m5_probe")
+check("L3 合法裁决落台账（job 目录内）",
+      _l1["ok"] is True and os.path.isfile(os.path.join(_JD_M5, orc._ADJ_FILE)))
+_rec = [json.loads(l) for l in open(os.path.join(_JD_M5, orc._ADJ_FILE),
+                                    encoding="utf-8")][-1]
+check("L4 台账字段完整（ts/kind/subject/evidence/note/session）",
+      _rec.get("kind") == "supersede" and _rec.get("subject") == "job_child_a"
+      and "job_child_b" in (_rec.get("evidence") or [])
+      and str(_rec.get("session", "")).startswith("hive_orch_"), str(_rec)[:160])
+
+_g = orc._source_group("deepseek-flash", ["a.txt", "b.txt"])
+check("L5 同源组键：同 model+同 context_files 同组",
+      _g == orc._source_group("deepseek-flash", ["b.txt", "a.txt"]))
+check("L6 同源组键：异 model 异组",
+      _g != orc._source_group("deepseek-v4-pro", ["a.txt", "b.txt"]))
+check("L7 同源组键：异 context_files 异组",
+      _g != orc._source_group("deepseek-flash", ["a.txt"]))
+_ctx_a = os.path.join(TMP, "ctx_a.txt")
+with open(_ctx_a, "w", encoding="utf-8") as f:
+    f.write("ctx\n")
+_sga = orc._spawn({"user_prompt": "同源甲", "tools": ["lingshu_cg"],
+                   "context_files": [_ctx_a]})
+_sgb = orc._spawn({"user_prompt": "同源乙", "tools": ["lingshu_cg"],
+                   "context_files": [_ctx_a]})
+_sg = [c for c in orc._CFG["children"]
+       if c["job_id"] in (_sga.get("job_id"), _sgb.get("job_id"))]
+check("L8 卡片带 source_group 且孪生同组",
+      len(_sg) == 2 and _sg[0].get("source_group")
+      and _sg[0]["source_group"] == _sg[1]["source_group"],
+      str(_sg)[:160])
+_card_sg = orc._card(_sga["job_id"]).get("source_group")
+check("L9 卡片可读出 source_group", _card_sg == _sg[0]["source_group"], str(_card_sg))
+
+# --------------------------------- N N142/N88：children/spec 原子写（mkstemp 模板）
+# 能红说明：N2/N3/N4 在 replace 注入故障后目标仍=旧清单（旧码固定共享 tmp
+# _children.json.tmp+裸写+except OSError: pass 静默吞，双写者对撞撕裂/接管者
+# _load_children 回 [] 全量重复派发）；N5 缺 _atomic_write_json 模板、N6/N7
+# spec 补全写回仍裸 open("w")（N88：写中途毁任务契约→rust 重投读坏 spec）。
+print("[N] N142/N88：children/spec 原子写（mkstemp 唯一名+os.replace 模板）")
+from unittest import mock                              # noqa: E402
+import shutil                                          # noqa: E402
+
+JD_N = tempfile.mkdtemp(prefix="orch_n142_")
+orc._CFG["job_id"] = "orch_n142_probe"
+orc._CFG["job_dir"] = JD_N
+_children_a = [{"job_id": "h_n142_a", "user_prompt": "甲"}]
+_children_b = [{"job_id": "h_n142_b", "user_prompt": "乙"}]
+orc._CFG["children"] = _children_a
+_cf_n = os.path.join(JD_N, orc.CHILDREN_FILE)
+_real_replace = os.replace
+
+orc._save_children()
+check("N1 成功路径零 tmp 残留且目标完整（行为不变对照）",
+      os.path.isfile(_cf_n)
+      and json.load(open(_cf_n, encoding="utf-8"))["children"] == _children_a
+      and not [n for n in os.listdir(JD_N) if n.endswith(".tmp")])
+
+# N2 对撞自愈：replace 首撞 PermissionError（读者瞬态句柄）→ 重试落新清单
+orc._CFG["children"] = _children_b
+_n2 = {"n": 0}
+
+
+def _flaky_replace(src, dst):
+    _n2["n"] += 1
+    if _n2["n"] == 1:
+        raise PermissionError(5, "模拟读者瞬态句柄")
+    return _real_replace(src, dst)
+
+
+with mock.patch.object(orc.os, "replace", _flaky_replace), \
+        mock.patch.object(orc.time, "sleep", lambda *_a: None):
+    orc._save_children()
+check("N2 replace 首撞 PermissionError → 重试落新清单（旧码静默吞保旧值）",
+      json.load(open(_cf_n, encoding="utf-8"))["children"] == _children_b,
+      f"目标={json.load(open(_cf_n, encoding='utf-8'))['children']!r}")
+
+# N3 tmp 被瞬态消费（FileNotFoundError，旧共享名对撞形态）→ 重建重写自愈
+_n3 = {"n": 0}
+
+
+def _consume_replace(src, dst):
+    _n3["n"] += 1
+    if _n3["n"] == 1:
+        os.unlink(src)
+        raise FileNotFoundError(src)
+    return _real_replace(src, dst)
+
+
+with mock.patch.object(orc.os, "replace", _consume_replace), \
+        mock.patch.object(orc.time, "sleep", lambda *_a: None):
+    orc._save_children()
+check("N3 tmp 扑空 → 重建唯一名重写自愈（旧码吞掉保旧值）",
+      json.load(open(_cf_n, encoding="utf-8"))["children"] == _children_b)
+
+# N4 重试耗尽 → log 留痕不再静默（v8 N70 写侧残面收口），目标保旧完整态
+def _always_perm(src, dst):
+    raise PermissionError(5, "锁死")
+
+
+with mock.patch.object(orc.os, "replace", _always_perm), \
+        mock.patch.object(orc.time, "sleep", lambda *_a: None):
+    orc._save_children()
+_log_p = os.path.join(JD_N, "log.txt")
+_log_txt = open(_log_p, encoding="utf-8").read() if os.path.isfile(_log_p) else ""
+check("N4 重试耗尽 → log 留痕（旧码 except OSError: pass 无痕）",
+      "子任务清单落盘失败" in _log_txt, f"log={_log_txt[-120:]!r}")
+check("N4b 耗尽后目标仍=旧完整态（fail-safe，不撕裂）",
+      os.path.isfile(_cf_n)
+      and json.load(open(_cf_n, encoding="utf-8"))["children"] == _children_b)
+
+# N5 spec 档：写中途异常（磁盘满）不毁旧完整态（N88；直测模板函数）
+if hasattr(orc, "_atomic_write_json"):
+    _spec_p = os.path.join(JD_N, "spec.json")
+    with open(_spec_p, "w", encoding="utf-8") as f:
+        json.dump({"model": "m", "tools": ["lingshu_cg"]}, f)
+    _raised = False
+    try:
+        with mock.patch.object(orc.json, "dump",
+                               side_effect=OSError(28, "模拟磁盘满")):
+            orc._atomic_write_json(_spec_p, {"tools": ["lingshu_cg",
+                                                       "web_search"]})
+    except OSError:
+        _raised = True
+    check("N5a 写中途异常 → fail-fast 外抛（不吞）", _raised)
+    check("N5b 旧完整 spec 未被截断毁（旧码裸 open(w) 先截断即毁）",
+          json.load(open(_spec_p, encoding="utf-8")).get("tools")
+          == ["lingshu_cg"])
+else:
+    check("N5a orch 缺 _atomic_write_json 原子写模板", False, "N142 未修")
+
+# N6/N7 接线源断言：main 内 spec 补全写回不再裸 open("w")
+with open(os.path.join(_HERE, "orch.py"), encoding="utf-8") as f:
+    _ORCH_PY = f.read()
+check("N6 main spec 补全写回经 _atomic_write_json（N88 接线）",
+      '_atomic_write_json(os.path.join(job_dir, "spec.json"), spec)'
+      in _ORCH_PY)
+check("N7 裸 spec open(w) 写回已移除",
+      'open(os.path.join(job_dir, "spec.json"), "w"' not in _ORCH_PY)
+
+shutil.rmtree(JD_N, ignore_errors=True)
+shutil.rmtree(_JD_M5, ignore_errors=True)
+shutil.rmtree(TMP, ignore_errors=True)  # 测毕清理（此前历次运行临时区只增不清）
+
+print(f"\n=== orchestration tests: {PASS} passed, {FAIL} failed ===")
+sys.exit(1 if FAIL else 0)

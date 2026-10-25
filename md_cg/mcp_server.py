@@ -1,0 +1,5512 @@
+# -*- coding: utf-8 -*-
+"""md_cg · MCP server（记忆操作系统对外接口）
+
+把 MdCGOS（认知图 + 记忆 OS 七项能力）暴露为标准 MCP 服务：
+  · 传输：stdio（逐行 JSON-RPC 2.0，UTF-8）
+  · 协议：2024-11-05
+  · 零第三方依赖（D-005）
+
+启动：
+    MDCG_ROOT=<认知图目录> MDCG_ACTOR=<调用方> python -m md_cg.mcp_server
+
+DSH 侧配置（cordis.yml / MCP client）：
+    command: python
+    args: ["-m", "md_cg.mcp_server"]
+    env: { MDCG_ROOT: "...", PYTHONPATH: ".../dsh-memory" }
+
+工具面（默认 kernel 只暴露 2 个基元 cg/stg；MDCG_MCP_SURFACE=full 时
+另有 31 个细粒度工具，供兼容/调试）：
+  写：mdcg_remember（gated=true 走主动遗忘闸门）/ mdcg_rejected /
+      mdcg_unresolved / mdcg_propose
+  目标/近期：cg(op=goal) 目标槽 / cg(op=recent) 近期事件窗口
+  读：mdcg_get / mdcg_search / mdcg_recall / mdcg_review_list /
+      mdcg_review_records
+  认知：mdcg_reflect / mdcg_verify / mdcg_flywheel / mdcg_mine_fix_pairs /
+      mdcg_consistency（节点间冲突检测：check/history/stats/catalog）/
+      mdcg_metacognition（独立元认知：report/trace/calibration/blindspots/
+      trust/self_check/history/catalog）/
+      mdcg_self_state（自我状态层：snapshot/refresh/bootstrap/relate/
+      relations/index/dimensions/audit/history/summary/catalog）/
+      mdcg_predict（生成式预测：routes/feedback/stats/catalog）/
+      mdcg_causal（因果推理：path/gate/chain/explain/catalog）
+  生命周期：mdcg_forget（override）/ mdcg_restore / mdcg_review_decide
+  保护/遗忘：mdcg_protect（盘点/查询/标记/快照/历史）/
+      mdcg_forgetting_history（三问四态留痕）
+  身份识别：mdcg_identity（observe/anchor/trait/profile/positions/catalog/
+      contract/contracts——存在契约记录，走 admin 闸）
+  运维：mdcg_health / mdcg_whoami / mdcg_ingest / mdcg_watermarks /
+      mdcg_service_info
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+# issue #133 + #140：op 元数据**单点真源**（名字 / 段落 / 专属参数 / 权限词 /
+# dispatch 目标 / 二级子 op / 缺省 action / 签名推导）。本模块此前把这些分散在
+# 5 处字面量里（枚举串、description 段落、_ACTION_SIGS、_ACTION_DEFAULT、
+# require_op 实参），互不对账——实测删掉枚举串里的一个 op，全部测试仍绿。
+# 现在各处**从 op_table 派生**；分发结构（下面 `_cg_dispatch` 的 `if op == "x"` 链）
+# 保持原样，故 `protocol.dispatch_ops()` 的 AST 提取面逐位不变，仍是独立读数。
+from . import op_table as _ot  # noqa: E402
+
+# ---------------------------------------------------------------- 入口自保证 UTF-8
+# 约束（工作纪律第 15 条）：本调用必须在**任何文件/库 I/O 之前**——utf8_boot.ensure_utf8
+# 在解释器未开 UTF-8 模式时以相同 argv 重启自身（-X utf8），早于它的任何 open/stdio
+# 读写都走 locale 编码（Windows 中文机 = cp936：裸 open 抛 UnicodeDecodeError、中文写
+# 落 GBK 字节）。本文件下方 _package_version() 就在**模块级**读 package.json，故锚点
+# 必须落在它之前。仓库根入 sys.path 的形态照 hive/exec.py::_md_cg_import 的最小写法
+# （助手在仓根，不是 md_cg 包目录）。
+# 被 import（本模块非 __main__）时助手只置子进程继承面、绝不重启/退出——F6：静默重启
+# 会吞掉调用方输入；本入口的真实接入形态是 `python -m md_cg.mcp_server`（mcp.json）。
+_UTF8_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _UTF8_ROOT not in sys.path:
+    sys.path.insert(0, _UTF8_ROOT)
+from utf8_boot import ensure_utf8  # noqa: E402
+
+ensure_utf8(__file__)
+
+
+# ------------------------------------------- 入口自保证 OpenBLAS 线程数（2026-10-05）
+# 根因（返修取证）：numpy（md_cg 可选依赖，经 whitebox_kb 系列模块加载）在**导入期**
+# 由 OpenBLAS 按线程数（默认 = 核数）申请每线程缓冲——本机 32 核实测单进程
+# `import numpy` 的**全机提交内存**增量 0.73 GiB。启动链上的代校验
+# （verify_delegations → 导入含 numpy 的目标模块，见 main）把这笔分配带到
+# **服务应答之前**：机器提交内存吃紧、或**多进程同启**（并行测试套件 / 多会话
+# 并存 / 常驻扫描）时，OpenBLAS 重试 10 次后放弃并 exit(1)——进程在 initialize
+# 应答前死亡，桥侧只见「握手失败 / 插件激活失败」，子进程 stderr 里的
+# `OpenBLAS error: Memory allocation still failed after 10 retries` 是唯一线索。
+# 实测（本机，2026-10-05；随提交内存压力波动）：12 个并发 `import numpy` 默认
+# 4~9/12 失败（两轮独立读数，stderr 同上），置本值后 0/12（两轮）；单进程提交
+# 增量 0.73 → 0.013 GiB（4 线程 0.100 GiB）。md_cg 现有数值面是向量点积/范数/
+# 小矩阵，单线程对其**无已观测的性能意义**（⚠ 未做基准实测，出现 BLAS 密集路径
+# 须在性能轮复测）。显式设值优先，只填空缺/空白（仓库口径：空白视为未设置）。
+# 位置钉死：必须在 numpy 可被导入之前——模块级，早于 main() 的代校验；
+# 且晚于 ensure_utf8（其重启形态经 env 继承本值，两条保证互不干扰）。
+if not (os.environ.get("OPENBLAS_NUM_THREADS") or "").strip():
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
+
+# SERVER_VERSION 从包根 package.json 动态读取（issue #42：硬编码 0.1.0 与发布
+# 版本脱节，握手自报假版本）；读不到（文件缺失/损坏/裁剪）回落保底值不阻塞启动。
+# v21-R1（2026-09-28）：**回落必须覆盖全形态**——修前只捉 (OSError, ValueError)
+# 却无条件 `.get("version")`，顶层是合法 JSON 但非对象（`[1,2]`/`"0.9.9"`/`123`/
+# `null`/`true`）时 AttributeError 逃出 except，而本句在**模块级**立即求值 ⇒
+# `python -m md_cg.mcp_server` 连 initialize 都发不出就退出（服务起不来，量级
+# 远重于「版本号退化」）；`{"version": 123}` 不抛但把 int 塞进握手
+# serverInfo.version（协议要字符串）。同族已修：hive/hive_mcp/mcp_server.py。
+def _package_version() -> str:
+    """读包根 package.json 的 version；**任何**形态异常都回落 "0.1.0"。
+
+    生效条件：文件可读、json.load 得 dict、且 doc["version"] 为 strip() 后非空
+    的 str 时返回该值；文件缺失 / OSError / JSON 非法 / 顶层非对象 / version
+    缺失·非字符串·空白串时一律回落 "0.1.0"（TypeError、AttributeError 一并兜底，
+    绝不把异常抛给 import 期）。
+    """
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "package.json"), encoding="utf-8") as f:
+            doc = json.load(f)
+        ver = doc.get("version") if isinstance(doc, dict) else None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return "0.1.0"
+    return ver if isinstance(ver, str) and ver.strip() else "0.1.0"
+
+
+SERVER_NAME = "mdcg-mcp"
+SERVER_VERSION = _package_version()
+PROTOCOL_VERSION = "2024-11-05"
+
+
+# --------------------------------------------------------------------------
+# 工具定义
+# --------------------------------------------------------------------------
+
+# 生效条件：传 _desc 与任意 props 时返回 {"type":"object","properties":props,"required":[...]}，required 仅列出 props 中值含真值 "_req" 键的条目名。
+def _s(_desc, **props):
+    return {"type": "object", "properties": props, "required":
+            [k for k, v in props.items() if v.get("_req")]}
+
+
+# 生效条件：始终返回 {"type":t,"description":desc}，仅当 req 为真值时该字典额外含 "_req": True。
+def drop_doc_nodes(items, id_of, enabled=False):
+    """过滤 doc_ 索引节点（会话日志切片）——**单一判据**，供所有可达路径共用。
+
+    issue #653：此前该过滤只活在 cg(op=read) 的非 budget 分支里：
+      · mdcg_recall / mdcg_search 直调库层，从不读该键（传了无效、无告警）；
+      · cg(op=read) 的 budget_tokens 早退分支在过滤块之前 return（静默忽略）；
+      · 唯一生效的 cg(op=read) 面其 inputSchema 未声明该参数。
+    本函数把判据收成一处，调用方只负责传 enabled 与取 id 的方式。
+    """
+    if not enabled:
+        return list(items or []), 0
+    kept, dropped = [], 0
+    for it in items or []:
+        nid = str(id_of(it) or "")
+        if nid.startswith("doc_"):
+            dropped += 1
+            continue
+        kept.append(it)
+    return kept, dropped
+
+
+def _note_doc_filter(meta, dropped, enabled):
+    """把过滤读数如实体现在 meta 上（不静默）。"""
+    if dropped and isinstance(meta, dict):
+        meta = dict(meta)
+        meta["excluded_doc"] = dropped
+        meta["exclude_doc"] = bool(enabled)
+    return meta
+
+
+def _p(t, desc, req=False, **extra):
+    d = {"type": t, "description": desc}
+    if req:
+        d["_req"] = True
+    d.update(extra)   # P2-22 前置（批次 24）：node_id 等可传 pattern/maxLength
+    return d
+
+
+# 生效条件：exp 为假值（None/空容器等）时返回 None，exp 为真值时返回 _expand 闭包——该闭包调用时先取 expand_query_terms_weighted(q)，再对 exp 每项（dict 项 term=str(it.get("term") or "").strip()、w=float(it.get("weight",0.5)) 抛 TypeError/ValueError 则 w=0.5；非 dict 项 term=str(it).strip()、w=0.5）在 term 非空时写 out[term]=max(out.get(term,0.0), max(0.0,min(1.0,w)))，最后置 out["__source__"]="llm" 并返回 out；
+def _make_query_expand(exp):
+    """把调用方（LLM/多智能体）提供的扩展词包装成 query_expand 注入函数。
+
+    黑箱只在**查询时刻**：调用方给出 {term,weight}，索引侧仍是白箱词表匹配。
+    返回的函数与 md_cg.mdcg.expand_query_terms_weighted 同构，并在 __source__ 标注 llm。
+    """
+    if not exp:
+        return None
+    from .mdcg import expand_query_terms_weighted
+
+# 生效条件：在外层 _make_query_expand(exp) 的 exp 为真值前提下被调用时，先 out=expand_query_terms_weighted(q)，再对 _exp（默认绑定外层 exp）每项——dict 项取 term=str(it.get("term") or "").strip()、w=float(it.get("weight",0.5))（抛 TypeError/ValueError 则 w=0.5），非 dict 项取 term=str(it).strip()、w=0.5，term 非空时 out[term]=max(out.get(term,0.0), max(0.0,min(1.0,w)))，最后置 out["__source__"]="llm" 并返回 out。
+    def _expand(q, _exp=exp):
+        out = expand_query_terms_weighted(q)
+        for it in _exp:
+            if isinstance(it, dict):
+                term = str(it.get("term") or "").strip()
+                try:
+                    w = float(it.get("weight", 0.5))
+                except (TypeError, ValueError):
+                    w = 0.5
+            else:
+                term, w = str(it).strip(), 0.5
+            if term:
+                out[term] = max(out.get(term, 0.0), max(0.0, min(1.0, w)))
+        out["__source__"] = "llm"
+        return out
+
+    return _expand
+
+
+TOOLS = [
+    {
+        "name": "mdcg_remember",
+        "description": "写入一条记忆节点（md 认知图）。content 建议含 CCG 5 要素注释"
+                       "（# 功能名/# 生效条件/# 子功能/# 执行/# 验证方式/# 不适用条件）。"
+                       "gated=true 时先经主动遗忘闸门（三问→四态：ACCEPT/MERGE/DROP/DEFER），"
+                       "适用于写入情景层记忆时的筛选（未指定 layer 时默认 contextual）。"
+                       "写入恒带会话身份（session）以区分不同会话的记忆；省略则归因到"
+                       "进程/环境身份。",
+        "inputSchema": _s("", node_id=_p("string", "节点 id（省略则自动生成）",
+                                         pattern="^[A-Za-z0-9_.@\u4e00-\u9fff,-]{1,128}$",
+                                         maxLength=128),
+                          content=_p("string", "节点内容", True),
+                          layer=_p("string", "层：anchor|structural|knowledge|contextual|self"),
+                          role=_p("string", "角色：knowledge|user|assistant|tool-output|command|edit"
+                                            "（兼作来源证据：user=外部惊奇，command/tool-output=内部确定性）"),
+                          session=_p("string", "本会话标识（归因维度，与授权无关）：单进程服务"
+                                              "多个会话时用它声明这条记忆属于哪个会话，以便按会话"
+                                              "隔离检索。DSH 形态会校验会话真实存在（不存在降级 "
+                                              "anonymous），非 DSH 形态原样采用；部署侧已设 "
+                                              "MDCG_SESSION/DSH_SESSION_ID 时本参数被忽略（环境权威，"
+                                              "客户端不得改写归属）"),
+                          tags=_p("array", "标签"), importance=_p("number", "重要性 0-1"),
+                          importance_hint=_p("number", "闸门的重要性提示（≥0.7 保护优先直接 ACCEPT）"),
+                          gated=_p("boolean", "启用主动遗忘闸门（默认否；写情景层建议开）"),
+                          override=_p("boolean", "覆盖受保护节点需显式 true"),
+                          consistency=_p("boolean", "写入前节点间自动冲突检测（三级决策，默认 true）"),
+                          on_conflict=_p("string", "冲突处置：reject（默认，抛错）|defer（不写）|record（记录放行）"),
+                          condition_space=_p("object", "条件空间"),
+                          spatial=_p("object", "3D 空间锚（0.8.0 身体×脑对接约定，四条裁定之二）："
+                                               "{\"coords3d\": {x,y,z}} 自定义键直存米制；"
+                                               "可选 bbox 投影后补（不改既有 bbox 2D 语义）"),
+                          verification_basis=_p("string", "验证基底"),
+                          non_applicable_conditions=_p("array", "不适用条件")),
+                          },
+    {
+        "name": "mdcg_recall",
+        "description": "按 token 预算召回记忆包（RRF 多路融合）。装包策略：条目超预算时"
+                       "**按 max_item_tokens 截取前 N token 摘录纳入**（返回体标 truncated=true），"
+                       "仅当剩余预算放不下最小摘录时才跳过——避免旧行为"
+                       "「跳过超大、继续试更小的」在预算紧张时淘汰最有价值的详实条目。"
+                       "会话开始或重要工作前调用。可选启用第 5 路模糊召回（分级隶属度）"
+                       "与第 6 路条件语义路（条件结构驱动），并注入调用方 LLM 的查询"
+                       "扩展词（索引侧始终白箱）。缺省另含第 7 路因果路（沿 edges 多跳）"
+                       "与第 8 路时间路（时间邻近度）——按裁定「全进默认检索」缺省开，"
+                       "可用 causal=false / temporal=false 单独关。",
+        "inputSchema": _s("", query=_p("string", "描述当前任务的查询", True),
+                          budget_tokens=_p("integer", "token 预算（默认 1200）"),
+                          max_item_tokens=_p("integer", "单条上限（默认 250）；超限条目截断纳入。"
+                                                        "传 0 关闭截断、回到「超大一律跳过」的旧行为"),
+                          excerpt_strategy=_p("string", "超预算条目摘录方式：prefix（默认，正文开头）或 query（按查询选择原文片段，附字符位置）"),
+                          k=_p("integer", "候选上限"), context=_p("object", "当前情境条件空间"),
+                          include_work=_p("boolean", "是否含工具输出/命令/编辑（默认否）"),
+                          fuzzy=_p("boolean", "启用第 5 路模糊召回（分级隶属度，默认否）"),
+                          bm25=_p("boolean", "用 BM25 倒排词频评分替换词法路（默认否；仍经可见性与门控）"),
+                         semantic=_p("boolean", "启用第 6 路条件空间结构化匹配"
+                                               "（白箱语义路：CCG 生效条件 + condition_space "
+                                               "四槽，不适用条件命中即剔除；默认否）"),
+                          exclude_doc=_p("boolean", "检索面排除 doc_ 索引节点（会话日志切片；"
+                                                "默认 false = 保持既有契约——test_p27_docindex ⑤ 断言"
+                                                "文档节点必须可被检索到；需要「只看真记忆卡」的调用方显式传 true）"),
+                          expand=_p("array", "LLM 查询侧扩展词：[{term,weight}] 或 [\"词\"]；"
+                                             "仅在查询时刻生效，索引侧仍白箱"),
+                          session=_p("string", "会话归属过滤（frontmatter.session；"
+                                     "多会话共用 root 时只取本会话记忆；缺省不过滤）"),
+                          validity=_p("boolean", "时效过滤（**显式启用**，缺省不过滤）："
+                                                 "仅排除**已过期**（valid_until 已过）节点；"
+                                                 "**未生效（valid_from 未到）一律保留**——"
+                                                 "「尚未开始」与「已失效」语义相反，预约/计划类"
+                                                 "记忆在生效前仍可召回"),
+                          goal=_p("string", "当前目标（第 5 篇第 3 章）：启用 goal 路给召回定向；"
+                                            "省略则自动取活跃目标"),
+                          goal_path=_p("boolean", "启用目标定向路（默认否；给 goal 即自动启用）"),
+                          causal=_p("boolean", "因果路（P3，设计稿 §6.2）：以词法/实体命中"
+                                               "为种子沿 edges 多跳扩散，**缺省开**（全进默认"
+                                               "检索）；传 false 单独关本路。无 edges 的库上"
+                                               "自然为空"),
+                          temporal=_p("boolean", "时间路（P3，设计稿 §6.3）：按时间邻近度"
+                                                "排序的排名项，核走 time_core.cred_factor；"
+                                                "**缺省开**；传 false 单独关本路。无时间算子/"
+                                                "区间时恒空"),
+                          include_recent=_p("boolean", "是否附「近期事件」窗口（默认否）"),
+                          recent_limit=_p("integer", "近期事件条数（默认 10）"),
+                          fusion=_p("string", "融合模式：sum（经典 RRF，奖励多路共识）"
+                                              "| max（取各路最高贡献，不奖励共识）。"
+                                              "fuzzy=true 时缺省 max——实测 sum 会低估"
+                                              "「只有模糊路捞到」的目标，self@1 −10.1%；"
+                                              "因果路（causal，缺省开）同为单路独有召回型，"
+                                              "故一并缺省 max")),
+    },
+    {
+        "name": "mdcg_search",
+        "description": "精确检索（T0–T3 阶梯 + 四态资格判定）。返回 score/state/tier。",
+        "inputSchema": _s("", query=_p("string", "查询", True), k=_p("integer", "条数"),
+                          layer=_p("string", "限定层"), context=_p("object", "情境"),
+                          roles=_p("array", "限定角色"), include_work=_p("boolean", "含工作角色"),
+                          session=_p("string", "会话归属过滤（frontmatter.session；缺省不过滤）"),
+                          validity=_p("boolean", "时效过滤（显式启用，缺省不过滤）：仅排除已过期（valid_until 已过）节点，未生效（valid_from 未到）保留"),
+                          # 异步检索（2026-10-21）：怕 MCP 超时的客户端用它——提交后立刻拿
+                          # job_id，隔若干秒带 job_id 再来取结果（后台线程跑同一条检索）。
+                          defer_s=_p("number", "异步检索：大于 0 时立刻返回工单（job_id），检索在后台跑"),
+                          job_id=_p("string", "取异步检索结果：传上次返回的 job_id")),
+    },
+    {
+        "name": "mdcg_get",
+        "description": "按 id 读取一个记忆节点（frontmatter + content）。"
+                       "id 不存在或密级不可读时返回 {ok:false, error:'not_found', "
+                       "readable_sensitivities, hint}（不再返回裸 null——"
+                       "调用方须能区分「没有」与「读不到」）。",
+        "inputSchema": _s("", node_id=_p("string", "节点 id", True)),
+    },
+    {
+        "name": "mdcg_reflect",
+        "description": "反思单元：记录本次查询的信息差 D(t,C) 与二阶 d²D/dt²，写 _reflection.jsonl。",
+        "inputSchema": _s("", query=_p("string", "查询", True), k=_p("integer", "取前 k 条"),
+                          feedback=_p("string", "用户反馈（可选）")),
+    },
+    {
+        "name": "mdcg_verify",
+        "description": "验证单元：对节点做外部裁决 confirmed/weakened/falsified"
+                       "（falsified 会移入 rejected/ 负记忆；受保护节点"
+                       " self/anchor 层、protected 标记、importance≥0.7 不可"
+                       "一键证伪删除，需显式 override=true，旧版本自动快照+留痕）。",
+        "inputSchema": _s("", node_id=_p("string", "节点 id", True),
+                          evidence=_p("string", "证据", True),
+                          verdict=_p("string", "confirmed|weakened|falsified", True),
+                          override=_p("boolean", "受保护节点需显式 true 才可证伪删除")),
+    },
+    {
+        "name": "mdcg_flywheel",
+        "description": "知识飞轮：把一次误差（预期状态 vs 实际状态）转为 unresolved 条目，驱动补条件。",
+        "inputSchema": _s("", error_report=_p("object", "错误报告 {query,expected_state,actual_state,missing}", True)),
+    },
+    {
+        "name": "mdcg_mine_fix_pairs",
+        "description": "从行为日志自动挖掘「错误→修复」对：产出可路由修复知识 + rejected 负记忆。",
+        "inputSchema": _s("", events=_p("array", "事件列表 [{role,text}] 或 [{error,fix}]", True)),
+    },
+    {
+        "name": "mdcg_rejected",
+        "description": "写入负记忆（被证伪的假设），防重复踩坑；同内容幂等。",
+        "inputSchema": _s("", hypothesis=_p("string", "假设", True), reason=_p("string", "否决原因", True),
+                          verification_basis=_p("string", "验证基底"), tags=_p("array", "标签")),
+    },
+    {
+        "name": "mdcg_unresolved",
+        "description": "写入未解问题（驱动主动探索）。",
+        "inputSchema": _s("", question=_p("string", "问题", True), known_clues=_p("string", "已知线索"),
+                          goal=_p("string", "目标")),
+    },
+    {
+        "name": "mdcg_propose",
+        "description": "把一个候选记忆放入审核队列（海马体 inbox），等待 review_decide。",
+        "inputSchema": _s("", node_id=_p("string", "节点 id", True), content=_p("string", "内容", True),
+                          layer=_p("string", "层"), tags=_p("array", "标签"),
+                          condition_space=_p("object", "条件空间"),
+                          verify=_p("object", "验收判据（内联声明，裁决阶段只读）")),
+    },
+    {
+        "name": "mdcg_review_list",
+        "description": "列出待审核候选；被红队打回待再审批的条目带 status=needs_reapproval。",
+        "inputSchema": _s(""),
+    },
+    {
+        "name": "mdcg_review_decide",
+        "description": "审核裁决：accept / reject / edit / merge / noop（merge 需 merge_into；"
+                       "merge 与 add 同受写保护——目标层须可写，self/anchor/immutable "
+                       "目标需显式 override=true）。"
+                       "noop=已评估、判定不改变任何现有记忆：只留痕并关闭提案，"
+                       "不落业务节点、不进负记忆（与 reject 的区别是语义而非路径）。"
+                       "redteam.verdict=reject 不落库，转 needs_reapproval，"
+                       "修复后须带递增 round 的 pass 再审批；判据只读不可改。",
+        "inputSchema": _s("", pid=_p("string", "提案 id", True),
+                          decision=_p("string", "accept|reject|edit|merge|noop", True),
+                          edits=_p("object", "edit 时的覆盖字段"), merge_into=_p("string", "merge 目标节点 id"),
+                          reason=_p("string", "裁决理由"),
+                          redteam=_p("object", "红队裁决 {verdict:pass|reject, issues:[], round:n}"),
+                          issues=_p("array", "问题清单（打回理由）"),
+                          override=_p("boolean", "merge 进受保护目标需显式 true")),
+    },
+    {
+        "name": "mdcg_review_records",
+        "description": "裁决记录审计：列出 md 审计节点（self 层，供其他来源审计）；"
+                       "给 node_id 则复核该记录的 record_hash 与 "
+                       "hippocampus/decisions.jsonl 是否一致。",
+        "inputSchema": _s("", pid=_p("string", "只看某提案的记录"),
+                          node_id=_p("string", "复核该审计节点 id")),
+    },
+    {
+        "name": "mdcg_forget",
+        "description": "软删除（tombstone）：节点移入 trash/ 并写入删除清单，可审计。"
+                       "受保护节点（self/anchor 层、protected 标记、importance≥0.7）"
+                       "不可遗忘，需显式 override=true（旧版本自动快照 + 留痕）。",
+        "inputSchema": _s("", node_id=_p("string", "节点 id", True), reason=_p("string", "原因"),
+                          override=_p("boolean", "受保护节点需显式 true 才可删除")),
+    },
+    {
+        "name": "mdcg_protect",
+        "description": "写保护（不可遗忘/不可覆盖）：action=stats 盘点 / check 查询某节点"
+                       "保护状态 / mark 打保护标记（需 can_admin）/ snapshot 快照当前版本 / "
+                       "history 列历史版本 / forgetting 读主动遗忘裁决留痕。",
+        "inputSchema": _s("", action=_p("string", "stats|check|mark|snapshot|history|forgetting"),
+                          node_id=_p("string", "check/mark/snapshot/history 的节点 id"),
+                          reason=_p("string", "mark 的保护原因"),
+                          limit=_p("integer", "forgetting 的最近条数（默认 100）")),
+    },
+    {
+        "name": "mdcg_forgetting_history",
+        "description": "主动遗忘裁决留痕：ACCEPT/MERGE/DROP/DEFER 四态及三问判据"
+                       "（重复度/重要度/自信息代理），可审计「为什么没被记住」。",
+        "inputSchema": _s("", limit=_p("integer", "最近条数（默认 100）")),
+    },
+    {
+        "name": "mdcg_identity",
+        "description": "身份特征识别（不止「用户画像」）：识别每个主体（智能体自身 self / "
+                       "协作者 user / 扮演角色 role / 其他智能体 agent）的身份锚点、位置效应"
+                       "（智能论 v3.4 五大单元：记录=全/反思=新/验证=稳/输出=通/维生=存）"
+                       "与条件特征。action=observe 记行为证据（memory 接口）/ anchor 写身份"
+                       "锚点（不可遗忘，role 不得进 self 层）/ trait 写条件特征（values 接口）"
+                       "/ profile 取画像 / positions 看主体位置分布 / catalog 读位置效应表"
+                       "；另含**存在契约记录**（§1.6.5/§3.2.1）：action=contract 写（走 "
+                       "admin 闸，落 anchor 层不可篡改；四字段＋引用锚 doc_ref＋status_hash"
+                       "，不复制承诺原文）/ contracts 只读反查（给 contract_id 取单条，"
+                       "否则列全部）。",
+        "inputSchema": _s("", action=_p("string", "observe|anchor|trait|profile|positions|"
+                                                 "catalog|history|contract|contracts"),
+                          subject_id=_p("string", "主体：self:xx|user:xx|role:xx|agent:xx；"
+                                                 "contracts 兼作接收方过滤"),
+                          subject_kind=_p("string", "主体类型：self|user|role|agent"),
+                          content=_p("string", "observe/anchor 的文本"),
+                          trait=_p("string", "trait 的特征文本"),
+                          role=_p("string", "observe 的行为角色（兼作来源证据）"),
+                          position=_p("string", "位置效应：record|reflect|verify|output|sustain"),
+                          layer=_p("string", "observe 落层（默认 knowledge）"),
+                          tags=_p("array", "标签"),
+                          condition_space=_p("object", "条件空间（=触发时机）"),
+                          importance=_p("number", "重要度 0-1"),
+                          verification_basis=_p("string", "验证基底"),
+                          evidence=_p("string", "证据来源标记"),
+                          requested_layer=_p("string", "anchor 目标层（role≠self 时禁止 self）"),
+                          override=_p("boolean", "覆盖受保护锚点需显式 true"),
+                          limit=_p("integer", "positions/history 返回条数"),
+                          contract_id=_p("string", "contract/contracts：锚定标识"
+                                                   "（#ANCHOR-xxx 原形，落 id 时归一）"),
+                          grantor=_p("string", "contract：授予方＝设计者位置标识"),
+                          grantee=_p("string", "contract：接收方＝协议实例标识"),
+                          timestamp=_p("string", "contract：时间戳（结构事件时间）"),
+                          status_summary=_p("string", "contract：状态摘要（结构状态文本）"),
+                          doc_ref=_p("object", "contract：引用锚（doc_ref 同构，指向真源区间，"
+                                               "不复制原文）"),
+                          condition_ref=_p("object", "contract：承诺条件空间的引用"
+                                                     "（节点 id/台账，不复制内容）"),
+                          state_ref=_p("object", "contract：那一刻运行状态的引用"
+                                                 "（节点 id/台账，不复制内容）")),
+    },
+    {
+        "name": "mdcg_consistency",
+        "description": "节点间自动冲突检测（写入前校验，三级决策）："
+                       "L0 情绪=信息差二阶变化（approaching/stable/avoiding，独立通道"
+                       "不参与信任计算）→ L1 反思=条件论「反题」冲突检测"
+                       "（自否定/违反纪律/条件互斥）→ L2 递归反思（受深度/节点数/"
+                       "循环/信息增益门槛约束）。action=check 预检待写内容（不落盘）/ "
+                       "history 判定留痕 / stats 汇总 / catalog 自描述。"
+                       "冲突自动触发飞轮（误差→补条件→结构更新）。",
+        "inputSchema": _s("", action=_p("string", "check|history|stats|catalog"),
+                          content=_p("string", "check 的待写内容"),
+                          layer=_p("string", "check：只与该层节点比对"),
+                          condition_space=_p("object", "check：待写节点的条件空间"),
+                          non_applicable_conditions=_p("array", "check：不适用条件"),
+                          tags=_p("array", "check：标签"),
+                          exclude=_p("string", "check：排除自身节点 id"),
+                          depth=_p("integer", "check：递归反思深度上限"),
+                          auto_flywheel=_p("boolean", "check：冲突时自动投递飞轮"),
+                          sensitivity=_p("string",
+                                         "check：待写内容声明的密级（透传飞轮建单）"),
+                          limit=_p("integer", "check 扫描上限 / history 条数")),
+    },
+    {
+        "name": "mdcg_metacognition",
+        "description": "独立元认知（观察自身认知的二阶单元，不参与裁决）："
+                       "情绪=信息差二阶变化 d²D/dt²（§十一）→ 轨迹面；"
+                       "自信校准（期望正确率 vs 实际验证通过率，过度自信/过度保守）→ 校准面；"
+                       "盲区地图（反复 BLINDSPOT 的查询邻域 + 未解问题，推论三）→ 盲区面；"
+                       "P_gap/P_trust + 情感 d²T/dt²（§十）→ 信任面；"
+                       "D_meta 边界压力向量（events_pressure / unmodeled_growth / "
+                       "boundary_violation_rate 各自 [0,1]，**不合成单值**，DEV-002a）"
+                       "→ 边界面。"
+                       "action=report 完整报告（含确定性建议）/ trace / calibration / "
+                       "blindspots / trust / self_check（回答前自检：该直接答还是先补条件）"
+                       " / history / d_meta / catalog。只读留痕，不改事实层。",
+        "inputSchema": _s("", action=_p("string", "report|trace|calibration|"
+                                                "blindspots|trust|self_check|"
+                                                "history|d_meta|catalog"),
+                          query=_p("string", "self_check 的待答查询"),
+                          k=_p("integer", "self_check：相似历史条数"),
+                          window=_p("integer", "轨迹/信任的滚动窗口"),
+                          limit=_p("integer", "calibration 扫描上限 / "
+                                              "blindspots、history 条数")),
+    },
+    {
+        "name": "mdcg_self_state",
+        "description": "自我状态层（薄自我 + 富索引）：self 层只放一张自我状态卡"
+                       "（单例）+ 有向关系节点，登记九项自我信息的当前值与指针"
+                       "（信息差 D/d1/d2、信任 P_gap/P_trust、情绪=d²D/dt²、"
+                       "情感=d²T/dt²、短期记忆窗口摘要、重要性、身份锚点、关系度）；"
+                       "具体任务/人物/会话/时间/信任的细节仍留在原层，按五维索引"
+                       "（task/person/session/time/trust）连接过来，不搬运内容。"
+                       "action=snapshot 读卡 / refresh 刷新（幂等 + 版本链） / "
+                       "bootstrap 会话启动加载 / relate 写关系 / relations 列关系 / "
+                       "index 按维度反查详情 / dimensions 看索引 / audit 一致性审计 / "
+                       "history 留痕 / summary 一句话 / catalog 自描述。",
+        "inputSchema": _s("", action=_p("string", "snapshot|refresh|bootstrap|relate|"
+                                                "relations|index|dimensions|audit|"
+                                                "history|summary|catalog"),
+                          subject=_p("string", "主体（默认 self:lingshu）"),
+                          window=_p("integer", "聚合窗口（反思/验证/近期条数）"),
+                          importance=_p("number", "refresh：自我重要性权重"),
+                          important_refs=_p("array", "refresh：显式重要节点 id"),
+                          dimensions=_p("object", "refresh：五维索引标签，"
+                                                  "{task,person,session,time,trust}"),
+                          links=_p("array", "refresh：指向详情节点的边"),
+                          force=_p("boolean", "refresh：强制写入（跳过幂等）"),
+                          strict=_p("boolean", "refresh：版本链断裂时拒绝写入"),
+                          frm=_p("string", "relate：源主体"),
+                          to=_p("string", "relate：目标主体"),
+                          relation_type=_p("string", "relate：collaborator|user|peer|"
+                                                     "mentor|student|adversary|tool|other"),
+                          strength=_p("number", "relate：强度 0-1"),
+                          condition=_p("string", "relate：生效条件"),
+                          note=_p("string", "relate：备注"),
+                          reciprocal=_p("boolean", "relate：同时写反向关系"),
+                          direction=_p("string", "relations：out|in|both"),
+                          dim=_p("string", "index：task|person|session|time|trust"),
+                          value=_p("string", "index：维度取值"),
+                          with_content=_p("boolean", "index：是否附正文摘要"),
+                          limit=_p("integer", "index/history 条数")),
+    },
+    {
+        "name": "mdcg_predict",
+        "description": "生成式预测（候选未来，非必然未来）：沿因果/时序边 + 语义邻近"
+                       "（经 D-002 伪因果过滤门）生成局部路线，输出 uncertainty_bound / "
+                       "extrapolation_validity（smooth|jump|unknown）/ T_pred 四维评分"
+                       "（trend .40 / boundary .20 / verification .25 / balance .15）。"
+                       "支持盲区驱动（blindspot_id 指向 unresolved 节点/盲区邻域；"
+                       "声明「不可预测」则拒绝生成）与命中反馈（D-006 动态校准："
+                       "命中 → 边置信度 +0.05，未命中 → 登记 rejected）。"
+                       "action=routes|feedback|stats|catalog。",
+        "inputSchema": _s("", action=_p("string", "routes|feedback|stats|catalog"),
+                          start_id=_p("string", "routes：起点节点 id"),
+                          blindspot_id=_p("string", "routes：盲区驱动（unresolved 节点 id "
+                                                   "或盲区邻域键）"),
+                          horizon=_p("integer", "routes：最大前推步数（默认 3，上限 16）"),
+                          max_branches=_p("integer", "routes：每步最大分支"
+                                                     "（默认 5，上限 32）"),
+                          sort=_p("string", "routes：composite|trend|verification|"
+                                            "boundary|balance"),
+                          limit=_p("integer", "routes：返回条数；stats：最近留痕条数"),
+                          semantic=_p("boolean", "routes：是否并入语义邻近候选"
+                                                 "（默认是，须过伪因果过滤门）"),
+                          predicted_node_id=_p("string", "feedback：被预测命中的节点 id"),
+                          actual_node_id=_p("string", "feedback：实际走向节点 id"),
+                          hit=_p("boolean", "feedback：是否命中"
+                                            "（缺省按 predicted==actual）"),
+                          note=_p("string", "feedback：备注")),
+    },
+    {
+        "name": "mdcg_causal",
+        "description": "因果推理：`causal` 边 = 条件依赖因果（A 是 B 成立的条件），"
+                       "链 = 条件序列。action=path 判断 A 能否沿因果/时序边到达 B"
+                       "（可达性，伪因果防护的完整语义）/ gate 跑 D-002 伪因果过滤门"
+                       "（语义邻近须能说清关系才准入）/ chain 沿因果链展开（每跳带"
+                       "条件与权重）/ explain 人类可读链式解释 / catalog 自描述。",
+        "inputSchema": _s("", action=_p("string", "path|gate|chain|explain|catalog"),
+                          a=_p("string", "path/gate：源节点 id"),
+                          b=_p("string", "path/gate：目标节点 id"),
+                          node_id=_p("string", "chain/explain：起点节点 id"),
+                          max_depth=_p("integer", "path/chain：最大跳数"),
+                          relation_types=_p("array", "chain：限定边类型，"
+                                                     "默认 ['causal']"),
+                          direction=_p("string", "chain：out|in"),
+                          sort=_p("string", "chain：strength|length")),
+    },
+    {
+        "name": "mdcg_evolution",
+        "description": "演化账本（md 载体 `_evolution/ledger.md`）：每一次修改 = 对一条"
+                       "缺失条件的补充；账本正文是人类可读的**认知规律 + 状态**"
+                       "（confidence/layer/importance/负条件/验证基底），不记实现细节"
+                       "（实现属于 git）。action=record 追加 / entries 列表 / show 单条 / "
+                       "history 某节点演化史 / patterns 按缺失条件维度聚类出规律 / "
+                       "summary 一句话 / rollback 撤回某条演化的状态（dry_run 可预演；"
+                       "撤销本身也记一条条目，不可静默）/ catalog 自描述。",
+        "inputSchema": _s("", action=_p("string", "record|entries|show|history|"
+                                                "patterns|summary|rollback|catalog"),
+                          node_id=_p("string", "绑定节点 id"),
+                          rule=_p("string", "record：规律（必填，一句话认知规律）"),
+                          missing=_p("string", "record：补的是哪一维缺失条件"),
+                          change=_p("string", "record：这次具体改了什么"),
+                          kind=_p("string", "record：condition_gap|layer_shift|general"),
+                          evidence=_p("string", "record：触发本次演化的验证依据"),
+                          source=_p("string", "record：consolidate|verify|manual"),
+                          entry_id=_p("string", "show/rollback：条目 id"),
+                          note=_p("string", "rollback：备注（覆盖默认规律）"),
+                          dry_run=_p("boolean", "rollback：只预演不落盘"),
+                          limit=_p("integer", "entries/history/patterns 条数")),
+    },
+    {
+        "name": "mdcg_restore",
+        "description": "恢复被 forget 的节点；若在删除清单中且未 force 则拒绝（恢复时删除检查）。",
+        "inputSchema": _s("", node_id=_p("string", "节点 id", True), force=_p("boolean", "强制恢复")),
+    },
+    {
+        "name": "mdcg_health",
+        "description": "健康度：分桶健康 + CCG 完整度 + 验证基底覆盖率 + OS 指标（审核/墓碑/审计）。",
+        "inputSchema": _s(""),
+    },
+    {
+        "name": "mdcg_whoami",
+        "description": "身份与权限：tenant / actor / clearance / 可见节点数 / 可读密级列表。",
+        "inputSchema": _s(""),
+    },
+    {
+        "name": "mdcg_ingest",
+        "description": "设备驱动：从会话文件增量摄取事件（自动 fix-pair 挖掘 + watermark 去重）。"
+                       "source=auto 时自动发现本机 DSH 会话，按**文件体积**降序选取"
+                       "（不是按最近活动）；选中的会话与候选明细见返回体 selection 字段。",
+        "inputSchema": _s("", source=_p("string", "会话文件路径，或 'auto' 自动发现 DSH 会话"),
+                          max_events=_p("integer", "单次最多摄取事件数"),
+                          mine_fix_pairs=_p("boolean", "是否自动挖掘错误→修复对（默认否——"
+                                            "先落账后挖矿；显式开启时产物走 propose "
+                                            "审核队列，不直写知识层）"),
+                          dry_run=_p("boolean", "只统计不写入")),
+    },
+    {
+        "name": "mdcg_watermarks",
+        "description": "各事件源的摄取水位（增量摄取状态，可审计）。",
+        "inputSchema": _s(""),
+    },
+    {
+        "name": "mdcg_whitebox",
+        "description": "显式调用白箱能力库（AEIS，已下线为本地库）并验证其能力。"
+                       "action=ask 问白箱（wisdom_chat）；action=remember 让白箱编码一条知识；"
+                       "action=verify_encoding 验证「编码能力」（记住口令→追问命中）；"
+                       "action=verify_existing 验证「已有知识回答能力」（route=self 且非空）；"
+                       "action=ping 连通性探测；action=report 汇总验证留痕。"
+                       "验证结论写回认知图 self 层（tags 含 whitebox:verify）。",
+        "inputSchema": _s("", action=_p("string", "ask|remember|verify_encoding|"
+                                                "verify_existing|ping|report", True),
+                          question=_p("string", "ask/verify 的问题"),
+                          message=_p("string", "ask：问题（question 的别名）"),
+                          content=_p("string", "remember：待编码内容"),
+                          importance=_p("number", "remember：重要性 0-1"),
+                          tags=_p("array", "remember：标签"),
+                          session_id=_p("string", "会话 id"),
+                          marker=_p("string", "verify_encoding：唯一口令标记"),
+                          fact=_p("string", "verify_encoding：待编码事实"),
+                          questions=_p("array", "verify_existing：探针问题列表"),
+                          limit=_p("integer", "report：返回条数")),
+    },
+    {
+        "name": "mdcg_service_info",
+        "description": "服务信息（信任透明度）：身份/版本/根目录/节点统计/工具数/权限。",
+        "inputSchema": _s(""),
+    },
+]
+
+
+# --------------------------------------------------------------------------
+# 基元接口（kernel 暴露面）
+#
+# 架构决定（2026-09-09）：对外只暴露 2 个认知基元，其余细粒度工具下沉为
+# 本地函数（MDCG_MCP_SURFACE=full 时仍可见，供兼容与调试）。
+# 认知图只给「知识与建议能力名」，不执行——执行权归调用方。
+# --------------------------------------------------------------------------
+
+KERNEL_TOOLS = [
+    {
+        "name": "cg",
+        # issue #133 + #140：description 由单点表拼接（前缀 + 各 op 段落，
+        # 按 doc_order 逐字复原）——不再手写这 5KB 段落文本。
+        "description": _ot.cg_description(),
+        "inputSchema": _s("",
+            op=_p("string", _ot.op_enum(), True),
+            ccg=_p("object", "CCG 六要素编译器入参：{action, node_id, dialog, marks, "
+                             "slots, strict_spans, role, verdict, verifier, compiled_by, "
+                             "evidence, slot_corrections, model, jobs, blocking, wait_s, "
+                             "allow_degrade, channel, doctor, apply, basis}"),
+            intent=_p("string", "route 的查询意图"), query=_p("string", "read 的查询"),
+            goal=_p("string", "goal op 的目标文本；read 的定向目标（缺省用活跃目标）；"
+                              "task op：任务目标（CCG「执行」栏）"),
+            goal_status=_p("string", "goal op：active|done|dropped"),
+            priority=_p("number", "goal op：优先级 0-1（兼作定向偏置依据）"),
+            deadline=_p("string", "goal op：截止时间（仅排序用，不做硬约束）"),
+            conditions=_p("string", "goal op：生效条件"),
+            action_hint=_p("string", "goal op：执行说明（写入 CCG 的「执行」栏）"),
+            text=_p("string", "recent op 的事件文本"),
+            role=_p("string", "recent op 的事件角色：user|assistant|tool-output|command；"
+                              "write 时作为来源证据（user=外部惊奇）"),
+            meta=_p("object", "recent op：附加元数据"),
+            window=_p("integer", "recent op：滚动窗口大小（默认 200）"),
+            slot=_p("string", "state_event：事件槽位（五元之一——哪项状态）"),
+            old=_p("string", "state_event：变更前值（撤回时留空、new 必填；"
+                             "old/new 双空非法）"),
+            new=_p("string", "state_event：变更后值（撤回＝留空；空值即值作废）"),
+            include_recent=_p("boolean", "read：是否附近期事件窗口（默认否）"),
+            limit=_p("integer", "goal/recent 的返回条数；read 的近期事件条数；"
+                                "edges 分页条数（缺省 50、上限 500，0/负数报错不当「全部」）"),
+            node_id=_p("string", "节点 id"),
+            offset=_p("integer", "read 的续读起始行（1 基；传上次返回的 next_offset）；"
+                                 "edges 的分页偏移（排序后切片，默认 0）"),
+            content=_p("string", "write 的内容（建议含 CCG 5 要素注释）"),
+            content_kind=_p("string", "write 的内容类型：code|image_desc|text|permission|work_done|work_wip|ccg_marks|hyperedge。"
+                                      "text 类需带 CCG 六要素（功能名／生效条件／子功能／执行／验证方式／不适用条件，各占一行、"
+                                      "以「# 要素名：」起首）；缺失会被写入闸门拒绝，返回体如实列出缺失清单（verdict.detail.missing）——"
+                                      "补全后重写即可，无需原样再发。要求由规则库（MDCG_POLICY_FILE 指向的 policy 的 required/required_kinds）定义"),
+            depends_on=_p("array", "write/verify：本单元**依赖**的节点 id 列表（CCG「子功能」"
+                                   "的落字段，单值/逗号串亦可）。被依赖单元被修改或被证伪时，"
+                                   "本节点**同跳**标「存疑」（一跳同步；多跳走 maintain"
+                                   " action=propagate）。**何时需要它**：正文「# 子功能：」行"
+                                   "以 @<节点 id> 显式引用其它单元时（仅自述本单元内部构成"
+                                   "不算依赖，无需本字段）——显式引用却无可解析目标 → 硬拒"
+                                   "（E050 缺 depends_on / E051 目标悬空）"),
+            valid_from=_p("string", "双时间轴**起点**（ISO8601，如 2026-01-01）：此刻起才成立"
+                                    "（未到点在 scrub 报 not_yet，仅提示不降权）"),
+            valid_until=_p("string", "双时间轴**终点**（ISO8601）：此刻后不再成立"
+                                     "（过期在 scrub 报 expired，weaken/demote）"),
+            start_time=_p("string", "时间算子：查询窗起点（ISO8601/时间戳）。启用后 "
+                                    "read 按 time_axis 轴把候选收敛到窗内；edges 按边"
+                                    "写入时刻 t 收敛（**edges 缺省轴 observed**，与 read 不同）"),
+            end_time=_p("string", "时间算子：查询窗终点（缺省该侧=无界）"),
+            start_operator=_p("string", "时间算子：起点比较 gt|gte|eq|lte|lt"
+                                        "（两端都不给算子=区间重叠语义）"),
+            end_operator=_p("string", "时间算子：终点比较 gt|gte|eq|lte|lt"),
+            time_axis=_p("string", "时间算子轴：effective（效力轴，read 缺省）|"
+                                   "observed（观察轴 temporal/time_window；"
+                                   "**edges 的缺省轴**——派生边只有记录时刻，无效力声明）"),
+            layer=_p("string", "层：anchor|structural|knowledge|contextual|self"),
+            tags=_p("array", "标签（cap:xxx 会作为 route 的建议能力名）"),
+            importance=_p("number", "重要性 0-1"),
+            importance_hint=_p("number", "write gated=true 时的重要性提示"
+                                        "（≥0.7 触发保护优先，直接 ACCEPT）"),
+            gated=_p("boolean", "write 时启用主动遗忘闸门（三问→四态；默认否）"),
+            consistency=_p("boolean", "write：写入前做节点间冲突检测"
+                                      "（三级决策：情绪→反思→递归反思；默认开）"),
+            on_conflict=_p("string", "write：冲突处置 reject|defer|record（默认 defer）"),
+            override=_p("boolean", "覆盖/删除受保护节点需显式 override=true"),
+            subject_id=_p("string", "identity 的主体：self:xx|user:xx|role:xx|agent:xx"),
+            subject_kind=_p("string", "identity 主体类型：self|user|role|agent"),
+            trait=_p("string", "identity action=trait 的特征文本"),
+            position=_p("string", "identity：位置效应 record|reflect|verify|output|sustain"),
+            requested_layer=_p("string", "identity anchor 目标层（role≠self 时禁止 self）"),
+            contract_id=_p("string", "identity contract/contracts：锚定标识（#ANCHOR- 原形）"),
+            grantor=_p("string", "identity contract：授予方＝设计者位置标识"),
+            grantee=_p("string", "identity contract：接收方＝协议实例标识"),
+            timestamp=_p("string", "identity contract：时间戳（结构事件时间）"),
+            status_summary=_p("string", "identity contract：状态摘要（结构状态文本）"),
+            doc_ref=_p("object", "identity contract：引用锚（指向真源区间，不复制原文）"),
+            auto_flywheel=_p("boolean", "consistency：冲突时自动投递飞轮（默认否）"),
+            exclude=_p("string", "consistency：排除自身节点 id"),
+            depth=_p("integer", "consistency：递归反思深度上限"),
+            condition_space=_p("object", "条件空间"),
+            verification_basis=_p("string", "验证基底"),
+            # A1 补接（2026-10-05，路线 C 动工时经 audit 现值面发现写链漏传后
+            # 一并补齐的三处接线之一）：检验强度（与验证基底正交的裁决力分级）。
+            check_strength=_p("string", "检验强度：hoop|smoking_gun|doubly_decisive"
+                                       "（与 verification_basis 正交的裁决力分级；"
+                                       "覆写既有节点时默认继承）"),
+            # 路线 C（2026-10-05）：audit 的截断上限。
+            cap=_p("integer", "audit：各面截断上限（1–64，缺省 8）"),
+            non_applicable_conditions=_p("array", "不适用条件"),
+            context=_p("object", "当前情境"),
+            k=_p("integer", "返回条数（sustain pool_bench 亦用）"),
+            view=_p("string", "read/route 的角色化读取视图（第四阶段 6.1，缺省关）："
+                             "main（主代理：结论与修正历史）|"
+                             "verifier（验证端：判据面与环境陷阱）|"
+                             "receipt（回执审计：命令与预期输出）；"
+                             "非法值库层报错（fail-closed）"),
+            budget_tokens=_p("integer", "read 的 token 预算"),
+                          exclude_doc=_p("boolean", "检索面排除 doc_ 索引节点（会话日志切片；"
+                                                "默认 false = 保持既有契约——test_p27_docindex 断言"
+                                                "文档节点必须可被检索到；需要只看真记忆卡时显式传 true）"),
+            excerpt_strategy=_p("string", "read 超预算条目摘录方式：prefix（默认）或 query（查询相关原文片段）"),
+            bm25=_p("boolean", "read：显式使用 BM25 倒排评分（默认否）"),
+            evidence=_p("string", "verify 的证据；state_event：出处（五元之一，"
+                                 "回指原文/轮次）"),
+            verdict=_p("string", "verify 裁决：confirmed|weakened|falsified；"
+                                 "insight verify：verified|falsified"),
+            question=_p("string", "whitebox：ask/verify 的问题"),
+            message=_p("string", "whitebox ask：问题（question 的别名）"),
+            session_id=_p("string", "whitebox：会话 id（默认 md_cg-whitebox-verify）"),
+            marker=_p("string", "whitebox verify_encoding：唯一口令标记（缺省自动生成）"),
+            fact=_p("string", "whitebox verify_encoding：待编码事实"),
+            questions=_p("array", "whitebox verify_existing：探针问题列表"),
+            action=_p("string", "review: list|decide|rounds|stats|backlog|preview|search；"
+                                "forget: forget|restore；"
+                                "protect: stats|check|mark|snapshot|history|forgetting；"
+                                "identity: observe|anchor|trait|profile|positions|catalog|"
+                                "contract|contracts；"
+                                "consistency: check|history|stats|catalog；"
+                                "goal: add|list|status；recent: add|list|clear；"
+                                "sustain: status|beat|peers|diagnose|heal|"
+                                "evolve|provenance|pooling|pool_bench|"
+                                "pool_compare|start|stop|resume|note|catalog；"
+                                "scrub: sample|associate|audit|decontaminate|"
+                                "calibrate|sweep|history|summary|catalog；"
+                                "evolution: record|entries|show|history|patterns|"
+                                "summary|rollback|catalog；"
+                                "link: ls|show|handshake|observe|promote|degrade|"
+                                "isolate|withdraw|decay|policy|card|publish|peers|"
+                                "evidence|export|import|derive|derive_dangling|"
+                                "derive_catalog|derive_rebuild|catalog；"
+                                "ref: read|check|stat|prune；"
+                                "session: note|recall|compact；"
+                                "ingest: file|dir|jsonl|stat|hive；"
+                                "export: graph|nodes|slice|stat；"
+                                "maintain: stat|history|importance|longterm|prefeed|"
+                                "separate|rollback|backfill|backfill_rollback|"
+                                "backfill_history|cap|cap_rollback|cap_history|"
+                                "exempt|exempt_rollback|exempt_history|"
+                                "vision_evidence|vision_evidence_rollback|"
+                                "vision_evidence_history|"
+                                "refine|refine_gate|refine_history|"
+                                "refine_calibrate；"
+                                "consolidate: promote|promote_rollback|"
+                                "promote_history|induce|contextualize|"
+                                "contextualize_rollback|contextualize_history；"
+                                "insight: window|record|verify|list|report|"
+                                "reconstruct|learn|outlook|catalog|"
+                                "fork|branch_rewrite|branch_search|"
+                                "branch_merge|branch_discard|branches|"
+                                "tickets；"
+                                "分支六 act：node_ids/branch_id/note/content/"
+                                "reason 按 act 取用（rewrite 传 node_id+content）；"
+                                "tickets：盲区→四类消解票据任务卡"
+                                "（types=[research|prototype|grilling|task]，"
+                                "min_blindspot 资格线；apply=True 落库需 admin）"),
+            pid=_p("string", "review decide 的提案 id"),
+            decision=_p("string", "review 裁决：accept|reject|edit|merge"),
+            edits=_p("object", "review edit 的覆盖字段（不可含 verify）"),
+            merge_into=_p("string", "review merge 的目标节点 id"),
+            redteam=_p("object", "红队裁决 {verdict:pass|reject, issues:[], round:n}"),
+            issues=_p("array", "问题清单（红队打回理由）"),
+            reason=_p("string", "原因；consolidate contextualize 的归位理由（写台账）"),
+            force=_p("boolean", "restore 强制（忽略前置条件：墓碑等）"),
+            overwrite_live=_p("boolean", "restore 覆写同 id 在位节点需显式确认（#426-E，默认 False）"),
+            path=_p("string", "index_code/index_doc 的目录（大域）；link import 的证据包文件"),
+            patterns=_p("array", "index_code/index_doc 的文件后缀，默认取各自注册表"
+                                 "（代码 .py/.ts/.tsx/.js/.mjs/.cjs；文档 .md/.markdown）"),
+            skip_dirs=_p("array", "index_code/index_doc 的**追加**排除目录（只增不减："
+                                  "内置 .git/.venv/node_modules 等不可被关闭）。含 / 按"
+                                  "相对 root 的路径匹配（docs/experiments 只排这一处）；"
+                                  "不含 / 按目录名匹配（experiments 排任意层级同名目录）。"
+                                  "被排掉的目录见返回 skipped_dirs（排除与截断一样不静默）"),
+            prune=_p("boolean", "index_code/index_doc：索引后清退「同 root + 同 path "
+                                "但已不在本次产出中」的过期代节点（文档改标题致 node_id "
+                                "重算时产生），默认开；截断时不执行"),
+            prune_dry_run=_p("boolean", "prune 预演：只列待清退节点，不落删除"),
+            roots=_p("array", "ref action=prune：只清这些 root 下的悬空节点（默认全部）"),
+            max_files=_p("integer", "index_code/index_doc 最多扫描文件数（被截断时"
+                                    "返回里会显式给 truncated，不再静默不完整）"),
+            max_items=_p("integer", "index_code/index_doc 最多产出条目数（越限即截断并上报）"),
+            incremental=_p("boolean", "index_code/index_doc：按 _refindex.json 水位跳过"
+                                     "未变文件（默认否=全量重切，保证不漏召回）；"
+                                     "传 sensitivity 覆盖时自动退回全量"),
+            max_nodes=_p("integer", "ref action=check：最多巡检节点数（默认 2000，"
+                                    "越限返回 truncated=true）"),
+            sensitivity=_p("string", "密级声明：index_doc 的节点密级（默认 internal 并显式"
+                                     "写入；路径命中私有提示时保守降为 private）；"
+                                     "maintain prefeed 的待写内容密级（issue #315——"
+                                     "MERGE 并入更低密级节点时 fail-closed 拒绝）"),
+            ref=_p("object", "ref op：直接给 code_ref/doc_ref 对象（与 node_id 二选一）"),
+            root=_p("string", "ref op：覆盖 ref 里记录的 root（索引结果的跨机器搬迁）"),
+            name=_p("string", "sustain：心跳名（默认 md_cg）；"
+                              "task op：任务名（**身份判据**：同名即同任务，slug 归一后落 id）"),
+            session=_p("string", "read（search/recall 分支）：会话归属过滤"
+                                 "（frontmatter.session；缺省不过滤）；"
+                                 "sustain：会话 id（resume/note 用）"),
+            validity=_p("boolean", "read（search/recall 分支）：时效过滤（显式启用，"
+                                   "缺省不过滤）——仅排除**已过期**（valid_until 已过）"
+                                   "节点；**未生效（valid_from 未到）保留**"
+                                   "（两者语义相反，预约/计划类记忆生效前仍可召回）"),
+            ts=_p("number", "sustain note：事件时间戳"),
+            seq=_p("integer", "sustain note：事件序号；state_event：事件序号"
+                              "（五元之一——轮或序号）"),
+            task_running=_p("boolean", "sustain：任务执行中（心跳阈值放宽）"),
+            beat_interval=_p("number", "sustain start：心跳间隔秒（默认 600）"),
+            heal_interval=_p("number", "sustain start：巡检间隔秒（默认 300）"),
+            auto_heal=_p("boolean", "sustain start：巡检异常时自动修复（默认是）"),
+            scrub_interval=_p("number", "sustain start：自净间隔秒（默认 3600）"),
+            auto_scrub=_p("boolean", "sustain start：自净执行去污染（默认是；auto_scrub=false 可退回只巡检）"),
+            evolve_interval=_p("number", "sustain start：演化巡检间隔秒（默认 7200）"),
+            auto_evolve=_p("boolean", "sustain start：演化巡检自动落盘确定性动作（默认是）"
+                                      "（仅重要性重算；固化需 LLM 仍交人工。默认否）"),
+            allow_evolve=_p("boolean", "sustain heal：放行演化类修复"
+                                      "（确定性动作才执行；默认否）"),
+            dry_run=_p("boolean", "sustain heal / scrub：只列动作不落盘"),
+            ids=_p("array", "scrub：节点 id 列表（缺省全库）"),
+            kinds=_p("string", "scrub：限定污染类型，逗号分隔"),
+            strategy=_p("string", "scrub sample：stratified|risk|random"),
+            seed=_p("integer", "scrub sample：抽样种子（同 seed 同样本）"),
+            min_severity=_p("string", "scrub：最低严重度 info|low|medium|high"),
+            apply=_p("boolean", "scrub calibrate：写回偏置（默认只给建议）"),
+            lexical=_p("boolean", "scrub associate：是否用词法近邻（默认是）"),
+            start_id=_p("string", "predict：起点节点 id（缺省取最高重要度节点）"),
+            blindspot_id=_p("string", "predict：盲区驱动（unresolved 节点 id / "
+                                     "盲区邻域键）；声明不可预测则拒绝生成"),
+            horizon=_p("integer", "predict：最大前推步数（默认 3，上限 16）"),
+            max_branches=_p("integer", "predict：每步最大分支（默认 5，上限 32）"),
+            semantic=_p("boolean", "predict：是否并入语义邻近候选（默认是，"
+                                   "须过 D-002 伪因果过滤门）"),
+            a=_p("string", "causal path/gate：源节点 id"),
+            b=_p("string", "causal path/gate：目标节点 id"),
+            relation_types=_p("array", "causal chain：限定边类型，默认 ['causal']"),
+            direction=_p("string", "causal chain：out|in"),
+            sort=_p("string", "predict：composite|trend|verification|boundary|balance；"
+                              "causal chain：strength|length"),
+            predicted_node_id=_p("string", "predict feedback：被预测节点 id"),
+            actual_node_id=_p("string", "predict feedback：实际走向节点 id"),
+            hit=_p("boolean", "predict feedback：是否命中（缺省按 predicted==actual）"),
+            rule=_p("string", "evolution record：规律（必填，一句话认知规律）"),
+            missing=_p("string", "evolution record：补的是哪一维缺失条件"),
+            change=_p("string", "evolution record：这次具体改了什么；"
+                                "task op：本轮计划变更/新增问题（追加进「计划变更」节，可追溯）"),
+            kind=_p("string", "evolution：condition_gap|layer_shift|general"),
+            entry_id=_p("string", "evolution show/rollback：条目 id"),
+            source=_p("string", "evolution record：来源 consolidate|verify|manual；"
+                                "link evidence：按来源节点过滤；insight record：来源"),
+            peer=_p("string", "link：对端节点 id（如 agent:node-x）"),
+            subsystem=_p("string", "link：子系统名（缺省 swarm）"),
+            position_map=_p("object", "link handshake：对端位置映射 {位置:权重}"),
+            peer_theory=_p("object", "link handshake：对端版本声明"),
+            peer_version=_p("string", "link handshake：对端版本（peer_theory 简写）"),
+            declared_charter=_p("boolean", "link handshake：对端是否声明宪章（默认是）"),
+            peer_signature=_p("string", "link handshake/observe：对端签名"),
+            negative=_p("boolean", "link observe：是否反例（默认否）"),
+            set=_p("object", "link policy：设置子系统签名策略"),
+            signers_file=_p("string", "link：签名策略文件（缺省 ~/.mdcg/_signers.json）"),
+            swarm=_p("string", "link：跨节点共享目录（缺省 ~/.mdcg/swarm）"),
+            subject=_p("string", "link evidence：按主体过滤（如 agent:node-x）；"
+                                 "state_event：事件主体（五元之一——谁的状态）"),
+            subjects=_p("array", "link export：限定导出的主体列表"),
+            out=_p("string", "link export：证据包输出路径；export/maintain 输出路径"),
+            pack=_p("object", "link import：内联证据包（与 path 二选一）"),
+            include_content=_p("boolean", "export：是否带正文（默认 true，"
+                                          "nodes/graph 用；slice 按 ids 裁剪）"),
+            since=_p("number", "export slice：起始时间戳（含）"),
+            until=_p("number", "export slice：结束时间戳（含）"),
+            tag=_p("string", "export slice：按标签过滤"),
+            max_rows=_p("integer", "maintain longterm：单次评估行数上限"),
+            keep=_p("integer", "maintain longterm：保留最近 N 个断面（默认 10）"),
+            mode=_p("string", "maintain longterm：list|show（读断面清单/统计）"),
+            snapshot_id=_p("string", "maintain longterm show：断面 id 前缀"),
+            prefixes=_p("array", "consolidate contextualize / maintain vision_evidence："
+                                 "id 前缀白名单（如 ['note_','imgpart_']；不传即拒绝对"
+                                 "整层改写 / 用视觉节点默认前缀）"),
+            aeis_root=_p("string", "maintain vision_evidence：视觉证据归档根（只读逐部件"
+                                  "证据源；缺省本仓 data/vision；参数名为遗留名）"),
+            sample_n=_p("integer", "maintain refine：抽检条数（默认 20，裁定单条件 A）"),
+            prefix=_p("string", "maintain refine：抽检 id 前缀（默认空 = 不过滤，全库抽样）"),
+            verdicts=_p("array", "maintain refine apply：人工核对裁决 "
+                                 "[{concept_id, faithful, added_info, note}]；"
+                                 "缺省只落抽检留痕（不改节点）"),
+            batch=_p("string", "maintain/consolidate：批次号（回滚用）；"
+                               "edges：按派生边批次号过滤"),
+            derived_from=_p("string", "write/remember：派生来源节点 id（G8，可用逗号/空格"
+                                      "分隔多个）；声明后写入 frontmatter 并建派生边"),
+            relation=_p("string", "write/remember/link derive/edges：派生关系名（**谓词**），"
+                                  "默认 derived_from（split_from|extracted_from|"
+                                  "merged_from|refined_from|source）"),
+            child=_p("string", "link derive/edges：按子节点 id 过滤派生边"
+                               "（edges 中即三元组的**主体**）"),
+            parent=_p("string", "link derive/edges：按父节点 id 过滤派生边"
+                                "（edges 中即三元组的**对象**）"),
+            ordering=_p("string", "edges：排序方向 desc（按写入时刻 新→旧，缺省）|asc"),
+            aggregation=_p("string", "edges：分页前全集分桶 by_relation|by_parent|"
+                                     "by_child（缺省不聚合）"),
+            expand_nodes=_p("boolean", "edges：是否附端点索引摘要 child_node/"
+                                       "parent_node（默认否；只读索引快照）"),
+            ledger_only=_p("boolean", "link derive_dangling：只看台账、忽略索引声明"),
+            pools=_p("object", "search/sustain pool_bench：召回分池表"
+                               "{knowledge:{cap_ratio,weight},index:{…},"
+                               "negative:{…}}；各 cap_ratio 之和必须为 1.0；"
+                               "缺省（null）=关闭分池、沿用原 GLOBAL_CAP 平截"),
+            queries=_p("array", "sustain pool_bench/pool_compare：复测查询集；"
+                                "缺省则从索引确定性取样（proxy）"),
+            entry_ids=_p("array", "maintain rollback：按节点 id 定向回滚"),
+            min_jaccard=_p("number", "maintain separate / consolidate induce："
+                                     "内容相似度下限（默认 0.55 / 0.30）"),
+            min_cluster=_p("integer", "consolidate induce：成团最少成员数（默认 3）"),
+            min_delta=_p("number", "maintain importance：变动阈值（默认 0.05）"),
+            min_merge=_p("integer", "consolidate promote：反复命中次数下限（默认 2）"),
+            min_importance=_p("number", "consolidate promote：重要性下限（默认 0.6）"),
+            require_conditions=_p("boolean", "consolidate promote：四要素不全者不提升"
+                                             "（默认 true）"),
+            source_layer=_p("string", "consolidate promote：来源层（默认 contextual）"),
+            target_layer=_p("string", "consolidate promote：目标层（默认 knowledge）"),
+            write=_p("boolean", "maintain prefeed：按裁决落库（默认 false=只预演）"),
+            include_partial=_p("boolean", "maintain backfill：连「补完仍不全」的节点"
+                                           "一起写（默认 false=只补可判定者）"),
+            min_conf=_p("number", "maintain cap：能力标签置信度下限（默认 0.5）"),
+            basis_text=_p("string", "maintain backfill：本批次声明的「验证方式」文本"
+                                     "（人/流程声明，非模型生成）"),
+            clues=_p("array", "insight reconstruct：线索（词面 / 节点 id）"),
+            statement=_p("string", "insight record：洞见正文（必填；本层不臆造）"),
+            category=_p("string", "insight record：洞见分类"),
+            v_types=_p("array", "insight verify：证据类型 v1|v2|v3"
+                                "（v3 外部确证 / v2 实践重复 / v1 可检索）"),
+            state=_p("string", "insight list：按状态过滤 pending|verified|falsified"),
+            window_days=_p("number", "insight report/outlook：统计时间窗（天）"),
+            neighbors=_p("boolean", "insight reconstruct：是否并入一跳邻域（默认 true）"),
+            recent_days=_p("integer", "insight outlook：近期窗口天数（默认 7）"),
+            sample_limit=_p("integer", "insight outlook：抽样清单条数（默认 8）"),
+            bypass_gain=_p("boolean", "insight explore：§2.9.3.1 非任务探索的"
+                                      "预算豁免请求（默认 false；缺省关——未声明 "
+                                      "MDCG_EXPLORE_BUDGET_MAX 或窗口耗尽即回落"
+                                      "任务定价，非硬拒绝）"),
+            max_events=_p("integer", "ingest：单次最多摄取事件数"),
+            task_status=_p("string", "task op：active|blocked|done|dropped；"
+                                     "迁 done 必须同时给 result（缺一不收）"),
+            memory=_p("object", "task action=record_memory：{record_id, fact: "
+                      "{statement,subject,outcome,details?,files?,supersedes?}, "
+                      "experiences?:[{task,solution,conditions,boundary,verification,search_keys?}]}；"
+                      "outcome=succeeded|failed|blocked|partial；经验写为未核验候选"),
+            include_history=_p("boolean", "task action=recall_memory：是否包含已被取代的事实（默认否）"),
+            plan=_p("string", "task op：分步计划（每轮覆盖更新，跨会话持久存在）"),
+            result=_p("string", "task op：任务结果（done 时必填；本次不传则**保留旧值**，"
+                                "不会被静默清空）"),
+            acceptance=_p("string", "task op：验收判据（怎么算完成）"),
+            boundary=_p("string", "task op：不适用条件/边界"),
+            note=_p("string", "task op：本轮备注（change 是计划变更，note 是附注）；"
+                              "self_state relate：备注"),
+            condition=_p("string", "task op：生效条件（CCG「生效条件」栏）；"
+                                   "self_state relate：关系成立条件"),
+            active_limit=_p("integer", "task action=session：进行中任务条数（默认 5）"),
+            done_limit=_p("integer", "task action=session：近期已完成条数（默认 5）")),
+    },
+    {
+        "name": "stg",
+        "description": "语义时空图接口：精确得到信息的时间/空间关系。"
+                       "op=relation：两节点时空关系（Allen 时间 6 态 + RCC 空间 7 态）；"
+                       "op=timeline：按时间排序（可用 session 切本会话/跨会话视图，"
+                       "看「所有会话做了什么」传 session=\"*\"，返回项带会话归属）；"
+                       "op=anchors：落在时间窗/空间范围的节点；"
+                       "op=consistency：时空字段自洽性检查；"
+                       "op=state_chain：状态槽位投影（现值/区间/变迁史；"
+                       "flag MDCG_STG_STATE 默认关）。"
+                       "四个 op 均可用 time_axis 切换时间轴（缺省 observed）。",
+        "inputSchema": _s("",
+            op=_p("string", _ot.stg_op_enum(), True),
+            a=_p("string", "relation 的节点 a"), b=_p("string", "relation 的节点 b"),
+            time_window=_p("array", "anchors 的时间窗 [t1,t2]"),
+            bbox=_p("array", "anchors 的包围盒 [x1,y1,x2,y2]"),
+            layer=_p("string", "限定层"), limit=_p("integer", "返回条数"),
+            session=_p("string", "timeline 的会话视图开关（归因维度，与授权无关）："
+                                 "省略 = 不过滤（读遍所有会话，向后兼容）；\"*\" = 显式"
+                                 "跨会话，与「忘了传参」区分开；其它值 = 只取该会话"
+                                 "（frontmatter.session 精确相等）"),
+            desc=_p("boolean", "timeline 是否倒序（默认是）"),
+            time_axis=_p("string", "时间轴：observed（观察轴 temporal/time_window，"
+                                   "缺省）| effective（效力轴 effective_from/until）"),
+            subject=_p("string", "state_chain 的主体（省略＝不过滤）"),
+            slot=_p("string", "state_chain 的槽位（省略＝不过滤）"),
+            include_retired=_p("boolean", "state_chain 是否含退役槽位（默认 false；"
+                                          "退役不删除，只是默认不列）"),
+            history=_p("boolean", "state_chain 是否带变迁史（默认 true）")),
+    },
+]
+
+ALL_TOOLS = KERNEL_TOOLS + TOOLS
+SURFACE = os.environ.get("MDCG_MCP_SURFACE", "kernel").strip().lower()
+
+
+# 生效条件：模块级 SURFACE 等于 "full" 时以 ALL_TOOLS、否则以 KERNEL_TOOLS 调 slim_tools 并返回其结果。
+def tools_for_surface():
+    """kernel：只暴露 2 个基元；full：2 个基元 + 31 个细粒度工具（兼容/调试）。
+
+    返回**投影后**的工具面（工具一行职责 + 参数短提示）：完整语义由
+    ``cg(op=help, query=…)`` 按需取回。真源 KERNEL_TOOLS/TOOLS 保持完整定义，
+    投影只是运行时视图（信息零丢失，见 md_cg/tool_face.py）。
+    关闭投影：``MDCG_TOOL_FACE=full``。
+    """
+    tools = ALL_TOOLS if SURFACE == "full" else KERNEL_TOOLS
+    from .tool_face import slim_tools
+    return slim_tools(tools)
+
+
+# --------------------------------------------------------------------------
+# 序列化
+# --------------------------------------------------------------------------
+
+# 生效条件：始终返回 json.dumps(obj, ensure_ascii=False, default=str)。
+def _j(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, default=str)
+
+
+# 生效条件：path 以 ".zstd" 结尾时直接返回 DSHSessionSource(path)；否则读首个非空行做 json.loads，该 dict 满足 o.get("type")=="session" 或同时含 "type"/"seq"/"data" 时返回 DSHSessionSource(path)，能解析但不满足时返回 JsonlSource(path)，json.loads 抛 ValueError 或 open/读抛 OSError 或无非空行时落到返回 JsonlSource(path)。
+def _pick_source(path):
+    """按内容嗅探源类型：DSH 会话格式 vs 通用 JSONL。"""
+    from .sources import DSHSessionSource, JsonlSource
+    if path.endswith(".zstd"):
+        return DSHSessionSource(path)
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                o = json.loads(line)
+                if o.get("type") == "session" or ("type" in o and "seq" in o
+                                                  and "data" in o):
+                    return DSHSessionSource(path)
+                return JsonlSource(path)
+    except (ValueError, OSError):
+        pass
+    return JsonlSource(path)
+
+
+READ_MAX_LINES = 2000           # 单次 read 返回行数上限（Pi⑦② 截断）
+READ_MAX_BYTES = 50 * 1024      # 单次 read 返回字节上限（Pi⑦② 截断）
+
+
+# 生效条件：text 先按 text or "" 归一，start 由 offset 定（offset 为假值取 0，否则 max(0,int(offset)-1)）；start≥total_lines 时返回空 text、next_offset=None 的窗口结果；否则从 start 起按 max_lines 行收集（max_lines=0 时 got 为空），且仅当已收集非空且 used+b>max_bytes 时提前 break（首行即便超 max_bytes 也收），end<total_lines 时 truncated=True、next_offset=end+1 并写续读 note。
+def _clip_text(text: str, *, offset: int = 0, max_lines: int = READ_MAX_LINES,
+               max_bytes: int = READ_MAX_BYTES) -> dict:
+    """行窗口 + 双阈值截断（Pi⑦② 截断必带续读提示）。
+
+    offset 为 1 基起始行（续读传上次 next_offset）。不静默丢内容——截断时
+    返回 total_lines / total_bytes / next_offset / note，调用方按 offset 续读。
+    """
+    text = text or ""
+    lines = text.split("\n")
+    total_lines = len(lines)
+    total_bytes = len(text.encode("utf-8"))
+    start = max(0, int(offset) - 1) if offset else 0
+    if start >= total_lines:
+        return {"text": "", "offset": start + 1, "next_offset": None,
+                "returned_lines": 0, "total_lines": total_lines,
+                "total_bytes": total_bytes, "truncated": False,
+                "note": f"offset={start + 1} 超出总行数 {total_lines}，返回空"}
+    got, used = [], 0
+    for ln in lines[start:start + max_lines]:
+        b = len(ln.encode("utf-8")) + 1
+        if got and used + b > max_bytes:
+            break
+        got.append(ln)
+        used += b
+    end = start + len(got)
+    truncated = end < total_lines
+    out = {"text": "\n".join(got), "offset": start + 1,
+           "next_offset": end + 1 if truncated else None,
+           "returned_lines": len(got), "total_lines": total_lines,
+           "total_bytes": total_bytes, "truncated": truncated, "note": ""}
+    if truncated:
+        out["note"] = (f"内容已截断（单次上限 {max_lines} 行 / {max_bytes} 字节）："
+                       f"共 {total_lines} 行 / {total_bytes} 字节，本次返回第 "
+                       f"{start + 1}–{end} 行；续读传 offset={end + 1}。")
+    return out
+
+
+# 生效条件：node 为假值时返回 None；否则用 _clip_text(node.get("content") or "", offset=offset) 构造 {id,path,frontmatter,content}，且当 clip["truncated"] 为真或 offset 为真值时追加 truncated/content_lines/content_bytes/offset/next_offset/note。
+def _trust_state(fm):
+    """节点验证态（缺字段按 unverified；导入失败不拖垮读面）。"""
+    try:
+        from . import trust
+        return trust.state_of(fm)
+    except Exception:                                      # noqa: BLE001
+        return None
+
+
+# 生效条件：cg 具有 whoami() 且其返回 dict 含 readable_sensitivities 时返回该值；cg 无该方法或抛异常时返回 None（不编造、不抛）。
+def _readable_sensitivities(cg):
+    """当前身份可读密级（whoami 同源；取不到返回 None，不编造）。"""
+    try:
+        return (cg.whoami() or {}).get("readable_sensitivities")
+    except Exception:
+        return None
+
+
+# 生效条件：a 的 key 存在且值 is not None 时返回 int(a[key])（显式 0/负数是显式
+# 请求，原样透传由库层判定），键缺失或值为 None 时返回 default；a 恒为 args dict。
+def _int_arg(a, key, default):
+    """int 入参的统一取用口径：**「显式 0 也是显式」**（2026-09-30）。
+
+    与 budget_tokens 的先例同口径（见 read 分支 `a["budget_tokens"] if
+    a.get("budget_tokens") is not None else 1200`）：旧写法 `int(a.get(k) or N)`
+    把显式 0（以及 -1）当「没传」，静默换成默认 N —— 调用方以为「要 0 条」，
+    拿到的却是 N 条，且返回形似正常。
+
+    **不自造报错**：k<=0 的语义（空结果 / 报错）判定单点在库层。实测
+    `cg.search(q, k=0)` / `cg.recall(q, budget_tokens=..., k=0)` 均返回空结果
+    且不抛（见 test_read_face_input_gates.py 的 M1 断言），故本层只判
+    「透传 vs 回落默认」，与 budget_tokens 保持同一判据面。
+    """
+    v = a.get(key)
+    return int(v) if v is not None else default
+
+
+# 生效条件：k 可转 int 且（k<1 或 k>mdcg.GLOBAL_CAP）时返回 warning dict（code/k/min/max + hint，超上限另带 clamped_to=GLOBAL_CAP）；k 在 [1, GLOBAL_CAP] 内、或不可转 int 时返回 None。
+def _k_warning(k):
+    """issue #303 O4：read 面 k 越界的**显式信号**（保留夹紧行为，只透出）。
+
+    外部校准实测：read 的 k=10^18 / -1 / 0 均返回「形似正常」的结果——库层
+    对上限自然截断（GLOBAL_CAP=500）、对 0/负数走切片语义，调用方拿不到
+    「你传的值非法」的信号（静默归一）。本函数只**报告**，不改传参、不改
+    结果集、不改 meta（夹紧行为逐位保留）：
+      · k>GLOBAL_CAP：实际最多返回 GLOBAL_CAP 条（可由 meta.cap 核对）；
+      · k<1：0 是既有「显式空结果」语义（#M1 口径），负数走库层切片，
+        两者都不是「取缺省」，故给 warning 让调用方自己决定是否重试。
+    """
+    try:
+        kv = int(k)
+    except (TypeError, ValueError):
+        return None
+    from .mdcg import GLOBAL_CAP
+    if 1 <= kv <= GLOBAL_CAP:
+        return None
+    w = {"code": "k_out_of_range", "k": kv, "min": 1, "max": GLOBAL_CAP}
+    if kv > GLOBAL_CAP:
+        w["clamped_to"] = GLOBAL_CAP
+        w["hint"] = ("k=%d 超过单次输出上限 %d：本次实际最多返回 %d 条"
+                     "（夹紧行为不变，meta.cap 可核对）；要更多结果请分页或收窄查询"
+                     % (kv, GLOBAL_CAP, GLOBAL_CAP))
+    else:
+        w["hint"] = ("k=%d 越界（<1）：0 是「显式空结果」语义、负数由库层切片语义"
+                     "处理；本次未按缺省值替换。若要取缺省请省略 k" % kv)
+    return w
+
+
+# ★ issue #525：**「一律返 null」是有意的两面分工，不是缺陷**（本件零行为改动，只登记语义）。
+#   ① **防探测**：非法 id（穿越/绝对路径/NUL/超长）与「节点不存在」**返回同一个 `null`** ⇒
+#      调用方**无法用 read 枚举「哪些 id 存在」** ⇒ 这是安全属性。
+#   ② **要区分原因 ⇒ 用 `get`**：它返回 `{ok:false, error:'not_found'}`（见本文件 `:273` 的文档）⇒
+#      **两个面分工不同**：`read` 不泄漏存在性、`get` 会报因。
+#   ③ **类型错不在此分支**：`node_id` 非 str 已在 `:2509-2513` 返 `{ok:False, error:'node_id_not_str', got_type}`；
+#      而「不存在」保持 `null` 是 `md_cg/protocol.py` 的 `node_missing.returns_null = True` 协议真源
+#      （由 test_protocol A11/B8/B10 钉住）⇒ 改它须连带改协议真源与那三条断言（#274 已裁：属行为变更，不是补漏）。
+#   ★ 若将来要细分区因 ⇒ **须先确认「防探测」这条安全属性是否仍需要**；不能只改 `read` 而不动 `get` 的分工。
+#   ★ 2026-10-18（#303 O5）：细分区因已落地，口径——**只**把「格式非法」
+#     （`mdcos.valid_node_id` 判否：穿越/绝对路径/NUL/超长/空语义值）收敛为
+#     结构化 `{"ok": false, "error": "invalid_node_id"}`；「形态合法但不存在/
+#     不可读」仍返回 `null`（协议 node_missing 真源不变）。**防探测属性不受
+#     影响**：非法形态本就在 id 空间之外，不可能对应任何真实节点；合法形态的
+#     枚举面与改动前一致（一律 null）。空串 `""` 是 #274 裁定的显式
+#     node_missing 形态，不按格式非法处理（M2-B8/N3b 钉住）。要带原因取值
+#     仍用 `get`（not_found + readable_sensitivities）。
+def _node_view(node, offset: int = 0):
+    if not node:
+        return None
+    clip = _clip_text(node.get("content") or "", offset=offset)
+    out = {"id": node.get("id"), "path": node.get("path"),
+           "frontmatter": node.get("frontmatter"), "content": clip["text"],
+           # 可验证记忆单元：读面 additive 透出验证态（**不改排序权重**，保基准）
+           "verification_state": _trust_state(node.get("frontmatter"))}
+    if clip["truncated"] or offset:
+        out.update({"truncated": clip["truncated"],
+                    "content_lines": clip["total_lines"],
+                    "content_bytes": clip["total_bytes"],
+                    "offset": clip["offset"], "next_offset": clip["next_offset"],
+                    "note": clip["note"]})
+    return out
+
+
+# --------------------------------------------------------------------------
+# 基元实现
+# --------------------------------------------------------------------------
+
+# 生效条件：当 cg、a 传入时，按 a.get('action') or 'stats'（空串/None 回退 'stats'）并 strip().lower() 分派：action=stats 返回 cg.protect_stats()；action 为 forgetting 或 forgetting_history 返回 {'records': cg.forgetting_history(limit=int(a.get('limit') or 100))}（a.get('limit') 为 0/空串/None 时回落 100）；action=check 时 node_id 取 a.get('node_id') or ''（空串/None 回落 ''），返回包含 node_id、exists（nid in (cg.index.get('nodes') or {})）、protected、reason、immutable、immutable_reason 的 dict；action=history 返回 {'node_id': nid, 'versions': protect.history(cg, nid)}；action=snapshot 返回 {'node_id': nid, 'snapshot': protect.snapshot(cg, nid)}；action 为 mark 或 protect 时若 cg.principal 非 None 则先调用 cg.principal.require_admin('protect_mark')，再返回 protect.mark(cg, nid, a.get('reason') or '显式保护标记')（reason 空串/None 回落 '显式保护标记'）；其他 action 抛 ValueError；
+def _protect_call(cg, a):
+    """写保护 / 遗忘留痕的统一入口（cg op=protect 与 mdcg_protect 共用）。"""
+    from . import protect
+    act = (a.get("action") or "stats").strip().lower()
+    nid = a.get("node_id") or ""
+    if act == "stats":
+        return cg.protect_stats()
+    if act in ("forgetting", "forgetting_history"):
+        return {"records": cg.forgetting_history(limit=int(a.get("limit") or 100))}
+    if act == "check":
+        prot, why = protect.is_protected(cg, nid)
+        imm, iwhy = protect.is_immutable(cg, nid)
+        return {"node_id": nid, "exists": nid in (cg.index.get("nodes") or {}),
+                "protected": prot, "reason": why,
+                "immutable": imm, "immutable_reason": iwhy}
+    if act == "history":
+        return {"node_id": nid, "versions": protect.history(cg, nid)}
+    if act == "snapshot":
+        return {"node_id": nid, "snapshot": protect.snapshot(cg, nid)}
+    if act in ("mark", "protect"):
+        principal = getattr(cg, "principal", None)
+        if principal is not None:
+            principal.require_admin("protect_mark")
+        return protect.mark(cg, nid, a.get("reason") or "显式保护标记")
+    raise ValueError(f"protect 未知 action：{act}")
+
+
+# ---------------------------------------------------------------- E 面密级实参透传
+
+#: 工具面 identity_* **写侧**的密级实参透传真源表（issue #467 单点；四态登记）。
+#:
+#: 为什么需要它（#397/#414 同族「实参表漏传」）：工具面手写实参表，漏一项不会报错、
+#: 回执也逐字相同，调用方看不出来。密级尤其危险——漏传 ⇒ 调用方声明的密级被**静默
+#: 丢弃**、只能落 DEFAULT_SENSITIVITY。
+#:
+#: 四态（**每条都必须带理由**，理由本身是判据面）：
+#:   · "leaked"             —— 目标库层函数**有** sensitivity 形参，工具面必须透传；
+#:   · "n/a-no-param"       —— 目标函数**无**该形参；补透传既不会报错也不会生效，
+#:                             而是经 mdcos 的 **kw wrapper 直达目标 ⇒ **运行期 TypeError**；
+#:   · "excluded-nonfamily" —— 同名不同物（族枚举按**同构**判，不按 grep 名字收）；
+#:   · "import-unused"      —— 只导入无调用点 ⇒ 不适用；后来者**不要**补不需要的透传。
+#:
+#: 维护者若裁定「库层应让 anchor/trait/contract 也能声明密级」：把对应条目从
+#: n/a-no-param 改成 leaked 即可 —— 守卫的**反向断言**会立刻要求先给库层加形参
+#: （登记了却没有对应形参即红），判据自己把顺序推成「先加能力、再补透传」。
+IDENTITY_SENSITIVITY_PARITY = (
+    {"disposition": "leaked", "callee": "identity_observe",
+     "target": "identity.observe", "params": ("sensitivity",),
+     "reason": "identity.observe 有 sensitivity 形参（与 #397/#414 同类写侧）；漏传 ⇒ "
+               "调用方声明的密级被静默丢弃、只能落 DEFAULT_SENSITIVITY。"},
+    {"disposition": "n/a-no-param", "callee": "identity_anchor",
+     "target": "identity.set_anchor", "params": (),
+     "reason": "目标 set_anchor（anchor 层、不可遗忘）无 sensitivity 形参；"
+               "mdcos.identity_anchor 是 **kw 透传 ⇒ 补了会在运行期 TypeError。"},
+    {"disposition": "n/a-no-param", "callee": "identity_trait",
+     "target": "identity.add_trait", "params": (),
+     "reason": "目标 add_trait（结构层）无 sensitivity 形参；同上 **kw 直达 ⇒ 运行期 "
+               "TypeError。"},
+    {"disposition": "n/a-no-param", "callee": "identity_contract",
+     "target": "identity.set_contract", "params": (),
+     "reason": "目标 set_contract（anchor 层、不可篡改）无 sensitivity 形参；同上。"},
+    {"disposition": "excluded-nonfamily", "site": "md_cg/links.py",
+     "symbol": "observe", "callee": None, "target": None, "params": (),
+     "reason": "links 自有 observe（实参 peer/evidence/positive/peer_signature/"
+               "path/signers_file），与 identity.observe 同名不同物 —— 族枚举按同构判。"},
+    {"disposition": "import-unused", "site": "md_cg/self_state.py",
+     "symbol": "identity", "callee": None, "target": None, "params": (),
+     "reason": "该文件只 from . import identity 导入模块、无 identity_* 调用点 ⇒ 不适用；"
+               "后来者不要补一个不需要的透传。"},
+)
+
+# 生效条件：当 cg、a 传入时，按 a.get('action') or 'profile'（空串/None 回退 'profile'）并 strip().lower() 分派，subject_id 取 a.get('subject_id') or ''（空串/None 回落 ''）：action=catalog 返回 identity.catalog()；action=positions 返回 {'positions': cg.identity_positions(limit=int(a.get('limit') or 0))}（a.get('limit') 假值回落 0）；action=profile 时若 sid 为假值返回 {'subjects': cg.identity_positions(limit=0), 'hint': '指定 subject_id 可获取完整画像（锚点+位置+特征）'}，否则返回 cg.identity_profile(sid)；action=observe 时以 sid 和 a.get('content') or a.get('text') or '' 调用 cg.identity_observe（含 kind=a.get('subject_kind')、role=a.get('role')、layer=a.get('layer')、tags=a.get('tags')、condition_space=a.get('condition_space')、importance=float(a.get('importance', 0.5))、verification_basis=a.get('verification_basis')、evidence=a.get('evidence')、sensitivity=a.get('sensitivity')、override=bool(a.get('override'))）；action=trait 时以 sid 和 a.get('trait') or a.get('content') or '' 调用 cg.identity_trait（含 condition_space=a.get('condition_space')、importance=float(a.get('importance', 0.6))、position=a.get('position')、kind=a.get('subject_kind')、verification_basis=a.get('verification_basis') or 'data'、override=bool(a.get('override'))）；action=anchor 时若 cg.principal 非 None 先调用 cg.principal.require_admin('identity_anchor')，再以 sid 和 a.get('content') or a.get('text') or '' 调用 cg.identity_anchor（含 kind=a.get('subject_kind')、condition_space=a.get('condition_space')、importance=float(a.get('importance', 0.9))、override=bool(a.get('override'))、requested_layer=a.get('requested_layer')）；action=history 返回 {'records': cg.identity_history(limit=int(a.get('limit') or 100))}（a.get('limit') 假值回落 100）；action=contract 时若 cg.principal 非 None 先调用 cg.principal.require_admin('identity_contract')（对齐 action=anchor 的管理闸先例，§3.2.1 发出权属设计者位置），再以 a.get('contract_id') 及 grantor/grantee/timestamp/status_summary/doc_ref/condition_ref/state_ref/importance（缺省 1.0）/override 调用 cg.identity_contract；action=contracts 时若 a.get('contract_id') 为真值返回 cg.identity_contract_record(该 id)，否则返回 cg.identity_contracts(subject=a.get('subject_id'))；其他 action 抛 ValueError；
+def _identity_call(cg, a):
+    """身份特征识别统一入口（cg op=identity 与 mdcg_identity 共用）。
+
+    理论：智能论 v3.4 位置效应（五大单元）+ 扮演论三接口。
+    """
+    from . import identity
+    act = (a.get("action") or "profile").strip().lower()
+    sid = a.get("subject_id") or ""
+    if act == "catalog":
+        return identity.catalog()
+    if act == "positions":
+        return {"positions": cg.identity_positions(limit=int(a.get("limit") or 0))}
+    if act == "profile":
+        if not sid:
+            return {"subjects": cg.identity_positions(limit=0),
+                    "hint": "指定 subject_id 可获取完整画像（锚点+位置+特征）"}
+        return cg.identity_profile(sid)
+    if act == "observe":
+        # ★issue #418（**第二入口**，2026-10-16 回归实测）：role 类型闸此前只装在
+        # `mdcg_remember` 分支（见本文件下方 ★issue #418 段），而本入口（`cg
+        # op=identity` 与 `mdcg_identity` **共用**）把 `role` 直传
+        # `cg.identity_observe` ⇒ 非法 role 照样落盘，下次装载被自家装载器判
+        # frontmatter 损坏而**隔离**（不进索引、get/search 读不到），回执却是
+        # `{"ok": true, "node_id": …}`——「说存住了，其实读不到」逐字同形。
+        # 判据取**同一单点** `nodefile.valid_role`（不另写第二份类型判据）；
+        # 回执取协议声明的 `gate_hard_reject` 形态（WRITE_TRIO + gate/error/
+        # verdict/hint，verdict=None 是盲区声明），与 remember 分支逐键对齐。
+        # `id` 用写入本该使用的那个 id（`identity._nid` 与 observe 内部同源），
+        # 使「被拒的那条写入」可被调用方对上号；本次**未落任何盘**。
+        from . import nodefile as _nf418i
+        if not _nf418i.valid_role(a.get("role")):
+            _txt418 = a.get("content") or a.get("text") or ""
+            return {"ok": False, "id": identity._nid("obs", sid, _txt418[:32]),
+                    "committed": False, "gate": "role_type", "error": "role_not_str",
+                    "verdict": None, "got_type": type(a.get("role")).__name__,
+                    "hint": "role 须为字符串（省略即合法）；非字符串会让节点落盘后被自家"
+                            "装载器判 frontmatter 损坏而**隔离**（不进索引、get/search 读不到）。"}
+        return cg.identity_observe(
+            sid, a.get("content") or a.get("text") or "",
+            kind=a.get("subject_kind"), role=a.get("role"),
+            layer=a.get("layer"), tags=a.get("tags"),
+            condition_space=a.get("condition_space"),
+            importance=float(a.get("importance", 0.5)),
+            verification_basis=a.get("verification_basis"),
+            evidence=a.get("evidence"),
+            # #467（2026-10-15）：本分支是**唯一**透传点漏了 sensitivity 的写侧
+            # （identity.observe 一直有该形参）；漏传 ⇒ 调用方声明的密级被静默丢弃、
+            # 只能落 DEFAULT_SENSITIVITY=internal。工具面其余 identity_* 写侧的目标
+            # 函数均无该形参（n/a-no-param），四态登记见 test_issue467 的单点真源表。
+            sensitivity=a.get("sensitivity"),
+            override=bool(a.get("override")))
+    if act == "trait":
+        return cg.identity_trait(
+            sid, a.get("trait") or a.get("content") or "",
+            condition_space=a.get("condition_space"),
+            importance=float(a.get("importance", 0.6)),
+            position=a.get("position"), kind=a.get("subject_kind"),
+            verification_basis=a.get("verification_basis") or "data",
+            override=bool(a.get("override")))
+    if act == "anchor":
+        principal = getattr(cg, "principal", None)
+        if principal is not None:
+            principal.require_admin("identity_anchor")
+        return cg.identity_anchor(
+            sid, a.get("content") or a.get("text") or "",
+            kind=a.get("subject_kind"),
+            condition_space=a.get("condition_space"),
+            importance=float(a.get("importance", 0.9)),
+            override=bool(a.get("override")),
+            requested_layer=a.get("requested_layer"))
+    if act == "history":
+        return {"records": cg.identity_history(limit=int(a.get("limit") or 100))}
+    if act == "contract":
+        # 定稿第 9 条：契约生成者＝设计者位置（走 admin 闸），权威唯一性 > 便利性；
+        # 对齐 action=anchor 的 require_admin("identity_anchor") 先例。
+        principal = getattr(cg, "principal", None)
+        if principal is not None:
+            principal.require_admin("identity_contract")
+        return cg.identity_contract(
+            a.get("contract_id") or "",
+            grantor=a.get("grantor") or "",
+            grantee=a.get("grantee") or "",
+            timestamp=a.get("timestamp") or "",
+            status_summary=a.get("status_summary") or "",
+            doc_ref=a.get("doc_ref"),
+            condition_ref=a.get("condition_ref"), state_ref=a.get("state_ref"),
+            importance=float(a.get("importance", 1.0)),
+            override=bool(a.get("override")))
+    if act == "contracts":
+        cid = a.get("contract_id")
+        if cid:
+            return cg.identity_contract_record(cid)
+        return cg.identity_contracts(subject=a.get("subject_id"))
+    raise ValueError(f"identity 未知 action：{act}")
+
+
+# 生效条件：act=(a.get("action") or "check").strip().lower()；"check" 时以 content/text、layer、condition_space、non_applicable_conditions、tags、exclude、limit=int(a.get("limit") or consistency.MAX_SCAN)、depth（非 None 时 int(depth)，否则 consistency.MAX_DEPTH）、auto_flywheel 调 cg.check_consistency；"history" 返回 {"records": cg.consistency_history(limit=int(a.get("limit") or 100))}；"stats" 返回 cg.consistency_stats()；"catalog" 返回 consistency.catalog()；其余 act 抛 ValueError。
+def _consistency_call(cg, a):
+    """节点间自动冲突检测统一入口（cg op=consistency 与 mdcg_consistency 共用）。
+
+    理论：智能论 §十一（情绪=信息差二阶变化，独立不参与信任）、
+    条件论「反题」、:273（递归受深度/节点/循环/增益门槛约束）、
+    知识飞轮（误差→补条件→结构更新）。
+    """
+    from . import consistency
+    act = (a.get("action") or "check").strip().lower()
+    if act == "check":
+        depth = a.get("depth")
+        return cg.check_consistency(
+            a.get("content") or a.get("text") or "",
+            layer=a.get("layer"), condition_space=a.get("condition_space"),
+            non_applicable_conditions=a.get("non_applicable_conditions"),
+            tags=a.get("tags"), exclude=a.get("exclude"),
+            limit=int(a.get("limit") or consistency.MAX_SCAN),
+            depth=int(depth) if depth is not None else consistency.MAX_DEPTH,
+            auto_flywheel=bool(a.get("auto_flywheel")),
+            # issue #294：check 面也要能声明密级——否则
+            # mdcg_consistency(action=check, auto_flywheel=true) 的调用方
+            # 无从告诉飞轮「这段正文是 private 的」，同一条出口照旧泄明文。
+            sensitivity=a.get("sensitivity"))
+    if act == "history":
+        return {"records": cg.consistency_history(limit=int(a.get("limit") or 100))}
+    if act == "stats":
+        return cg.consistency_stats()
+    if act == "catalog":
+        return consistency.catalog()
+    raise ValueError(f"consistency 未知 action：{act}")
+
+
+# 生效条件：当 cg、a 传入时，按 a.get('action') or 'report'（空串/None 回退 'report'）分派，window=int(a.get('window') or 50)（a.get('window') 假值回落 50）：action=report 返回 cg.metacognition_report(window=window)；action=trace 返回 cg.metacognition_trace(window=window)；action=calibration 返回 cg.metacognition_calibration(max_scan=int(a.get('limit') or 2000))（a.get('limit') 假值回落 2000）；action=blindspots 返回 cg.metacognition_blindspots(limit=int(a.get('limit') or 20), window=window)（a.get('limit') 假值回落 20）；action=trust 返回 cg.metacognition_trust(window=window)；action=self_check 返回 cg.self_check(a.get('query') or a.get('text') or '', k=_int_arg(a, 'k', 5))（query/text 假值回落 ''，k 显式原样透传、缺省回落 5）；action=history 返回 cg.metacognition_history(limit=int(a.get('limit') or 100))（a.get('limit') 假值回落 100）；action=catalog 返回 metacognition.catalog()；action=d_meta 返回 cg.metacognition_d_meta(window=window)（边界压力向量，三代理各自 [0,1]、不合成单值）；其他 action 抛 ValueError；
+def _metacognition_call(cg, a):
+    """独立元认知统一入口（cg op=metacognition 与 mdcg_metacognition 共用）。
+
+    理论：智能论 §十一（情绪=d²D/dt²）、§十三（五大单元外部观察者）、
+    推论三「局部不可知」（盲区即知识）、§十（P_trust / P_gap）。
+    独立性：只读留痕，不写 confidence / 资格 / 召回打分。
+    """
+    act = (a.get("action") or "report").strip().lower()
+    window = int(a.get("window") or 50)
+    if act == "report":
+        return cg.metacognition_report(window=window)
+    if act == "trace":
+        return cg.metacognition_trace(window=window)
+    if act == "calibration":
+        return cg.metacognition_calibration(
+            max_scan=int(a.get("limit") or 2000))
+    if act == "blindspots":
+        return cg.metacognition_blindspots(
+            limit=int(a.get("limit") or 20), window=window)
+    if act == "trust":
+        return cg.metacognition_trust(window=window)
+    if act == "self_check":
+        return cg.self_check(a.get("query") or a.get("text") or "",
+                             k=_int_arg(a, "k", 5))
+    if act == "history":
+        return cg.metacognition_history(limit=int(a.get("limit") or 100))
+    if act == "catalog":
+        from . import metacognition
+        return metacognition.catalog()
+    if act == "d_meta":                    # D_meta 观测面（只读，不合成单值）
+        return cg.metacognition_d_meta(window=window)
+    raise ValueError(f"metacognition 未知 action：{act}")
+
+
+# 生效条件：当 cg、a 传入时，按 a.get('action') or 'snapshot'（空串/None 回退 'snapshot'）分派，subject=a.get('subject') or self_state.DEFAULT_SUBJECT（subject 假值回落常量），session=a.get('session') or getattr(getattr(cg, 'principal', None), 'session', None)（session 假值回落 principal.session）：action 为 snapshot/read/get 返回 {'state': self_state.snapshot(cg, subject)}；action=refresh 返回 self_state.refresh(cg, subject, window=int(a.get('window') or self_state.RECENT_WINDOW), importance=a.get('importance'), important_refs=a.get('important_refs'), dimensions=a.get('dimensions'), links=a.get('links'), actor=a.get('actor') or getattr(cg, 'actor', 'self_state'), force=bool(a.get('force')), strict=bool(a.get('strict')), session=session)（window 假值回落 self_state.RECENT_WINDOW）；action=bootstrap 返回 self_state.bootstrap(cg, subject, window=int(a.get('window') or self_state.RECENT_WINDOW), actor=a.get('actor') or 'bootstrap')；action=relate 返回 self_state.relate(cg, a.get('frm') or subject, a.get('to') or '', relation_type=a.get('relation_type') or 'collaborator', strength=a.get('strength', 0.5), condition=a.get('condition') or '', note=a.get('note') or '', reciprocal=bool(a.get('reciprocal')), actor=a.get('actor') or getattr(cg, 'actor', 'self_state'))；action=relations 返回 {'relations': self_state.relations(cg, subject=a.get('subject'), direction=(a.get('direction') or 'both'))}；action=index 时 dim,value=a.get('dim'),a.get('value')，若 dim 假值且 session 真值则 dim='session' 且 value=value or session，返回 self_state.index(cg, dim, value, limit=int(a.get('limit') or 50), with_content=bool(a.get('with_content')))（limit 假值回落 50）；action=dimensions 返回 self_state.dimensions(cg, subject)；action=audit 返回 self_state.audit(cg, subject, window=int(a.get('window') or self_state.RECENT_WINDOW))；action=history 返回 {'records': self_state.history(cg, limit=int(a.get('limit') or 100), subject=a.get('subject'))}（limit 假值回落 100）；action=summary 返回 self_state.summary(cg, subject, session=session)；action=catalog 返回 self_state.catalog()；其他 action 抛 ValueError；
+def _self_state_call(cg, a):
+    """自我状态层统一入口（cg op=self_state 与 mdcg_self_state 共用）。
+
+    薄自我：self 层只放状态卡（单例）+ 关系节点，登记九项自我信息的当前值
+    与指针；具体任务/人物/会话/时间/信任的细节留在原层，由认知图按五维
+    索引连接。一致性由 audit 重算校验（不依赖人的判断）。
+    """
+    from . import self_state
+    act = (a.get("action") or "snapshot").strip().lower()
+    subject = a.get("subject") or self_state.DEFAULT_SUBJECT
+    # 会话归因缺省：显式入参 > Principal 归因维度（嵌套身份 (harness, session)）。
+    # 会话只作薄卡的维度切片与审计标记，不参与权限判定。
+    session = (a.get("session")
+               or getattr(getattr(cg, "principal", None), "session", None))
+    if act in ("snapshot", "read", "get"):
+        return {"state": self_state.snapshot(cg, subject)}
+    if act == "refresh":
+        return self_state.refresh(
+            cg, subject, window=int(a.get("window") or self_state.RECENT_WINDOW),
+            importance=a.get("importance"),
+            important_refs=a.get("important_refs"),
+            dimensions=a.get("dimensions"), links=a.get("links"),
+            actor=a.get("actor") or getattr(cg, "actor", "self_state"),
+            force=bool(a.get("force")), strict=bool(a.get("strict")),
+            session=session)
+    if act == "bootstrap":
+        return self_state.bootstrap(
+            cg, subject, window=int(a.get("window") or self_state.RECENT_WINDOW),
+            actor=a.get("actor") or "bootstrap")
+    if act == "relate":
+        return self_state.relate(
+            cg, a.get("frm") or subject, a.get("to") or "",
+            relation_type=a.get("relation_type") or "collaborator",
+            strength=a.get("strength", 0.5), condition=a.get("condition") or "",
+            note=a.get("note") or "", reciprocal=bool(a.get("reciprocal")),
+            actor=a.get("actor") or getattr(cg, "actor", "self_state"))
+    if act == "relations":
+        return {"relations": self_state.relations(
+            cg, subject=a.get("subject"), direction=(a.get("direction") or "both"))}
+    if act == "index":
+        dim, value = a.get("dim"), a.get("value")
+        if not dim and session:        # 便捷：不传 dim 时按当前会话反查
+            dim, value = "session", value or session
+        return self_state.index(cg, dim, value,
+                                limit=int(a.get("limit") or 50),
+                                with_content=bool(a.get("with_content")))
+    if act == "dimensions":
+        return self_state.dimensions(cg, subject)
+    if act == "audit":
+        return self_state.audit(
+            cg, subject, window=int(a.get("window") or self_state.RECENT_WINDOW))
+    if act == "history":
+        return {"records": self_state.history(
+            cg, limit=int(a.get("limit") or 100), subject=a.get("subject"))}
+    if act == "summary":
+        return self_state.summary(cg, subject, session=session)
+    if act == "catalog":
+        return self_state.catalog()
+    raise ValueError(f"self_state 未知 action：{act}")
+
+
+# 生效条件：act=(a.get("action") or "routes").strip().lower()；act 属 routes/route/predict 时以 start_id=a.get("start_id") or a.get("node_id")、blindspot_id、horizon=int(a.get("horizon") or predict.HORIZON_DEFAULT)、max_branches=int(a.get("max_branches") or predict.MAX_BRANCHES_DEFAULT)、sort=a.get("sort") or "composite"、limit=int(a.get("limit") or 0)、semantic=bool(a.get("semantic", True)) 调 cg.predict_routes；act 属 feedback/rate 时调 cg.predict_feedback；act=="stats" 时调 cg.predict_stats(limit=int(a.get("limit") or 20))；act=="catalog" 时返回 predict.catalog()；其余 act 抛 ValueError。
+def _predict_call(cg, a):
+    """生成式预测统一入口（cg op=predict 与 mdcg_predict 共用）。
+
+    对齐 AEIS prediction.py 四通道预测引擎的通道 3（生成式·因果路线图）
+    + 通道 4（语义式，经 D-002 伪因果过滤门）。输出**候选未来，非必然未来**：
+    每条路线都带 uncertainty_bound（不确定性边界）与 extrapolation_validity
+    （局部线性近似外推是否仍然成立），并按 T_pred 四维评分排序。
+    """
+    from . import predict
+    act = (a.get("action") or "routes").strip().lower()
+    if act in ("routes", "route", "predict"):
+        return cg.predict_routes(
+            start_id=a.get("start_id") or a.get("node_id"),
+            blindspot_id=a.get("blindspot_id"),
+            horizon=int(a.get("horizon") or predict.HORIZON_DEFAULT),
+            max_branches=int(a.get("max_branches") or predict.MAX_BRANCHES_DEFAULT),
+            sort=a.get("sort") or "composite",
+            limit=int(a.get("limit") or 0),
+            semantic=bool(a.get("semantic", True)))
+    if act in ("feedback", "rate"):
+        return cg.predict_feedback(
+            a.get("predicted_node_id") or a.get("node_id") or "",
+            actual_node_id=a.get("actual_node_id"),
+            hit=a.get("hit"), note=a.get("note") or "",
+            actor=a.get("actor") or getattr(cg, "actor", "predict"),
+            sync_self=bool(a.get("sync_self", True)))
+    if act == "stats":
+        return cg.predict_stats(limit=int(a.get("limit") or 20))
+    if act == "catalog":
+        return predict.catalog()
+    raise ValueError(f"predict 未知 action：{act}")
+
+
+# 生效条件：当 cg、a 传入时，按 a.get('action') or 'path'（空串/None 回退 'path'）分派，a_id=a.get('a') or a.get('a_id') or a.get('from') or ''（假值链回落 ''），b_id=a.get('b') or a.get('b_id') or a.get('to') or ''：action 为 path/reach/reachable 返回 predict.causal_path(cg, a_id, b_id, max_depth=int(a.get('max_depth') or 5))（a.get('max_depth') 假值回落 5）；action 为 gate/filter 返回 {'ok': True, 'admitted': predict.causal_gate(cg, a_id, b_id) 的 ok, 'reason': why, 'a': a_id, 'b': b_id, 'note': '语义邻近须能说清关系（因果链/共同父节点/偏好权重>0.5）'}；action=chain 返回 cg.causal_chain(a.get('node_id') or a_id, relation_types=a.get('relation_types'), max_depth=int(a.get('max_depth') or chain.MAX_DEPTH_DEFAULT), direction=a.get('direction') or 'out', sort=a.get('sort') or 'strength')；action=explain 返回 cg.explain_chain(a.get('node_id') or a_id)；action=catalog 返回包含 module/types/chain_types_default/edge_weights/max_depth_default/note/gate/actions 的 dict（gate 取 predict.catalog()['decisions']['D-002']）；其他 action 抛 ValueError；
+def _causal_call(cg, a):
+    """因果推理统一入口（cg op=causal 与 mdcg_causal 共用）。
+
+    `causal` 边 = 条件依赖因果：A 是 B 成立的条件；链 = 条件序列。
+    D-002 伪因果过滤门：语义邻近**必须能说清关系**（因果/时序边直通、
+    共同父节点的结构模式、偏好权重 > 0.5）才准入，否则视为伪因果拒绝。
+    """
+    from . import chain, predict
+    act = (a.get("action") or "path").strip().lower()
+    a_id = a.get("a") or a.get("a_id") or a.get("from") or ""
+    b_id = a.get("b") or a.get("b_id") or a.get("to") or ""
+    if act in ("path", "reach", "reachable"):
+        return predict.causal_path(cg, a_id, b_id,
+                                   max_depth=int(a.get("max_depth") or 5))
+    if act in ("gate", "filter"):
+        ok, why = predict.causal_gate(cg, a_id, b_id)
+        return {"ok": True, "admitted": ok, "reason": why, "a": a_id, "b": b_id,
+                "note": "语义邻近须能说清关系（因果链/共同父节点/偏好权重>0.5）"}
+    if act == "chain":
+        return cg.causal_chain(
+            a.get("node_id") or a_id,
+            relation_types=a.get("relation_types"),
+            max_depth=int(a.get("max_depth") or chain.MAX_DEPTH_DEFAULT),
+            direction=a.get("direction") or "out",
+            sort=a.get("sort") or "strength")
+    if act == "explain":
+        return cg.explain_chain(a.get("node_id") or a_id)
+    if act == "catalog":
+        return {"module": "causal", "types": list(chain.CAUSAL_TYPES),
+                "chain_types_default": list(chain.CHAIN_TYPES_DEFAULT),
+                "edge_weights": chain.EDGE_WEIGHTS,
+                "max_depth_default": chain.MAX_DEPTH_DEFAULT,
+                "note": "causal = 条件依赖因果，链 = 条件序列",
+                "gate": predict.catalog()["decisions"]["D-002"],
+                "actions": ["path", "gate", "chain", "explain", "catalog"]}
+    raise ValueError(f"causal 未知 action：{act}")
+
+
+# 生效条件：当 cg、a 传入时，按 a.get('action') or 'summary'（空串/None 回退 'summary'）分派：action 为 record/add/log 返回 {'entry': cg.evolution_record(node_id=a.get('node_id'), pattern=a.get('rule') or a.get('pattern') or '', missing=a.get('missing') or '', action=a.get('change') or a.get('note') or '', evidence=a.get('evidence') or '', source=a.get('source') or '', kind=a.get('kind') or evolution.KIND_CONDITION_GAP)}（各字段假值回落）；action 为 entries/list 返回 cg.evolution_entries(limit=int(a.get('limit') or 50), node_id=a.get('node_id'), kind=a.get('kind'))（a.get('limit') 假值回落 50）；action 为 show/get 返回 cg.evolution_show(a.get('entry_id') or '')；action=history 返回 cg.evolution_history(a.get('node_id') or '', limit=int(a.get('limit') or 50))（a.get('limit') 假值回落 50）；action 为 patterns/regularities 返回 cg.evolution_patterns(limit=int(a.get('limit') or 10))（a.get('limit') 假值回落 10）；action=summary 返回 cg.evolution_summary()；action 为 rollback/revert/undo 时若 cg.principal 非 None 先调用 cg.principal.require_admin('evolution_rollback')，再返回 cg.evolution_rollback(a.get('entry_id') or '', dry_run=bool(a.get('dry_run')), note=a.get('note') or '')；action=catalog 返回 evolution.catalog()；其他 action 抛 ValueError；
+def _evolution_call(cg, a):
+    """演化账本统一入口（cg op=evolution 与 mdcg_evolution 共用）。
+
+    载体是 md（`_evolution/ledger.md`）：每一次修改 = 对一条缺失条件的补充，
+    记录的是**认知规律**（rule）与**状态**（before→after），不是实现细节。
+    rollback 把某条演化的状态撤回 before，撤销本身也记一条条目。
+    """
+    from . import evolution
+    act = (a.get("action") or "summary").strip().lower()
+    if act in ("record", "add", "log"):
+        return {"entry": cg.evolution_record(
+            node_id=a.get("node_id"),
+            pattern=a.get("rule") or a.get("pattern") or "",
+            missing=a.get("missing") or "",
+            action=a.get("change") or a.get("note") or "",
+            evidence=a.get("evidence") or "", source=a.get("source") or "",
+            kind=a.get("kind") or evolution.KIND_CONDITION_GAP)}
+    if act in ("entries", "list"):
+        return cg.evolution_entries(
+            limit=int(a.get("limit") or 50), node_id=a.get("node_id"),
+            kind=a.get("kind"))
+    if act in ("show", "get"):
+        return cg.evolution_show(a.get("entry_id") or "")
+    if act == "history":
+        return cg.evolution_history(a.get("node_id") or "",
+                                    limit=int(a.get("limit") or 50))
+    if act in ("patterns", "regularities"):
+        return cg.evolution_patterns(limit=int(a.get("limit") or 10))
+    if act == "summary":
+        return cg.evolution_summary()
+    if act in ("rollback", "revert", "undo"):
+        principal = getattr(cg, "principal", None)
+        if principal is not None:
+            principal.require_admin("evolution_rollback")
+        return cg.evolution_rollback(
+            a.get("entry_id") or "", dry_run=bool(a.get("dry_run")),
+            note=a.get("note") or "")
+    if act == "catalog":
+        return evolution.catalog()
+    raise ValueError(f"evolution 未知 action：{act}")
+
+
+# 生效条件：value 为 None 时返回 []，value 为 list/tuple/set 时按其元素、其它类型按 str(value).replace(",", " ").split() 取项，再对每项 str(x).strip()，非空且未出现过才按序追加并返回去重列表。
+def _split_ids(value):
+    """把 'a,b c' / ['a','b'] / 'a' 统一成去空白的 id 列表（None → []）。
+
+    G8 派生溯源用：MCP 参数可能来自命令行逗号串，也可能来自 JSON 数组，
+    入口先归一，避免 `"kp_a,kp_b"` 被当成单个 id 落进 frontmatter。
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        items = str(value).replace(",", " ").split()
+    out = []
+    for x in items:
+        s = str(x).strip()
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+# 生效条件：a 为 MCP 参数字典时——`a["spatial"]` 非 None 返回 {"spatial": ...}，否则返回 {}
+# （**缺省不传**：未声明 spatial 的写入零落键，既有 fm 形态逐位不变；0.8.0 身体×脑对接
+# 四条裁定之二引入，gated 分支与非 gated add 两处共用本单点）。
+def _spatial_kw(a):
+    if a.get("spatial") is not None:
+        return {"spatial": a["spatial"]}
+    return {}
+
+
+def _as_deps(v):
+    """与直连路径同口径的依赖归一（单点 = trust.as_deps，**不复制语义**）。
+
+    issue #186 补完：直连链尾的取值表达式是
+    `depends_on=trust.as_deps(a.get("depends_on")),`（md_cg/writepipe.py）；入队面
+    若把原始值原样透传，两路径的落盘形态（列表归一 / 去重 / 上限）就会分叉——
+    所以这里只做**同一次调用**，不重复实现归一规则。延迟 import 防环：模块级
+    `from . import trust` 会把包加载顺序咬回来，本模块既有惯例就是函数体内 import。
+    """
+
+    try:
+        from . import trust as _trust
+    except Exception:                     # noqa: BLE001 —— 不可用时原样透传
+        return v
+    return _trust.as_deps(v)
+# 生效条件：始终构造 ex（verify=a.get("verify")、importance=float(a["importance"]) 当 a.get("importance") is not None 否则 None、verification_basis=a.get("verification_basis") or (verdict or {}).get("basis")、non_applicable_conditions、role、derived_from=_split_ids(a.get("derived_from")) or None、relation、sensitivity、session、valid_from、valid_until、depends_on（经 _as_deps 归一，与直连链尾 trust.as_deps 同口径）、verification_state），返回其中值不属于 (None, [], '', {}) 的键值对。
+def _proposal_extras(a, verdict=None):
+    """入队时保全 write 的落盘要素，避免裁决 accept 后退化成默认值。
+
+    队列项以 `extra` 承载任意 kw（propose 的 `**kw`），裁决 accept 时原样
+    `**extra` 回传给 `add()` —— 通道本就在，缺的是调用点透传：`op=write`
+    的 ACCEPT 直落盘分支（L1600）原本就传 importance / verification_basis /
+    non_applicable_conditions，而两个入队分支（冲突 defer / 判据 DEFER）只传
+    content/layer/tags/condition_space，导致 importance 退化为 0.5（≥0.7 的
+    自动保护线随之失效）、verification_basis 退化为 null。
+
+    空值一律不传：父类 `add(importance: float = 0.5)` 对 None 无容错，显式传
+    None 会落成 null 并绕过保护线，所以必须在入口过滤而非依赖下游兜底。
+
+    本白名单覆盖的键集合 = 「op=write 直接提交分支会交给 add() 的键」中**可由
+    入队通道保全**的部分。issue #186（P0）是同族失败模式第二次发作：`sensitivity`
+    / `session` / `valid_from` / `valid_until` 此前同样只活在调用方声明面，入队即丢
+    ——accept 落盘后密级退化 internal、声明 private 的正文以明文落盘（可被无令牌
+    访客读到）、session 变 unattributed、valid_until 丢失。四键与上面诸键同属
+    「写落盘要素」，故一并纳入本白名单（对照 commit 0f566cc2 修 importance 的同族）。
+    """
+    ex = {
+        "verify": a.get("verify"),
+        "importance": (float(a["importance"]) if a.get("importance") is not None
+                       else None),
+        "verification_basis": (a.get("verification_basis")
+                               or (verdict or {}).get("basis")),
+        "non_applicable_conditions": a.get("non_applicable_conditions"),
+        "role": a.get("role"),
+        "derived_from": _split_ids(a.get("derived_from")) or None,
+        "relation": a.get("relation"),
+        # issue #186（P0）：入队即保全写落盘要素的第二批——密级 / 会话 / 有效期
+        # （importance 漏传族的同族第二次发作）。值取 a.get(...)，空值由末尾过滤剔除。
+        "sensitivity": a.get("sensitivity"),
+        "session": a.get("session"),
+        "valid_from": a.get("valid_from"),
+        "valid_until": a.get("valid_until"),
+             "depends_on": _as_deps(a.get("depends_on")),
+             "verification_state": a.get("verification_state"),
+    }
+    return {k: v for k, v in ex.items() if v not in (None, [], "", {})}
+
+
+# 生效条件：act 取 a.get("action") 转 str 去空白并 lower 后缺省 "status"，name 取 a.get("name") 或环境变量 MDCG_SUSTAIN_NAME 或 "md_cg"；status/info 只读诊断，自愈类 act 只回收派生物（索引重扫、临时分片、日志轮转、心跳戳），永不删除节点、不代签密钥；
+def _sustain_call(cg, a):
+    """持续性自维持统一入口（常驻 / 心跳 / 自愈 / 会话续接）。
+
+    路线图「常驻服务：会话/心跳/自愈」。原则：诊断只读；自愈只碰派生物
+    （索引/临时文件/日志边界），永不删节点；缺密钥属于权限事实，只报告不修。
+    """
+    from . import sleep as _sleep
+    from . import sustain
+    act = (a.get("action") or "status").strip().lower()
+    name = a.get("name") or os.environ.get("MDCG_SUSTAIN_NAME") or "md_cg"
+
+    if act in ("status", "info"):
+        sm = sustain.summary(cg, name)
+        lp = sustain.get_loop(cg, name)
+        return {"heartbeat": sm["heartbeat"], "loop": (lp.status() if lp
+                                                      else {"running": False}),
+                "sessions": sm["sessions"], "watermarks": sustain.watermarks(cg),
+                "peers": sustain.peers()}
+    if act in ("beat", "heartbeat"):
+        return {"beat": sustain.write_stamp(
+            name, root=cg.root, task_running=bool(a.get("task_running")))}
+    if act == "peers":
+        return {"peers": sustain.peers()}
+    if act in ("diagnose", "check"):
+        return sustain.diagnose(cg, name=name)
+    if act in ("heal", "repair"):
+        return sustain.heal(cg, name=name, dry_run=bool(a.get("dry_run")),
+                            allow_evolve=bool(a.get("allow_evolve")))
+    if act in ("evolve", "evolve_check"):
+        # G7：演化候选盘点（只读、零读节点文件、不写盘）
+        return sustain.evolution_candidates(
+            cg, layer=a.get("layer"),
+            top=int(a.get("limit") or 8))
+    if act in ("provenance", "derive_check"):
+        # G8：派生溯源悬空巡检（只读、零读节点文件、不删边）
+        from . import provenance as _pv
+        return _pv.check(cg, limit=int(a.get("limit") or 20))
+    if act in ("pooling", "pool_catalog"):
+        # §七：召回分池显式权重表自描述（只读）
+        from . import pooling as _pl
+        return _pl.catalog()
+    if act in ("pool_bench", "pool_measure"):
+        # §七：同口径复测（只读；queries 缺省则从索引确定性取样 → proxy）
+        from . import pooling as _pl
+        qs = a.get("queries")
+        if isinstance(qs, str):
+            qs = [x for x in qs.replace("\n", ",").split(",") if x.strip()]
+        return _pl.measure(cg, qs, k=_int_arg(a, "k", 20),
+                           pools=(a.get("pools") if a.get("pools") is not None
+                                  else True),
+                           n_queries=int(a.get("limit") or 50))
+    if act in ("pool_compare", "pool_ab"):
+        # §七：分池前后同口径对比 + 副作用归因（只读）
+        from . import pooling as _pl
+        qs = a.get("queries")
+        if isinstance(qs, str):
+            qs = [x for x in qs.replace("\n", ",").split(",") if x.strip()]
+        return _pl.compare(cg, qs, k=_int_arg(a, "k", 20),
+                           pools=a.get("pools"),
+                           n_queries=int(a.get("limit") or 50))
+    if act in ("start", "up"):
+        lp = sustain.ensure_loop(
+            cg, name,
+            beat_interval=float(a.get("beat_interval")
+                                or sustain.DEFAULT_BEAT_INTERVAL),
+            heal_interval=float(a.get("heal_interval")
+                                or sustain.DEFAULT_HEAL_INTERVAL),
+            # 四档 auto_* 一律经 sustain 的**单一真源读取器**（P0-2）——此处
+            # 不得再写缺省字面量：op 路径原 `auto_tidy` 缺省 False 与 env 路径
+            # 的 True 相反，同 (root,name) 走两条入口语义不一致。显式入参仍优先。
+            auto_heal=sustain.auto_from_args("auto_heal", a),
+            scrub_interval=float(a.get("scrub_interval")
+                                 or sustain.DEFAULT_SCRUB_INTERVAL),
+            auto_scrub=sustain.auto_from_args("auto_scrub", a),
+            evolve_interval=float(a.get("evolve_interval")
+                                  or sustain.DEFAULT_EVOLVE_INTERVAL),
+            auto_evolve=sustain.auto_from_args("auto_evolve", a),
+            tidy_interval=float(a.get("tidy_interval")
+                                or sustain.DEFAULT_TIDY_INTERVAL),
+            auto_tidy=sustain.auto_from_args("auto_tidy", a),
+            # 第六档睡眠周期（§4.7）：五个值一律经 `md_cg/sleep.py` 的**单一真源
+            # 读取器**（此处不得再写缺省字面量，也不得再写 env 键名字面量——
+            # 键名真源是 `sleep.SLEEP_ENV_KEYS`）。与 env 路径逐字同一组调用。
+            sleep_interval=_sleep.sleep_interval(),
+            auto_sleep=_sleep.sleep_enabled(),
+            sleep_merge=_sleep.sleep_merge_mode(),
+            sleep_window=_sleep.sleep_window(),
+            sleep_scrub_apply=_sleep.sleep_scrub_apply())
+        return {"loop": lp.start().status()}
+    if act in ("stop", "down"):
+        lp = sustain.get_loop(cg, name)
+        return {"loop": (lp.stop().status() if lp else {"running": False})}
+    if act in ("resume", "resume_point"):
+        return sustain.SessionLedger(cg.root).resume_point(
+            a.get("session") or a.get("node_id") or "")
+    if act in ("note", "record"):
+        return {"session": sustain.SessionLedger(cg.root).note(
+            a.get("session") or a.get("node_id") or "default",
+            t=a.get("ts"), seq=a.get("seq"), n=int(a.get("limit") or 1),
+            actor=a.get("actor"))}
+    if act == "catalog":
+        return {"actions": ["status", "beat", "peers", "diagnose", "heal",
+                            "evolve", "provenance", "pooling", "pool_bench",
+                            "pool_compare", "start", "stop", "resume",
+                            "note", "catalog"],
+                "beat_interval": sustain.DEFAULT_BEAT_INTERVAL,
+                "heal_interval": sustain.DEFAULT_HEAL_INTERVAL,
+                "scrub_interval": sustain.DEFAULT_SCRUB_INTERVAL,
+                "evolve_interval": sustain.DEFAULT_EVOLVE_INTERVAL,
+                "tidy_interval": sustain.DEFAULT_TIDY_INTERVAL,
+                "evolve_fixes": dict(sustain.EVOLVE_FIXES),
+                "provenance_fixes": {},     # 悬空派生边只检出、无自动修复
+
+                "thresholds": {"warn": sustain.DEFAULT_WARN_FACTOR,
+                               "dead": sustain.DEFAULT_DEAD_FACTOR,
+                               "working": sustain.DEFAULT_WORKING_FACTOR},
+                "net_dir": sustain.net_dir()}
+    raise ValueError(f"sustain 未知 action：{act}")
+
+
+# 生效条件：当 cg、a 传入时，按 a.get('action') or 'sweep'（空串/None 回退 'sweep'）分派，ids/kinds 若为字符串则按逗号或空白拆成列表，node_id=a.get('node_id') or a.get('node')，target=ids or ([node_id] if node_id else None)（ids 假值回落 node_id 列表或 None）：action 为 sample/spot_check 返回 scrub.sample(cg, _int_arg(a, 'k', _int_arg(a, 'n', scrub.DEFAULT_SAMPLE)), strategy=a.get('strategy') or 'stratified', seed=a.get('seed'))（k/n 显式原样透传、缺省链回落 scrub.DEFAULT_SAMPLE）；action 为 associate/related 时若 node_id 假值抛 ValueError，否则返回 scrub.associate(cg, node_id, hops=int(a.get('hops') or scrub.DEFAULT_HOPS), limit=_int_arg(a, 'k', 30), lexical=bool(a.get('lexical', True)))（hops 假值回落常量，k 显式原样透传、缺省回落 30，lexical 缺键为 True）；action 为 audit/check 返回 scrub.audit(cg, target, hops=int(a.get('hops') or 1), min_severity=a.get('min_severity') or 'info')；action 为 decontaminate/repair 返回 scrub.decontaminate(cg, target, kinds=kinds, dry_run=bool(a.get('dry_run', True)), min_severity=a.get('min_severity') or 'medium', hops=int(a.get('hops') or 1), actor=a.get('actor'), override=bool(a.get('override')))；action 为 calibrate/calibration 返回 scrub.calibrate(cg, apply=bool(a.get('apply')), override=bool(a.get('override')), actor=a.get('actor'))；action 为 sweep/run 返回 scrub.sweep(cg, n=_int_arg(a, 'k', _int_arg(a, 'n', scrub.DEFAULT_SAMPLE)), seed=a.get('seed'), dry_run=bool(a.get('dry_run', True)), hops=int(a.get('hops') or scrub.DEFAULT_HOPS), strategy=a.get('strategy') or 'stratified', apply_calibration=bool(a.get('apply')), actor=a.get('actor'))；action 为 history/log 返回 scrub.history(cg, limit=_int_arg(a, 'k', 100))（k 显式原样透传、缺省回落 100）；action=summary 返回 scrub.summary(cg)；action=catalog 返回 scrub.catalog()；其他 action 抛 ValueError；
+def _scrub_call(cg, a):
+    """记忆自净统一入口（抽查 / 联想 / 去污染 / 校准偏差）。
+
+    路线图「记忆抽查去污染」。原则与 sustain 一致：体检只读；去污染只做
+    可逆动作（weaken / demote），**永不删节点**；保护节点跳过。
+    """
+    from . import scrub
+    act = (a.get("action") or "sweep").strip().lower()
+    ids = a.get("ids")
+    if isinstance(ids, str):
+        ids = [s for s in ids.replace(",", " ").split() if s]
+    kinds = a.get("kinds")
+    if isinstance(kinds, str):
+        kinds = [s for s in kinds.replace(",", " ").split() if s]
+    node_id = a.get("node_id") or a.get("node")
+    target = ids or ([node_id] if node_id else None)
+
+    if act in ("sample", "spot_check"):
+        return scrub.sample(
+            cg, _int_arg(a, "k", _int_arg(a, "n", scrub.DEFAULT_SAMPLE)),
+            strategy=a.get("strategy") or "stratified", seed=a.get("seed"))
+    if act in ("associate", "related"):
+        if not node_id:
+            raise ValueError("scrub associate 需要 node_id")
+        return scrub.associate(cg, node_id,
+                               hops=int(a.get("hops") or scrub.DEFAULT_HOPS),
+                               limit=_int_arg(a, "k", 30),
+                               lexical=bool(a.get("lexical", True)))
+    if act in ("audit", "check"):
+        return scrub.audit(cg, target, hops=int(a.get("hops") or 1),
+                           min_severity=a.get("min_severity") or "info")
+    if act in ("decontaminate", "repair"):
+        return scrub.decontaminate(
+            cg, target, kinds=kinds, dry_run=bool(a.get("dry_run", True)),
+            min_severity=a.get("min_severity") or "medium",
+            hops=int(a.get("hops") or 1), actor=a.get("actor"),
+            override=bool(a.get("override")))
+    if act in ("calibrate", "calibration"):
+        return scrub.calibrate(cg, apply=bool(a.get("apply")),
+                               override=bool(a.get("override")),
+                               actor=a.get("actor"))
+    if act in ("sweep", "run"):
+        return scrub.sweep(
+            cg, n=_int_arg(a, "k", _int_arg(a, "n", scrub.DEFAULT_SAMPLE)),
+            seed=a.get("seed"), dry_run=bool(a.get("dry_run", True)),
+            hops=int(a.get("hops") or scrub.DEFAULT_HOPS),
+            strategy=a.get("strategy") or "stratified",
+            apply_calibration=bool(a.get("apply")), actor=a.get("actor"))
+    if act in ("history", "log"):
+        return scrub.history(cg, limit=_int_arg(a, "k", 100))
+    if act == "summary":
+        return scrub.summary(cg)
+    if act == "catalog":
+        return scrub.catalog()
+    raise ValueError(f"scrub 未知 action：{act}")
+
+
+# ---- action 缺省防呆（2026-09-16）------------------------------------------
+# 与「op 缺省静默降级」同构的第二类静默失败：op 传了、action 漏了 → 各分支按
+# 字面量默认 action 执行。若默认恰是**读类**，写意图会被静默吞掉且返回形似正常
+# 的结果——最典型是文档化契约 `cg(op=review, pid, decision, reason)`（不带
+# action）实际静默走 review_list，裁决从未落盘（契约与实现漂移）。
+# 处置：签名明确指向非默认 action → 按签名推导并透出 action_derived/hint_action；
+# 无签名可依 → 维持默认执行但同样透出标记，让「按默认走」可见而非静默。
+# 判据用「键存在且非 None」（False / 0 / "" 属显式传入），避免真值判断误吞。
+#
+# issue #133 + #140：本表**不再手写**——真源是 `md_cg/op_table.py` 的 `_OP_TABLE`
+# 每个 op 的 `sigs` 字段（此处只是派生视图）。task 的次序语义（写意图优先、读意图
+# 最后）原样保留在表内，见 op_table 的 task 条目。
+_ACTION_SIGS = _ot.action_sigs()
+
+# op → 分支内缺省 action 字面量。**仅供缺省透出提示，不参与执行**；与各
+# _xxx_call / 分支里的 `a.get("action") or "<默认>"` 保持同步（同源守卫见
+# test_action_derive.py）。issue #133 + #140：真源同上（`_OP_TABLE[*]["default_action"]`）。
+_ACTION_DEFAULT = _ot.action_default()
+
+
+# 生效条件：op == "ingest" 时若 str(a.get("path") or "").strip() 非空，则按 a.get("patterns") 为真值→("dir","patterns")、该 path 小写以 ".jsonl" 结尾→("jsonl","path(*.jsonl)")、否则→("file","path")；其他 op 按常量 _ACTION_SIGS.get(op, ()) 的顺序取第一个 key 存在于 a 且 a.get(key) is not None 的项返回 (act, key)，无匹配则返回 (None, None)；
+def _action_sig(a, op):
+    """action 缺省时的签名推导 → (action, 依据键)；无签名可依 → (None, None)。
+
+    `ingest` 单独处理：其 op 语义是**写**（摄入），缺省 action 却是**读**（stat）
+    ——「传了 path 却静默 stat」会把摄入整件事吞掉。类型按**保守优先**推导：
+    patterns→dir、`*.jsonl`→jsonl、其余 path→file（file 最保守：若实为目录会
+    报错可见，而不会误把整棵目录树摄进来）。
+    """
+    if op == "ingest":
+        path = str(a.get("path") or "").strip()
+        if path:
+            if a.get("patterns"):
+                return "dir", "patterns"
+            if path.lower().endswith(".jsonl"):
+                return "jsonl", "path(*.jsonl)"
+            return "file", "path"
+    for key, act in _ACTION_SIGS.get(op, ()):
+        if key in a and a.get(key) is not None:
+            return act, key
+    return None, None
+
+
+# 生效条件：op0=(a.get("op") or "").strip().lower()，op0 为空时按 a.get("content")→"write"、a.get("query") 或 a.get("node_id")→"read"、a.get("intent")→"route"、都无→"read" 推导 op；act0=(args.get("action") or "").strip().lower()，act0 为空时用 _action_sig(args, op) 推导且推导出时写回 args["action"]；另恒定计算 act_source（explicit|sig|default|none）；args["op"]=op 后调 _cg_dispatch，返回 dict 且 op0 为空时补 out["op"]、out["op_derived"]=True 与 hint，**无条件** setdefault out["action_source"]=act_source，act0 为空且 (act_derived 或 op in _ACTION_DEFAULT) 时 setdefault("action", eff)、out["action_derived"]=True 并按是否有 act_derived 写 hint_action。
+def _cg_call(cg, a):
+    """认知图唯一入口（外层：op/action 缺省推导兜底 + 推导透出；主体见 `_cg_dispatch`）。
+
+    **action 来源契约（2026-09-30，调用方不必猜）**：返回 dict 里
+    `action_source` **恒定在场**（旧行为只在「推导过」时给 `action_derived`，
+    显式传 action 时返回里无任何痕迹——调用方无法判断这个 action 是自己传的
+    还是系统替它挑的）。四态取值：
+
+      · ``"explicit"`` —— 本次显式传了非空 action（真值判断只在「取 action 与否」
+        上用；判据本身用 `.strip()` 后非空，False/0 不是合法 action 字面量）。
+        此时 `action_derived` **不出现**（保持旧契约：只标记「推导发生过」）。
+      · ``"sig"`` —— 未传 action，且参数签名唯一指向某 action（表 `_ACTION_SIGS`）：
+        按签名执行，附 `action_derived=True` + `hint_action`（点名依据键）。
+      · ``"default"`` —— 未传 action 且无签名：按**默认动作表**执行，同样
+        `action_derived=True` + `hint_action`（点名走的是哪条默认）。
+      · ``"none"`` —— 未传 action、无签名、该 op 也无默认：本层不填 action，
+        交库层自行决定（此时 `action_derived` 亦不出现）。
+
+    默认动作表（op → 缺省 action；真源=本模块常量 `_ACTION_DEFAULT`，逐项与各
+    分支的 `a.get("action") or "<默认>"` 由 test_action_derive.py 双向守卫；
+    本表照表渲染，由 test_read_face_input_gates.py 断言与常量逐项一致）：
+
+      causal→path · ccg→compile · consolidate→promote · consistency→check ·
+      evolution→summary · export→stat · forget→forget · goal→list ·
+      identity→profile · ingest→stat · insight→outlook · link→ls ·
+      maintain→stat · metacognition→report · predict→routes · protect→stats ·
+      recent→list · ref→read · review→list · scrub→sweep ·
+      self_state→snapshot · session→recall · sustain→status · task→list ·
+      theory→check · whitebox→ping
+    """
+    op0 = (a.get("op") or "").strip().lower()
+    op = op0
+    if not op:
+        # op 缺省推导兜底：复杂任务后 agent 精力分散漏传 op 时，
+        # 旧行为静默降级 read（写入意图被吞，排查成本高）——按参数签名猜意图。
+        if a.get("content"):
+            op = "write"
+        elif a.get("query") or a.get("node_id"):
+            op = "read"
+        elif a.get("intent"):
+            op = "route"
+        else:
+            op = "read"        # 无任何签名可依：维持旧缺省 read
+    args = dict(a)
+    act0 = (args.get("action") or "").strip().lower()
+    act_sig = act_derived = None
+    if not act0:
+        act_derived, act_sig = _action_sig(args, op)
+        if act_derived:
+            args["action"] = act_derived     # 按签名补 action：避免写意图被默认吞掉
+    act_source = ("explicit" if act0 else
+                  "sig" if act_derived else
+                  "default" if op in _ACTION_DEFAULT else "none")
+    args["op"] = op
+    out = _cg_dispatch(cg, args)
+    if isinstance(out, dict):
+        # 「推导发生过」恒定在场：无论走默认、走推导还是显式传，都透出
+        # action_source（setdefault 不覆盖 op 自有的同名字段）。
+        out.setdefault("action_source", act_source)
+        if not op0:
+            out["op"] = op
+            out["op_derived"] = True
+            out["hint"] = ("op 未显式传入，已按参数签名推导（本次按 %s 执行）；op 为必填参数，"
+                           "复杂任务中也请始终显式传 op，避免静默执行错误意图" % op)
+        if not act0 and (act_derived or op in _ACTION_DEFAULT):
+            eff = act_derived or _ACTION_DEFAULT[op]
+            out.setdefault("action", eff)
+            out["action_derived"] = True
+            if act_derived:
+                out["hint_action"] = (
+                    "action 未显式传入，已按参数 %s 推导为 action=%s（旧行为会静默走默认 %s，"
+                    "意图被吞）；建议显式传 action" % (act_sig, act_derived,
+                                                     _ACTION_DEFAULT.get(op, "?")))
+            else:
+                out["hint_action"] = (
+                    "action 未显式传入，本次按 %s 的默认 action=%s 执行；"
+                    "若意图是其它 action 请显式传 action" % (op, eff))
+        # 状态摘要协议（**单出口挂载**，控制爆炸半径——不逐 op 改造）：
+        # 把「它还成不成立」（验证态/存疑/异常/时效）以状态头透出，并把既有
+        # hint 升级为状态头格式（MDCG_STATUS_HEAD=0 回退旧文本）。挂载失败不阻断读面。
+        try:
+            from . import statushdr
+            statushdr.annotate(cg, out)
+        except Exception as exc:                           # noqa: BLE001
+            out.setdefault("status_head_error", type(exc).__name__)
+    return out
+
+
+def _status_call(cg, a):
+    """验证态 / 依赖 / 双时间轴 / 履历查询（op=status，**只读**）。
+
+    真源 `md_cg/trust.py`。三形态（`cg(op="status")` 取摘要，`node_id=` 取单节点）：
+      · 给 `node_id`     → 单节点全貌（describe + 履历 + 状态头渲染）；
+      · 不给 / patrol    → 全库摘要（存疑 / 过期 / 未生效 / 悬空四类计数）；
+      · `action=ledger`  → 读验证态台账（`_trust.jsonl`，可按节点过滤）。
+    """
+    from . import statushdr, trust
+    nid = str(a.get("node_id") or a.get("id") or "").strip()
+    act = str(a.get("action") or "").strip().lower()
+    limit = int(a.get("limit") or 20)
+    if act in ("ledger", "log"):
+        rows = trust.load_ledger(cg, node_id=nid or None, limit=limit)
+        return {"op": "status", "action": "ledger", "node_id": nid or None,
+                "count": len(rows), "rows": rows, "readonly": True}
+    if nid and act not in ("patrol", "summary"):
+        de = trust.describe(cg, nid)
+        de.update({"op": "status", "action": "describe", "readonly": True,
+                   "status_head": statushdr.render(cg, nid),
+                   "ledger": trust.load_ledger(cg, node_id=nid, limit=limit)})
+        return de
+    rep = trust.patrol(cg, limit=limit)
+    rep.update({"op": "status", "action": act or "summary",
+                "summary": trust.summary(cg), "catalog": trust.catalog(cg.root)})
+    # 摘要形态主动挂全库级状态头（annotate 的 _collect_ids 找不到 node_id 不会自动注入）
+    s = rep.get("summary") or {}
+    bits = []
+    dc = s.get("doubted", 0)
+    ec = s.get("expired", 0)
+    nc = s.get("not_yet", 0)
+    uc = s.get("unverified", 0)
+    vc = s.get("verified", 0)
+    if ec:
+        bits.append(f"{statushdr.MARK_ABNORMAL} 异常({ec})")
+    if dc:
+        bits.append(f"{statushdr.MARK_DOUBTED} 存疑({dc})")
+    if nc:
+        bits.append(f"{statushdr.MARK_MODIFIED} 未生效({nc})")
+    if vc:
+        bits.append(f"{statushdr.MARK_VERIFIED} 已验证({vc})")
+    if uc:
+        bits.append(f"{statushdr.MARK_UNVERIFIED} 未验证({uc})")
+    rep["status_head"] = " · ".join(bits) if bits else statushdr.MARK_UNVERIFIED + " 空"
+    # 冷路径队列状态（2026-09-19 热温冷分层）
+    try:
+        from . import coldverify as _cv
+        q = _cv.get(cg)
+        if q is not None:
+            rep["coldverify"] = q.status()
+    except Exception:                                  # noqa: BLE001
+        pass
+    return rep
+
+
+# 生效条件：a 的 child/parent/relation/batch/时间五参/ordering/aggregation/offset/limit/expand_nodes 原样透传给 provenance.find_edges（本层不校验、不填默认，合法性单点在库层）；始终返回该只读结果字典（含 edges/total/matched/returned/aggregates/time_filter 审计块）。
+def _edges_call(cg, a):
+    """三元组反查（op=edges，**只读**）：按任意端 / 谓词 / 时间反查派生边。
+
+    三元组术语 `subject / predicate / object` 在本层就是 `child / rel / parent`
+    （即 `derived_from` 派生边）——**不新造第二套参数**：`cg` 工具面是扁平
+    schema，`subject` 已被 `identity`（主体语义）占用，同名异义会把两处口径搅在
+    一起；且 `relation`/`child`/`parent`/`batch` 已是 `link derive` 的既有谓词面。
+
+    参数**原样透传、不填默认、不做二次校验**，与 `_read_call` 同一策略：
+    合法性判定单点在库层（`provenance._ordering_of/_aggregation_of` 与
+    `trust.check_time_args`）。本层若自补默认，缺省轴（边 = `observed`，检索 =
+    `effective`）与枚举集就会两处分叉，日后必然漂移。
+
+    不暴露 `path`（库层测试用注入点）：MCP 面不接受文件系统路径。
+    """
+    from . import provenance as _pv
+    return _pv.find_edges(
+        cg,
+        child=a.get("child"), parent=a.get("parent"),
+        relation=a.get("relation"), batch=a.get("batch"),
+        start_time=a.get("start_time"), end_time=a.get("end_time"),
+        start_operator=a.get("start_operator"), end_operator=a.get("end_operator"),
+        time_axis=a.get("time_axis"),
+        ordering=a.get("ordering"), offset=a.get("offset") or 0,
+        limit=a.get("limit"), aggregation=a.get("aggregation"),
+        expand_nodes=bool(a.get("expand_nodes")))
+
+
+# 生效条件：始终调 help_text(ALL_TOOLS, query=a.get("query") or a.get("intent"), limit=int(a.get("limit") or a.get("k") or 40)) 并返回其结果。
+def _help_call(cg, a):
+    """按需披露入口（工具面渐进披露的读取面，见 md_cg/tool_face.py）。
+
+    常驻上下文只留「一行职责 + 参数短提示」；被投影掉的完整 op/参数语义
+    在此从真源无损取回——所以瘦身不损失能力，只把「随时付费」换成「按需取」。
+    只读元信息（工具 schema 本身对客户端可见），故不过角色权限闸。
+    """
+    from .tool_face import help_text
+    return help_text(ALL_TOOLS, query=a.get("query") or a.get("intent"),
+                     limit=int(a.get("limit") or a.get("k") or 40))
+
+
+# 生效条件：当 cg、a 传入时，act=(a.get('action') or '').strip().lower()（空串/None 得空串），若 act 空则 act=_action_sig(a, 'task')[0] or 'list'，name=a.get('name') or a.get('task_name') or a.get('task') or ''，nid=a.get('node_id') or a.get('task_id') or ''，tstat=a.get('task_status') or a.get('new_status') or ''（各假值链回落 ''）：act 为 open/add/upsert 时 importance 取 a.get('importance')，非 None 则 float、转换失败置 None，返回 _t.upsert(cg, name or nid, plan=a.get('plan'), status=tstat or None, result=a.get('result'), condition=a.get('condition'), goal=a.get('goal_text') or a.get('goal'), acceptance=a.get('acceptance'), boundary=a.get('boundary'), change=a.get('change'), note=a.get('note'), tags=a.get('tags'), importance=imp, actor=a.get('actor'))；act 为 status/set_status 时若 tstat 假值返回 {'ok': False, 'error': '缺 task_status', 'hint': '可选 active|blocked|done|dropped；迁 done 必须同时给 result'}，否则返回 _t.set_status(cg, nid or name, tstat, result=a.get('result'), note=a.get('note'), actor=a.get('actor'))；act=plan_add 返回 _t.plan_add(cg, nid or name, a.get('change') or a.get('text'), actor=a.get('actor'))；act=get 返回 _t.get_task(cg, nid or name)；act=find 返回 _t.find_similar(cg, name, k=_int_arg(a, 'k', _int_arg(a, 'limit', 5)))（k/limit 显式原样透传、缺省链回落 5）；act=session 返回 _t.session_tasks(cg, active_limit=int(a.get('active_limit') or 5), done_limit=int(a.get('done_limit') or 5))（各假值回落 5）；act 非 list 时返回 {'ok': False, 'error': '未知 task action：%r' % act, 'hint': '可选 open|status|plan_add|get|list|find|session'}；act=list 返回 _t.list_tasks(cg, status=tstat or None, limit=a.get('limit'))；
+# 生效条件：原任务动作沿用；record_memory/recall_memory/get_memory 分派到 task_memory 的 record/recall/get，参数由库层统一校验；memory 载荷签名优先推导为 record_memory，避免被 name 签名静默吞为 open。
+def _task_call(cg, a):
+    """结构层任务实体（op=task）——跨会话的工程台账。
+
+    action:
+      open / add   登记或更新任务卡（**同名即同卡**；未给字段沿用旧值，不静默清空）
+      status       状态迁移（active|blocked|done|dropped；迁 done 时「结果」必填）
+      plan_add     追加计划变更（执行中发现的偏差与新问题）
+      get          单卡全字段读回
+      list         任务清单（默认；可按 task_status 过滤）
+      find         同族任务提示（**只提示，不自动合并**）
+      session      会话装配面（进行中 + 近期完成）——供上下文召回
+      record_memory 保存本次任务结果与零或多条经验候选（不自动验证）
+      recall_memory 分桶召回任务事实/经验（原始证据按引用回读）
+      get_memory   按 node_id 完整读取原始记忆
+
+    :param name: 任务名（身份判据：同名即同任务，slug 归一后落节点 id）
+    """
+    from . import tasks as _t
+    act = (a.get("action") or "").strip().lower()
+    if not act:
+        act = _action_sig(a, "task")[0] or "list"
+    name = a.get("name") or a.get("task_name") or a.get("task") or ""
+    nid = a.get("node_id") or a.get("task_id") or ""
+    tstat = a.get("task_status") or a.get("new_status") or ""
+
+    if act in ("record_memory", "recall_memory", "get_memory"):
+        from . import task_memory
+        if act == "record_memory":
+            return task_memory.record(cg, nid or name, a.get("memory"))
+        if act == "get_memory":
+            return task_memory.get(cg, nid)
+        return task_memory.recall(cg, nid or name, query=a.get("query", ""),
+                                  limit=a.get("limit", 5),
+                                  include_history=a.get("include_history", False))
+
+    if act in ("open", "add", "upsert"):
+        imp = a.get("importance")
+        try:
+            imp = float(imp) if imp is not None else None
+        except (TypeError, ValueError):
+            imp = None
+        return _t.upsert(cg, name or nid,
+                         plan=a.get("plan"), status=tstat or None,
+                         result=a.get("result"), condition=a.get("condition"),
+                         goal=a.get("goal_text") or a.get("goal"),
+                         acceptance=a.get("acceptance"), boundary=a.get("boundary"),
+                         change=a.get("change"), note=a.get("note"),
+                         tags=a.get("tags"), importance=imp, actor=a.get("actor"))
+
+    if act in ("status", "set_status"):
+        if not tstat:
+            return {"ok": False, "error": "缺 task_status",
+                    "hint": "可选 active|blocked|done|dropped；迁 done 必须同时给 result"}
+        return _t.set_status(cg, nid or name, tstat, result=a.get("result"),
+                             note=a.get("note"), actor=a.get("actor"))
+
+    if act == "plan_add":
+        return _t.plan_add(cg, nid or name, a.get("change") or a.get("text"),
+                           actor=a.get("actor"))
+
+    if act == "get":
+        return _t.get_task(cg, nid or name)
+
+    if act == "find":
+        return _t.find_similar(
+            cg, name, k=_int_arg(a, "k", _int_arg(a, "limit", 5)))
+
+    if act == "session":
+        return _t.session_tasks(cg, active_limit=int(a.get("active_limit") or 5),
+                                done_limit=int(a.get("done_limit") or 5))
+
+    if act != "list":
+        return {"ok": False, "error": "未知 task action：%r" % act,
+                "hint": "可选 open|status|plan_add|get|list|find|session|record_memory|recall_memory|get_memory"}
+
+    return _t.list_tasks(cg, status=tstat or None, limit=a.get("limit"))
+
+
+# 生效条件：op 取 a.get("op") 转 str 去空白并 lower；缺失时按参数签名回推（含 content→write / query|node_id→read / intent→route；无签名可推时维持 read），op=="help" 在角色闸门之前直通 _help_call；其余 op 先经 cg.principal.require_op(op)（越权即 AccessDenied）再按 alias→内联名→cli 表分派；未识别 op 抛 ValueError；fork：op=="forget" 的**删除**分支走 cg.forget_gated（三档自治批次②：档位判定在既有资格闸之后，变更确认档出变更单且不软删；restore 分支不变），op=="write" 经 writepipe 默认链（链尾 autonomy 档位闸）；
+def _gate_link_signers_file(a):
+    """issue #167：signers_file 由调用方指定 = 调用方自选「验签策略来源」。
+
+    指向不存在的文件时 `signer.load_policies` 返回空策略表
+    （`require_peer_signature=False`）⇒ 一次参数即可关掉强制对端签名。
+    收口：只接受运维侧现行策略文件（realpath 归一）；未传则行为逐位不变。
+    """
+    sf = a.get("signers_file")
+    if not sf:
+        return
+    from . import signer as _sg
+    cur = _sg.signers_file()
+    if os.path.realpath(str(sf)) != os.path.realpath(cur):
+        raise ValueError("link: signers_file 只能指向现行策略文件（%s），收到 %s"
+                         % (cur, sf))
+
+
+def _gate_link_swarm(a):
+    """issue #245：swarm 由调用方指定 = 调用方自选「跨节点共享目录」。
+
+    该值被 `peers_dir`/`inbox_dir` 直接 `os.path.join` 当作**写盘根**
+    （`publish_card`/`write_pack`/`_rejected.jsonl`），传绝对路径或 `../`
+    即可在记忆库之外建目录写文件。
+
+    ★ 既有的 realpath 兜底（#147 的 write_pack、#277 的 publish_card）
+    **兜不住**：那些判据的基准 `base = os.path.realpath(peers_dir(swarm))`
+    本身由 `swarm` 派生 ⇒ `real.startswith(base)` 恒真，是自证同义反复。
+    故收口必须在**入口**，不能靠汇点。
+
+    收口：只接受运维侧现行共享目录（realpath 归一）；未传则行为逐位不变。
+    """
+    sw = a.get("swarm")
+    if not sw:
+        return                       # 未传 → 行为逐位不变（缺省/环境变量）
+    if not isinstance(sw, str):
+        raise ValueError("link: swarm 必须是字符串路径，收到 %r（%s）"
+                         % (sw, type(sw).__name__))
+    from . import evidence as _ev
+    cur = _ev.swarm_dir()
+    if os.path.realpath(os.path.expanduser(sw)) != os.path.realpath(
+            os.path.expanduser(cur)):
+        raise ValueError("link: swarm 只能指向现行共享目录（%s），收到 %s"
+                         % (cur, sw))
+
+
+def _import_subsystem_gate(a, ev):
+    """issue #167：import 不得挑一个**更松**的子系统策略来验签。
+
+    未声明子系统回落缺省策略（不要求对端签名）⇒ 传 `subsystem="x"` 即绕过强制
+    对端签名。更松时返回与「验签失败」同形的拒收 dict（不抛，保持 import 的
+    拒收语义自洽）；与基准同档或更严返回 None（放行）。
+    """
+    from . import signer as _sg
+    sub = a.get("subsystem") or ev.SUBSYSTEM
+    if sub == ev.SUBSYSTEM:
+        return None
+    why = _sg.weaker_than(_sg.policy_for(sub, a.get("signers_file")),
+                          _sg.policy_for(ev.SUBSYSTEM, a.get("signers_file")))
+    if not why:
+        return None
+    return {"ok": False, "rejected": True, "subsystem": sub,
+            "reason": "import 子系统 %s 的策略弱于 %s：%s"
+                      % (sub, ev.SUBSYSTEM, why)}
+
+
+# 生效条件：p 具 require_op（Principal）且 a["verification_state"] 归一后属**非中性**
+#   验证态时，转调 p.require_op("verify")（不具 verify op 即抛 AccessDenied）；p 无
+#   require_op 或该参数缺省/空/中性（trust.STATES[0] = unverified）时直接返回，无返回值。
+#   未知取值（不在 trust.STATES 内）同样按非中性处置——fail-closed。
+def _require_verify_for_vstate(p, a):
+    """issue #320（2026-10-15 DSH 端）：写入面自带的验证态声明 = 一次裁决行为。
+
+    病因：`verification_state` 是 op=write 的公开参数（protocol.py 的 write.optional），
+    而 `_cg_dispatch` 只 `require_op("write")`——于是 `record`（ops_allow 无 verify，
+    条约「不得自证」）可声明 `verification_state="verified"` 直接落盘：回执
+    「✓ 已验证（方式=…）」、importance≥0.7 触发不可遗忘保护、只读召回居首，而同一
+    令牌调 mdcg_verify 被 AccessDenied。库层（mdcg.py 的 `trust.require_transition`）
+    只校验**状态机迁移是否合法**（unverified→verified 合法），不看写的人有没有裁决权，
+    也不经 trust.set_state 留台账。
+
+    口径：非中性值一律要求 verify op；中性值与参数缺省不拦（存量调用零影响）。
+    合法路径是 `mdcg_verify`（_MDCG_OP_REQUIRE 映射到 verify op），由它经
+    trust.set_state 留台账。
+    """
+    if p is None or not hasattr(p, "require_op"):
+        return
+    try:
+        from . import trust as _t
+        _neutral = _t.STATES[0]
+    except Exception:                     # noqa: BLE001 —— 不可用时用文档口径
+        _neutral = "unverified"
+    _raw = str(a.get("verification_state") or "").strip().lower()
+    if not _raw or _raw == _neutral:
+        return
+    p.require_op("verify")
+
+
+def _cg_dispatch(cg, a):
+    """认知图唯一入口的 op 分发主体。"""
+    op = (a.get("op") or "read").strip().lower()
+    if op == "help":
+        return _help_call(cg, a)
+    _p = getattr(cg, "principal", None)
+    if _p is not None and hasattr(_p, "require_op"):
+        # P3 写口（state_event）映射到既有 "write" op 词——不给令牌 face 引入新
+        # op 词（角色白名单/派生收窄面零改动）：凡 ops 白名单含 write 的角色可
+        # 记账，guest/只读令牌照拒。其余 op 逐位不变。
+        _p.require_op("write" if op == "state_event" else op)
+    if op == "write":
+        # issue #320：op 名合规（write）不等于**参数**合规——验证态是裁决面，
+        # 按参数再要一次 verify op。单点放在分派层，不下沉到库层：库层不认识角色
+        # 白名单，且写面另有「入队→accept」通道（accept 的裁决权在 admin 手上）。
+        _require_verify_for_vstate(_p, a)
+
+    if op == "status":
+        return _status_call(cg, a)
+
+    if op == "edges":
+        return _edges_call(cg, a)
+
+    if op == "theory":
+        from . import theory as _th
+        act = (a.get("action") or "check").strip().lower()
+        if act == "check":
+            return _th.check()
+        if act == "show":
+            return _th.show()
+        if act == "catalog":
+            return _th.catalog()
+        if act == "declare":
+            acc = a.get("accepted") or a.get("accepted_versions")
+            if isinstance(acc, str):
+                acc = [x for x in acc.split(",") if x.strip()]
+            return _th.declare(a.get("version"), accepted=acc,
+                               actor=(_p.actor if _p is not None else "designer"))
+        raise ValueError(f"theory 未知 action：{act}")
+
+    if op == "link":
+        from . import links as _lk
+        act = (a.get("action") or "ls").strip().lower()
+        _actor = _p.actor if _p is not None else "system"
+        _gate_link_signers_file(a)
+        _gate_link_swarm(a)
+        if act == "catalog":
+            return _lk.catalog()
+        if act == "ls":
+            return _lk.ls(status=a.get("status"), subsystem=a.get("subsystem"))
+        if act == "show":
+            return _lk.get(a.get("peer"))
+        if act == "handshake":
+            pm = a.get("position_map")
+            if isinstance(pm, str):
+                pm = dict(x.split("=", 1) for x in pm.split(",") if "=" in x)
+            th = a.get("peer_theory")
+            if not th and a.get("peer_version"):
+                th = {"version": a.get("peer_version")}
+            return _lk.handshake(
+                a.get("peer"), peer_theory=th, position_map=pm,
+                declared_charter=bool(a.get("declared_charter", True)),
+                subsystem=a.get("subsystem"),
+                peer_signature=a.get("peer_signature"), actor=_actor)
+        if act == "observe":
+            return _lk.observe(
+                a.get("peer"), evidence=a.get("evidence") or "",
+                positive=not bool(a.get("negative")),
+                subsystem=a.get("subsystem"),
+                peer_signature=a.get("peer_signature"), actor=_actor)
+        if act in ("promote", "degrade", "isolate", "withdraw"):
+            return getattr(_lk, act)(a.get("peer"), reason=a.get("reason"),
+                                     actor=_actor)
+        if act == "decay":
+            return _lk.decay_all(actor=_actor)
+        if act == "policy":                       # 子系统签名策略（D-4）
+            from . import signer as _sg
+            if a.get("set"):
+                _kw = {k: a[k] for k in ("signer", "sign_on",
+                                         "require_peer_signature",
+                                         "on_verify_fail") if k in a}
+                # issue #167：放宽（含更换 signer）须管理权；收紧不限角色——否则
+                # 持有 link op 而无 admin 的角色（如 sustain）一次调用即可关掉
+                # 强制对端签名。判定在 set_policy **之前**（loosening 不写盘）。
+                _why = _sg.loosening(a.get("subsystem"),
+                                     path=a.get("signers_file"), **_kw)
+                if _why and _p is not None:
+                    _p.require_admin("link/policy 放宽签名策略：%s" % _why)
+                return _sg.set_policy(a.get("subsystem"), **_kw)
+            return _sg.show()
+        # ---- 跨节点证据存储（v0.3）------------------------------------
+        if act in ("card", "node_card"):
+            from . import evidence as _ev
+            return _ev.card(cg.root, subsystem=a.get("subsystem"),
+                            signers_file=a.get("signers_file"))
+        if act in ("publish", "publish_card"):
+            from . import evidence as _ev
+            return _ev.publish_card(cg.root, swarm=a.get("swarm"),
+                                    subsystem=a.get("subsystem"),
+                                    signers_file=a.get("signers_file"))
+        if act in ("peers", "peer_list"):
+            from . import evidence as _ev
+            return _ev.peers(a.get("swarm"), root=cg.root)
+        if act in ("evidence", "evidence_ls"):
+            from . import evidence as _ev
+            return _ev.evidence(
+                cg, subject=a.get("subject"), source=a.get("source"),
+                limit=int(a.get("limit") or a.get("k") or 100))
+        if act in ("export", "evidence_export"):
+            from . import evidence as _ev
+            from .security import check_path_root
+            # P1-4（批次 26）：证据包写/读路径根约束（报告点名的
+            # 「link export 不经 require_admin → 任意文件写」缺口）
+            check_path_root(a.get("out"), "MDCG_EXPORT_ROOT", "link/export")
+            # issue #211：白名单只判「在根内」，而 MDCG_EXPORT_ROOT 未配置时
+            # 回落记忆库根本身 ⇒ _keys.json / 节点 .md 都在可写面里。补一道
+            # 与白名单无关的落点约束；overwrite 只对管理员开放。
+            if a.get("out"):
+                from .security import check_export_target
+                _ow = bool(a.get("overwrite"))
+                if _ow and _p is not None:
+                    _p.require_admin("link/export overwrite")
+                check_export_target(a.get("out"), cg.root, "link/export",
+                                    allow_overwrite=_ow)
+            subs = a.get("subjects") or a.get("subject")
+            if isinstance(subs, str):
+                subs = [subs]
+            res = _ev.export_pack(
+                cg, subjects=subs, since=a.get("since"), swarm=a.get("swarm"),
+                subsystem=a.get("subsystem") or _ev.SUBSYSTEM,
+                signers_file=a.get("signers_file"))
+            if a.get("out"):
+                res["written"] = _ev.write_pack(
+                    res["pack"], path=a.get("out"), swarm=a.get("swarm"))
+            return res
+        if act in ("import", "evidence_import"):
+            from . import evidence as _ev
+            from .security import check_path_root
+            check_path_root(a.get("path") or a.get("pack"),
+                            "MDCG_EXPORT_ROOT", "link/import")
+            src = a.get("path") or a.get("pack")
+            if isinstance(src, str) and src.lstrip().startswith("{"):
+                src = json.loads(src)
+            if src is None:
+                raise ValueError("link/import 需要 path（包文件）或 pack（内联对象）")
+            # issue #167：验签前置——数据包按哪个子系统的策略验签**不得由调用方
+            # 挑松**（未声明子系统回落缺省策略 = 不要求对端签名）；更松即拒。
+            _rej = _import_subsystem_gate(a, _ev)
+            if _rej is not None:
+                return _rej
+            return _ev.import_pack(
+                cg, src, subsystem=a.get("subsystem") or _ev.SUBSYSTEM,
+                swarm=a.get("swarm"), signers_file=a.get("signers_file"))
+        # ---- 派生溯源（G8）：节点演进血缘（≠ 上面的对端信任 P_trust）----
+        # 权威声明只在节点写入时产生（`derived_from` → frontmatter + _link.jsonl），
+        # 本层**不新增写入口**；这里只读查询、悬空巡检与「按 frontmatter 重建台账」。
+        if act in ("derive", "derive_ls", "provenance_ls"):
+            from . import provenance as _pv
+            return {"ok": True, "readonly": True,
+                    "ledger": _pv.ledger_file(cg.root),
+                    "edges": _pv.edges(
+                        cg.root, child=a.get("child") or a.get("node"),
+                        parent=a.get("parent"), relation=a.get("relation"),
+                        batch=a.get("batch"), limit=a.get("limit"))}
+        if act in ("derive_dangling", "provenance_check"):
+            from . import provenance as _pv
+            return _pv.check(cg, limit=int(a.get("limit") or 20),
+                             include_index=not bool(a.get("ledger_only")))
+        if act in ("derive_catalog", "provenance_catalog"):
+            from . import provenance as _pv
+            return _pv.catalog(cg.root)
+        if act in ("derive_rebuild", "provenance_rebuild"):
+            # 台账是派生物，可重建：只重放 frontmatter 已声明的边，不发明任何边。
+            # 历史节点未声明派生关系 → 重建结果为空，正合「历史不回填」。
+            if _p is not None:
+                _p.require_admin("link_derive_rebuild")
+            from . import provenance as _pv
+            return _pv.rebuild_ledger(cg, apply=bool(a.get("apply")))
+        raise ValueError(f"link 未知 action：{act}")
+
+    if op == "info":
+        from . import audit
+        from . import nodefile
+        from . import theory as _th
+        from . import links as _lk
+        h = cg.health_os()
+        h.update({"surface": SURFACE,
+                  "tools": [t["name"] for t in tools_for_surface()],
+                  "audit_kinds": audit.kinds(), "whoami": cg.whoami(),
+                  # 裁定 B：CCG 六要素的契约角色（术语真源在 nodefile，此处只透出）
+                  "ccg_contract": dict(nodefile.CCG_CONTRACT_ROLES)})
+        # 能力外置可观测：本进程实际注入了哪些外部验证器（含失败原因）
+        h["external_verifiers"] = audit.load_external_verifiers()
+        # 写入策略来源（issue #43 契约④）：与启动 stderr / --show-config 同一
+        # 单点 policy_report()——工具面也能回答「我的策略从哪来、可不可用」。
+        # 诊断面**不得把整个 op=info 拖崩**（-32603）：策略自描述自身的异常在此
+        # 收口成不可用形状（与 policy_report 内部兜底同一形状，见
+        # audit.unavailable_report），info 的其余字段照常返回。
+        try:
+            h["write_policy"] = audit.policy_report()
+        except Exception as _pe:                  # noqa: BLE001
+            h["write_policy"] = audit.unavailable_report(_pe)
+        h["theory"] = _th.check()
+        h["links"] = _lk.ls()
+        # 代校验（纯增量，2026-09-30）：长驻进程可被问「你现在这一代是不是盘面那一代」。
+        # 根因（第4条取证）：升级后长驻进程仍持有启动代模块，与升级后惰性导入的新代
+        # 模块跨代混用（实测 cg 写入 ImportError: cannot import name 'mint_auto_id'
+        # from 'md_cg.mdcg'，而盘面正常）——盘面无从自证，须由进程自报。
+        # 落点＝generation.report()（单点）：code_generation / disk_generation /
+        # stale_on_disk / restart_required / hint。**纯增量**：既有键名、键值、
+        # 嵌套结构一字不动（本行只追加五个新键，键名与既有键无冲突）。
+        # 失败不得把 op=info 拖崩（同为诊断面契约）：异常在此收口成不可用形状。
+        from . import generation as _gen
+        try:
+            h.update(_gen.report())
+        except Exception as _ge:            # noqa: BLE001
+            h.update({"code_generation": None, "disk_generation": None,
+                      "stale_on_disk": None, "restart_required": None,
+                      "hint": "代校验不可用：%s: %s" % (type(_ge).__name__, _ge)})
+        return h
+
+    if op == "route":
+        intent = a.get("intent") or a.get("query") or ""
+        res, meta = cg.search(intent, k=_int_arg(a, "k", 10),
+                              context=a.get("context"), record=False,
+                              view=a.get("view"))
+        knowledge, caps = [], []
+        for n, s, q in res:
+            fm = n.get("frontmatter") or {}
+            knowledge.append({"id": n.get("id"), "score": s, "state": q.get("state"),
+                              "reason": q.get("reason"),
+                              "content": (n.get("content") or "")[:500],
+                              "verification_basis": fm.get("verification_basis")})
+            if fm.get("capability"):
+                caps.append(fm["capability"])
+            for t in (fm.get("tags") or []):
+                if isinstance(t, str) and t.startswith("cap:"):
+                    caps.append(t[4:])
+        return {"knowledge": knowledge, "suggested_capabilities": sorted(set(caps)),
+                "meta": meta,
+                "note": "认知图只给知识与建议能力名，不执行；由调用方决定"}
+
+    if op == "read":
+        # 时间算子（阶段二 4.1）：**原样透传**五个时间入参——本层不做校验也不填
+        # 默认值，合法性判定单点在库层 `trust.check_time_args`（默认轴 effective
+        # 亦由库层 `time_axis_of` 决定）。本层若自填默认值，两处口径就会分叉。
+        _tkw = {"start_time": a.get("start_time"), "end_time": a.get("end_time"),
+                "start_operator": a.get("start_operator"),
+                "end_operator": a.get("end_operator"),
+                "time_axis": a.get("time_axis"),
+                # 角色化读取视图（第四阶段 6.1）：原样透传，合法性判定单点在
+                # roleviews.ROLE_VIEWS（非法 view 库层 ValueError），与时间算子
+                # 同一透传纪律——本层不做校验也不填默认值。
+                "view": a.get("view")}
+        # 输入类型闸（2026-09-30）：`node_id` 非 str 时旧行为静默失真——哈希可算的
+        # 非 str（int/float/bool）cg.get() 取不到 → `_node_view(None)` → **裸 null**；
+        # 不可哈希的（list/dict）更会 TypeError 逃出 MCP 面。调用方无从区分
+        # 「id 不存在」与「类型错」。故本层只对**类型错**补结构化 error
+        # `node_id_not_str`（附 got_type；对齐 trust.py:692 的 `node_not_found`
+        # 负路由一族；写面的同族闸见 mdcg.py:1776 的「非法 node_id 类型」ValueError
+        # ——写面 fail-closed 抛异常，读面取负路由）。
+        #
+        # **「节点不存在」有意保持 null**：`md_cg/protocol.py` 的 read 形态表已登记
+        # `node_missing.returns_null = True`（note："不是错误对象——客户端须先判空
+        # 再解析"），反向证据 test_protocol A11/B8/B10 钉住该形态；改它须连带改协议
+        # 真源与那三条断言（不在本次指派文件内）。两态可区分性因此为：类型错 =
+        # `{"ok": False, "error": "node_id_not_str", ...}`，不存在 = `null`。
+        # 判据用「is not None」——**两种「显式」的处置刻意不同，勿当成疏漏**：
+        #   · 显式 "" 是**显式**：旧写法会把它当没传而静默转检索（本行注释的原始
+        #     动机），故它必须落进下面的类型闸 → 走「节点不存在」的 null，不转检索。
+        #   · 显式 None 是**未传**：MCP 客户端把「没有 id」序列化成 null 是常规形态，
+        #     故它落到下方检索分支。这是**刻意保留**的决定，由
+        #     test_read_face_input_gates 的 M2-B8 / M2-B9 两条钉住（M2-B9 断言名即
+        #     「node_id=None 仍是「未传」，走检索（不回归）」）。
+        # 该不对称曾被外部复审读作疏漏（issue #274）——根因是此处只写了 "" 的动机、
+        # 没写 None 的动机；故本次**只补文档，不改行为**。若要改成「None 也报类型
+        # 错」，须连带改 M2-B9 与协议形态表，属**行为变更**（issue #274 的 R1），
+        # 不是补漏。
+        if a.get("node_id") is not None:
+            _nid = a["node_id"]
+            if not isinstance(_nid, str):
+                return {"ok": False, "error": "node_id_not_str",
+                        "node_id": _nid, "got_type": type(_nid).__name__,
+                        "hint": "node_id 必须是字符串 id；要按关键词检索请改用 "
+                                "query（本层不再把类型错静默降级为检索）"}
+            # issue #303 O5：**格式非法**与「不存在」分开——非法形态用结构化
+            # error（invalid_node_id，判据单点 mdcos.valid_node_id，与写面
+            # add/restore 同一真源）；形态合法但不存在仍是协议登记的 null。
+            # 空串刻意留在 null 路（#274 裁定的显式 node_missing 形态，M2-B8/N3b
+            # 钉住；它不是「格式非法」的漏判，见 _node_view 上方 #525/#303 注释）。
+            if _nid:
+                from .mdcos import valid_node_id as _valid_node_id
+                if not _valid_node_id(_nid):
+                    return {"ok": False, "error": "invalid_node_id",
+                            "node_id": _nid,
+                            "hint": "node_id 形态非法（须匹配 "
+                                    "mdcg._NODE_ID_RE：1–128 字符的字母数字 _ . @ - "
+                                    "中文 逗号，且不含 '..'）：这不是「节点不存在」，"
+                                    "重试前请先校正 id；带原因取值用 get"}
+            _nv = _node_view(cg.get(_nid), offset=int(a.get("offset") or 0))
+            # issue #561 第①项（#553 可见性）：主库有旧值、队列里仍挂着针对**这个
+            # 节点**的待裁决提案时，读面必须同时给出这个事实——否则读者只看到旧值
+            # （DEFER 不冒充接受，但「有新值待复核」不可见）。无待复核提案时**不落键**
+            # （反恒真腿：字段存在即含义，不靠 true/false 区分）。
+            _pp = getattr(cg, "pending_proposals", None)
+            if isinstance(_nv, dict) and callable(_pp):
+                try:
+                    _pids = _pp(_nid)
+                except Exception:             # noqa: BLE001 —— 标注面失败不改读面结论
+                    _pids = []
+                if _pids:
+                    _nv = dict(_nv, pending_review=True, pending_proposals=_pids)
+            return _nv
+        q = a.get("query") or a.get("intent") or ""
+        # issue #303 O4：k 越界的信号单点（保留夹紧/切片行为，只在返回体加 warning）
+        _kwarn = _k_warning(_int_arg(a, "k", 20))
+        # 显式 0 也是「显式」（2026-09-24 修复）：旧写法 `if a.get("budget_tokens")`
+        # 把 0 当没传，静默换成 1200 —— 调用方以为「零预算」拿到的是满预算结果。
+        if a.get("budget_tokens") is not None:
+            # #188：`excerpt_strategy` 透传；#303 O4 的 k 越界 warning 仍走
+            # 下方 `_out` 后处理（两处改动正交——一个加参数、一个加返回体字段）。
+            _out = cg.recall(q, budget_tokens=int(a["budget_tokens"]),
+                             excerpt_strategy=a.get("excerpt_strategy") or "prefix",
+                             k=_int_arg(a, "k", 20), context=a.get("context"),
+                             goal_text=a.get("goal"),
+                             include_recent=bool(a.get("include_recent")),
+                             recent_limit=int(a.get("limit") or 10),
+                             session=a.get("session"),
+                             validity=a.get("validity"),
+                             **({"paths": ("bm25",)} if a.get("bm25", True) and hasattr(cg, "search_rrf") else {}), **_tkw)
+            # issue #653：budget 早退分支此前在过滤之前 return，exclude_doc 静默忽略。
+            if isinstance(_out, dict):
+                _pack2, _drop2 = drop_doc_nodes(
+                    _out.get("pack") or [], lambda it: (it or {}).get("id"),
+                    a.get("exclude_doc", False))
+                if _drop2:
+                    _out = dict(_out)
+                    _out["pack"] = _pack2
+                    _out["meta"] = _note_doc_filter(_out.get("meta"), _drop2,
+                                                    a.get("exclude_doc", False))
+            if _kwarn and isinstance(_out, dict):
+                _out = dict(_out)
+                _out["warning"] = _kwarn
+            return _out
+        from . import refindex
+        search_args = dict(layer=a.get("layer"), k=_int_arg(a, "k", 20),
+                           context=a.get("context"), session=a.get("session"),
+                           validity=a.get("validity"), **_tkw)
+        if a.get("bm25", True) and hasattr(cg, "search_rrf"):
+            ranked, meta = cg.search_rrf(q, paths=("bm25",), **search_args)
+            res = [(n, s, qual) for n, s, qual, _provenance in ranked]
+        else:
+            res, meta = cg.search(q, **search_args)
+        # read 面过滤 doc_ 索引节点（2026-10-23 使用者批准）：doc_ 为会话日志切片，
+        # 与真记忆卡同分（0.016）且占 top5 的 60–80%，稀释可达性。默认 true，可显式关。
+        # issue #653：判据收敛到 drop_doc_nodes（单一真源），不再就地手写第二条。
+        res, _excluded_doc = drop_doc_nodes(
+            res, lambda x: (x[0] or {}).get("id"), a.get("exclude_doc", False))
+        meta = _note_doc_filter(meta, _excluded_doc, a.get("exclude_doc", False))
+        _out = {"meta": meta, "results": [
+            {"node": _node_view(n), "score": s, "state": q2.get("state"),
+             "reason": q2.get("reason"), **refindex.ref_fields(n)}
+            for n, s, q2 in res]}
+        if _kwarn:
+            _out["warning"] = _kwarn
+        return _out
+
+    if op == "audit":
+        # 路线 C（2026-10-05，多主体世界模型对齐 v0.1 §4）：证据审计面——
+        # 只读组装器（md_cg/auditview.py），零写路径改动。node_id 类型闸与
+        # read 面同口径（类型错 ⇒ 结构化 error，不静默降级）；截断参数用
+        # `cap`（**故意不用 view/limit 等既有名**——view 已被 roleviews 占用，
+        # 设计稿复核修订的命名约束）。
+        _nid = a.get("node_id")
+        if not isinstance(_nid, str) or not _nid.strip():
+            return {"ok": False, "error": "node_id_not_str",
+                    "node_id": _nid, "got_type": type(_nid).__name__,
+                    "hint": "audit 需字符串 node_id（证据审计视图按节点组装）；"
+                            "要按关键词检索请改用 query（read）"}
+        from . import auditview
+        _cap = a.get("cap")
+        try:
+            _cap = int(_cap) if _cap is not None else auditview.DEFAULT_CAP
+        except (TypeError, ValueError):
+            _cap = auditview.DEFAULT_CAP
+        return auditview.build(cg, _nid, cap=max(1, min(64, _cap)))
+
+    # #303 设计边界裁定（O1/O2，保持现状并在此文档化；不改行为）：
+    #   O1 content 含 NUL **判合法**：六要素闸与 1MiB 闸都不含 NUL 判据，NUL 不
+    #      破坏六要素/正文结构，落盘与读回原样保留（本机实测：committed=true，
+    #      磁盘字节含 \x00，读回仅按既有写入纪律归一末尾换行）——故按「二进制
+    #      安全正文」口径保留。若将来要拒，属于**新增判据**（须连带六要素/体积闸
+    #      与守卫），不是修漏。
+    #   O2 未知 content_kind **不硬拒**：content_kind 是「内容类型提示」，不是
+    #      受枚举白名单校验的安全边界；audit 对未知类型判 BLINDSPOT，写链按
+    #      「宁转审不静默丢」转审核队列（实测 rm_rf → committed=false,
+    #      moved_to=review_queue, state=BLINDSPOT，未落主库）。这是有意取舍：
+    #      硬拒会让新类型在第一跳就断流，而转审保留人工裁决。
+    #   O3 op 缺失按签名推导：见 `_cg_call` 生效条件行——响应体带 op_derived=true
+    #      与 hint（已有文档化行为，保持现状）。
+    if op == "write":
+        # 写入路径拦截器链（Pi 钩子化移植，writepipe.py）：六道闸以扩展
+        # 形态注册于 writepipe.default_pipeline()，次序/启停不再硬编码于
+        # 本文件；新增闸门 = register_before 一行，即插即拔。
+        # 角色/层权限校验在 MdCGSecure.add 库层，结构上不可被拦截器绕过。
+        from .writepipe import default_pipeline
+        return default_pipeline().execute(cg, a)
+
+    if op == "goal":
+        act = (a.get("action") or "list").strip().lower()
+        if act == "add":
+            # issue #557 R2 残余（2026-10-19 复跑）：`op=goal` 是本类入口里**唯一**
+            # 仍不判写入硬上限的一条——1.26 MB 的 goal 会被受理并落出 2.5 MB 文件
+            # （goal 正文 + 台账两份）。判据与响应体仍走同一构造点 `_oversize_r2`
+            # （`oversize_response` 会量「除 content 外其余字段」的总字节，故 `goal`
+            # 这条分支天然被覆盖），不新增常量、不复制判据。
+            _ovg = _oversize_r2("", a)
+            if _ovg is not None:
+                return _ovg
+            # issue #426-H（2026-10-17 U05b，随 #439 同批修）：此前**没有**转发
+            # `sensitivity`——调用方显式传、服务端收下、然后静默丢掉 ⇒ 声明 private
+            # 的目标以 internal 明文落盘、访客可读（「显式声明静默失效」形态，与
+            # #186/#294 同族）。登记面（op_table 的 goal params）与转发面是同一件事
+            # 的两半，同批改，避免「声明了却做不到」。
+            gid = cg.add_goal(a.get("goal") or a.get("text") or "",
+                              priority=float(a.get("priority", 0.5)),
+                              deadline=a.get("deadline"),
+                              conditions=a.get("conditions") or "",
+                              action=a.get("action_hint") or "",
+                              tags=a.get("tags"),
+                              status=a.get("goal_status") or "active",
+                              sensitivity=a.get("sensitivity"))
+            return {"ok": True, "id": gid}
+        if act == "generate":
+            # W2 自主目标 · 盲区→目标生成器（**仅显式调用**；首版不进 sleep/sustain
+            # 自动循环——设计者裁定第 8 条）。默认 dry_run（apply 缺省 False，零落库）；
+            # apply=True 才按三区确认闸落台账/入审核队列/丢弃（裁定第 9 条白名单冻结）。
+            # 权限：批量落库（apply）与 insight.tickets 同构，须写权（无写权 fail-closed）。
+            from . import goal_gen
+            prin = getattr(cg, "principal", None)
+            apply = bool(a.get("apply"))
+            if prin is not None and apply and not bool(
+                    getattr(prin, "can_write", False)):
+                prin.require_admin("goal_generate")
+            _actor = getattr(prin, "actor", None) if prin is not None else None
+            return goal_gen.candidates(
+                cg, sources=a.get("sources"),
+                limit=int(a.get("limit") or goal_gen.DEFAULT_LIMIT),
+                apply=apply, actor=_actor)
+        if act in ("status", "set_status"):
+            return {"ok": True,
+                    "goal": cg.set_goal_status(a.get("node_id", ""),
+                                               a.get("goal_status") or "done")}
+        return {"goals": cg.list_goals(status=a.get("goal_status"),
+                                       limit=int(a.get("limit") or 20)),
+                "active": cg.active_goals(limit=int(a.get("limit") or 5))}
+
+    if op == "task":
+        return _task_call(cg, a)
+
+    if op == "recent":
+        act = (a.get("action") or "list").strip().lower()
+        if act in ("add", "append", "remember"):
+            return cg.remember_event(a.get("role") or "user",
+                                     a.get("text") or a.get("content") or "",
+                                     tags=a.get("tags"), meta=a.get("meta"),
+                                     window=int(a.get("window") or 200))
+        if act == "clear":
+            return {"cleared": cg.clear_recent()}
+        return {"events": cg.recent_events(limit=int(a.get("limit") or 20),
+                                           roles=a.get("roles"))}
+
+    if op == "state_event":
+        # L2 状态事件记账（P3 写口；设计稿 §2「事件是源、槽位是投影、查询走 stg」）。
+        # actor **恒取令牌**（不接受请求参数——沿本文件既有防伪造口径：客户端
+        # 不得改写归属）；台账是直写盘面的 append-only 文件、**绕过库层节点写闸**，
+        # 故在此显式补齐 require_write（缺了它：ops 白名单放行但 can_write=False
+        # 的令牌也能落盘）。kind 归一：空串归 None——「未分类」是合法记账，
+        # 而 append 对空串抛 ValueError。append 的 ValueError（缺 subject/slot、
+        # old/new 双空、非法 kind）原样上抛（fail-closed，不吞）。
+        from . import state_events as _se
+        _actor = _p.actor if _p is not None else "system"
+        if _p is not None:
+            _p.require_write("internal")
+        rec = _se.append(cg, a.get("subject"), a.get("slot"),
+                         old=a.get("old"), new=a.get("new"),
+                         kind=(a.get("kind") or "").strip() or None,
+                         seq=a.get("seq"),
+                         evidence=a.get("evidence") or "",
+                         actor=_actor)
+        return {"ok": True, "event": rec}
+
+    if op == "verify":
+        return cg.verify(a.get("node_id", ""), a.get("evidence", ""),
+                         a.get("verdict", ""),
+                         override=bool(a.get("override")))
+
+    if op == "review":
+        act = (a.get("action") or "list").strip().lower()
+        if act == "list":
+            return {"pending": cg.review_list()}
+        if act == "stats":
+            # 裁决动作分布（含 noop）：无此出口则「已评估、判定无需改动」这类
+            # 裁决只在 jsonl 里躺着，治理面看不到——与「静默忽略」等价。
+            return cg.review_stats()
+        if act == "rounds":
+            pid = a.get("pid", "")
+            return {"pid": pid, "rounds": cg.review_rounds(pid)}
+        if act == "records":
+            return {"records": cg.review_records(pid=a.get("pid"))}
+        # #71（2026-10-16）：三个**治理面** action——必须注册在下面的 `review_decide` **兜底之前**，
+        # 否则写成 backlog 会被当成「裁决一个 pid 为 backlog 的提案」（该兜底是既有形态，见本文件
+        # 「契约与实现漂移」注释；本批不改变它，只保证新 action 不落进去）。
+        if act == "backlog":
+            return cg.review_backlog()
+        if act == "preview":
+            return cg.review_preview(older_than_s=a.get("older_than_s"),
+                                     kind=a.get("kind"),
+                                     sensitivity=a.get("sensitivity"))
+        if act == "search":
+            return cg.review_search(a.get("query") or a.get("q") or "",
+                                    include_content=bool(a.get("include_content")))
+        if act in ("verify_record", "verify"):
+            return cg.verify_review_record(a.get("node_id", ""))
+        return cg.review_decide(a.get("pid", ""), a.get("decision", ""),
+                                edits=a.get("edits"), merge_into=a.get("merge_into"),
+                                reason=a.get("reason", ""),
+                                redteam=a.get("redteam"), issues=a.get("issues"),
+                                override=bool(a.get("override")))
+
+    if op == "forget":
+        if (a.get("action") or "forget").strip().lower() == "restore":
+            return cg.restore(a.get("node_id", ""), force=bool(a.get("force")),
+                             overwrite_live=bool(a.get("overwrite_live")))
+        # 三档自治批次②（设计 §三 D 删除）：工具面经 forget_gated——档位判定在
+        # 既有资格闸（not_found / protect.guard_forget）**之后**，变更确认档
+        # 出变更单且不软删；库层 forget 语义不变（脚本通道不接，本批边界）。
+        return cg.forget_gated(a.get("node_id", ""), a.get("reason", ""),
+                               override=bool(a.get("override")))
+
+    if op == "protect":
+        return _protect_call(cg, a)
+
+    if op == "identity":
+        return _identity_call(cg, a)
+
+    if op == "consistency":
+        return _consistency_call(cg, a)
+
+    if op == "metacognition":
+        return _metacognition_call(cg, a)
+
+    if op == "self_state":
+        return _self_state_call(cg, a)
+
+    if op == "evolution":
+        return _evolution_call(cg, a)
+
+    if op == "sustain":
+        return _sustain_call(cg, a)
+
+    if op == "scrub":
+        return _scrub_call(cg, a)
+
+    if op == "predict":
+        return _predict_call(cg, a)
+
+    if op == "causal":
+        return _causal_call(cg, a)
+
+    if op == "whitebox":
+        return _whitebox_call(cg, a)
+
+    if op == "index_code":
+        from . import refindex
+        from .security import check_path_root
+        root = a.get("path") or cg.root
+        # P1-X：path 是模型可控输入——索引会读取目录下全部
+        # 命中文件。根白名单与 ingest 的 P1-4 同语义：显式 path 越界即拒；
+        # 未传（回落服务器侧 cg.root）不校验，默认部署行为不变。
+        check_path_root(a.get("path"), "MDCG_INGEST_ROOT", "index_code")
+        if not os.path.isdir(root):
+            return {"ok": False, "error": f"目录不存在：{root}"}
+        # 写序（commit=False → add_items 成功后再 save）：水位是**派生物的水位**，
+        # 必须落在「节点已写成功」之后。否则进程在两步之间被杀，会留下
+        # 「水位新 + 节点旧」——下次巡检按水位判「未变、可跳过」，漂移静默漏报。
+        # 反过来（节点新 + 水位旧）只会让下次增量重切该文件，是安全方向。
+        # add/覆写是同步 atomic_write（mdcg.py:1915→2429-2436），故先后真的成立。
+        led = refindex.Ledger(cg.root)
+        items, errors, stats = refindex.index_dir(
+            root, kind="code_ref", patterns=a.get("patterns"),
+            max_files=int(a.get("max_files") or 500),
+            max_items=int(a.get("max_items") or 2000),
+            incremental=bool(a.get("incremental")),
+            skip_dirs=a.get("skip_dirs"),
+            ledger=led, commit=False)
+        _cf = []                         # #352-E：同 id 已被另一个源根占用 ⇒ 不覆写
+        ids, _sens = refindex.add_items(cg, items, kind="code_ref", root=root,
+                                        layer=a.get("layer"), conflicts=_cf)
+        # 冲突的源文件**水位一并丢掉**：否则下次增量把它判成「未变」跳过，
+        # 冲突从此不可见、被覆写的节点也补不回来（#352-E）。
+        for _c in _cf:
+            led.drop(_c.get("src") or os.path.join(root, _c.get("path") or ""))
+        led.save()                       # 节点已落盘 → 水位随后（两步之间被杀即安全方向）
+        note = ("只索引注释/接口（AST 已校验），未存完整代码；"
+                "正文用 frontmatter.code_ref + op=ref 指回源文件。"
+                "skipped_suffixes 是扫到但**没有提取器**的后缀，用于审计覆盖缺口")
+        out = {"ok": True, "indexed": len(ids), "error_count": len(errors),
+               "errors": errors[:10], "ids": ids[:20],
+               "files": stats["files"], "truncated": stats["truncated"],
+               "skipped_unchanged": stats.get("skipped_unchanged", 0),
+               "skipped_suffixes": stats["skipped_suffixes"], "note": note}
+        out.update(_skip_dirs_report(stats))
+        if stats["truncated"]:
+            # 截断必须显式说出来：以前静默 return，调用方以为索引是完整的。
+            out["truncated_reason"] = stats["truncated_reason"]
+            out["note"] = (f"⚠ 索引被截断，结果不完整（{stats['truncated_reason']}），"
+                           f"调大 max_files/max_items 后重跑。" + note)
+        if _cf:                          # #352-E：冲突不静默——回执里点名
+            out["conflict_count"] = len(_cf)
+            out["conflicts"] = _cf[:20]
+            out["note"] = (out["note"] + " ⚠ 有 %d 条条目因节点 id 已被**另一个源根**"
+                           "占用而未写入（#352-E）：改 id 键会动存量 id 的稳定性，"
+                           "属单独立项，本轮只止血——多仓同名节点暂时只保留先索引"
+                           "的一侧。" % len(_cf))
+        out["pruned"] = _prune_after_index(cg, a, kind="code_ref", root=root,
+                                           items=items, stats=stats)
+        return out
+
+    if op == "index_doc":
+        from . import refindex
+        from .security import check_path_root
+        root = a.get("path") or cg.root
+        # P1-X：与 index_code 同族——path 模型可控，根白名单
+        # 越界即拒；未传（回落 cg.root）不校验，默认部署行为不变。
+        check_path_root(a.get("path"), "MDCG_INGEST_ROOT", "index_doc")
+        if not os.path.isdir(root):
+            return {"ok": False, "error": f"目录不存在：{root}"}
+        layer = a.get("layer") or "knowledge"
+        # 显式改密级时必须全量重切（增量会跳过未变文件、覆盖不生效）。
+        incremental = bool(a.get("incremental")) and not a.get("sensitivity")
+        # 写序同 op=index_code：commit=False → 节点写成功后 led.save()。
+        led = refindex.Ledger(cg.root)
+        items, errors, stats = refindex.index_dir(
+            root, kind="doc_ref", patterns=a.get("patterns"),
+            max_files=int(a.get("max_files") or 500),
+            max_items=int(a.get("max_items") or 2000),
+            incremental=incremental, skip_dirs=a.get("skip_dirs"),
+            ledger=led, commit=False)
+        _cf = []                         # #352-E：同 id 已被另一个源根占用 ⇒ 不覆写
+        ids, sens_counts = refindex.add_items(
+            cg, items, kind="doc_ref", root=root, layer=layer,
+            sensitivity=a.get("sensitivity"), conflicts=_cf)
+        for _c in _cf:                   # 同上：冲突源文件的水位一并丢掉
+            led.drop(_c.get("src") or os.path.join(root, _c.get("path") or ""))
+        led.save()
+        note = ("只索引章节（level<=3）的标题与摘要，未存全文；正文用 "
+                "frontmatter.doc_ref + op=ref 回读。layer 与密级按计划 §1.3-3 "
+                "显式声明（默认 knowledge / internal，路径命中私有提示降为 "
+                "private），不依赖节点默认值")
+        out = {"ok": True, "indexed": len(ids), "error_count": len(errors),
+               "errors": errors[:10], "ids": ids[:20], "files": stats["files"],
+               "truncated": stats["truncated"],
+               "skipped_unchanged": stats.get("skipped_unchanged", 0),
+               "skipped_suffixes": stats["skipped_suffixes"],
+               "layer": layer, "sensitivity": sens_counts, "note": note}
+        out.update(_skip_dirs_report(stats))
+        if stats["truncated"]:
+            out["truncated_reason"] = stats["truncated_reason"]
+            out["note"] = (f"⚠ 索引被截断，结果不完整（{stats['truncated_reason']}），"
+                           f"调大 max_files/max_items 后重跑。" + note)
+        if _cf:                          # #352-E：冲突不静默——回执里点名
+            out["conflict_count"] = len(_cf)
+            out["conflicts"] = _cf[:20]
+            out["note"] = (out["note"] + " ⚠ 有 %d 条条目因节点 id 已被**另一个源根**"
+                           "占用而未写入（#352-E）：改 id 键会动存量 id 的稳定性，"
+                           "属单独立项，本轮只止血——多仓同名节点暂时只保留先索引"
+                           "的一侧。" % len(_cf))
+        out["pruned"] = _prune_after_index(cg, a, kind="doc_ref", root=root,
+                                           items=items, stats=stats)
+        return out
+
+    if op == "ref":
+        return _ref_call(cg, a)
+
+    if op == "session":
+        return _session_call(cg, a)
+
+    if op == "ingest":
+        return _ingest_call(cg, a)
+
+    if op == "export":
+        return _export_call(cg, a)
+
+    if op == "maintain":
+        return _maintain_call(cg, a)
+
+    if op == "consolidate":
+        return _consolidate_call(cg, a)
+
+    if op == "insight":
+        return _insight_call(cg, a)
+
+    if op == "ccg":
+        return _ccg_call(cg, a)
+
+    raise ValueError(f"cg 未知 op：{op}")
+
+
+# 公开别名：供 hive 侧引用，勿再直接引用私有名
+cg_dispatch = _cg_dispatch
+
+
+# 生效条件：由 _cg_dispatch 在 op=="ccg" 时进入；action 取 a.get("action") 缺省 "compile"；compile 只产出候选（落 _ccgc_pending/ 待复核、不当场写库），link 才准入落库，attest/recalibrate 须编外验证方且 verifier != compiled_by（E041/E042/E043 机械把关）；
+def _ccg_call(cg, a):
+    """CCG 六要素编译器（op=ccg）：对话记录 → 六要素候选 → **编外复核** → 落库。
+
+    定位：**记忆可靠性闸**——不是又一个写入通道，而是写入前「条件是否成立」的检查。
+    裁定 A（LLM 不得自己验证自己）由 ccgc 的 E041 机械执行，不依赖 prompt 自觉。
+    阻断强度如实分层（issue #27）：身份归一比较拦截同源字符串变体；根本保障是
+    verifier_token 凭据（mdcg 令牌 HMAC 验签）——无令牌时签章标
+    verifier_identity="self-reported"，下游策略可据此识别可信级别。
+
+    action（缺省 compile）：
+        compile      对话记录 → 六要素候选（五环编译）；候选+签章槽落
+                    `_ccgc_pending/<node_id>.json`（**不当场写库**）
+        review       派发编外复核单元：**蜂巢 reflect/verify 优先** → 不可用则提示配置
+                    → 显式 allow_degrade 才降级 harness 端子代理；拿到裁决即自动签章
+        attest       外部裁决签章（verifier 须 != compiled_by；E041/E042 机械把关）
+        link         读回候选+签章 → 准入校验 → apply=True 落库（成功后清 pending）
+        recalibrate  四槽修正（须编外验证方；E043 只放开 condition_space 四槽）
+        units        复核通道体检/计划（hive → 提示配置 → 子代理 三级链）
+        catalog      引擎自描述（错误码/契约角色/动作清单）
+
+    入参集中在 `ccg` 对象里（与 `redteam`/`verify` 同风格）——避免与既有扁平参数
+    重名（如 `verdict` 在 verify 面是 confirmed|weakened|falsified，语义不同）。
+
+    返回语义：`ok` 表示**本次请求本身**是否成立；`verdict` 是单元给出的裁决
+    （未复核为 None）；`passed` = 裁决为 ACCEPT。三者分开，避免「派发成功」
+    被误读成「复核通过」。
+
+    权限：编译器属写路径 → 记录/设计者角色可用（见 tokens.ALL_OPS 的 ccg 条目）。
+    attest/link 的准入**不靠 admin 闸**，而靠签章机械闸（E040/E041/E042）——理由：
+    默认部署（未设 MDCG_CAN_ADMIN）下再加 admin 会让编译器对使用者不可见
+    （「权限到位但通路不可见」是既有教训），而裁定 A 的保证本就在机械闸里。
+    """
+    from . import ccgc
+    from . import units as _units
+
+    o = a.get("ccg") or {}
+    # 第 17 条 D 案：`autostart` 已从模型可达工具面移除，模型侧携带即显式拒绝。
+    if not isinstance(o, dict) or (set(_CCG_REMOVED_PARAMS) & set(o)):
+        return _ccg_param_gate(o)
+    act = str(o.get("action") or a.get("action") or "compile").strip().lower()
+    node_id = str(o.get("node_id") or a.get("node_id") or "").strip()
+    actor = str(getattr(getattr(cg, "principal", None), "actor", "") or o.get("actor") or "agent")
+    jobs = str(o.get("jobs") or "")
+
+    if act == "catalog":
+        return {"ok": True, "op": "ccg", "action": "catalog",
+                "actions": ["compile", "review", "attest", "link", "recalibrate",
+                            "units", "catalog"],
+                "states": list(ccgc.STATES), "contract_roles": list(ccgc.CONTRACT_ROLES),
+                "errors": dict(ccgc.E_CODES),
+                "rule": "裁定 A：验证方标识不得等于编译执行者（E041）；缺签章不写库（E040）；"
+                        "未通过不写库（E042）"}
+
+    if act == "units":
+        if o.get("doctor"):
+            return {"ok": True, "op": "ccg", "action": "units", **_units.doctor(jobs)}
+        p = _units.plan(jobs=jobs, model=o.get("model") or "",
+                        allow_degrade=bool(o.get("allow_degrade")),
+                        channel=o.get("channel") or "")
+        return {"ok": True, "op": "ccg", "action": "units", **p}
+
+    if act == "compile":
+        dialog = str(o.get("dialog") or o.get("content") or a.get("content") or "")
+        if not dialog.strip():
+            return {"ok": False, "op": "ccg", "action": "compile",
+                    "error": "缺对话记录：传 ccg.dialog（或顶层 content）"}
+        if not node_id:
+            return {"ok": False, "op": "ccg", "action": "compile",
+                    "error": "缺 node_id：六要素候选须指明目标节点"}
+        res = ccgc.compile_dialog(dialog, node_id, actor,
+                                  marks=o.get("marks"), slots=o.get("slots"),
+                                  strict_spans=bool(o.get("strict_spans", True)), cg=cg)
+        saved = ccgc.save_pending(cg, res)
+        return {"ok": bool(res.success), "op": "ccg", "action": "compile",
+                "compiled": ccgc.asdict(res), "pending": saved,
+                "actor": actor, "compiled_by": actor,
+                "hint": ("候选已落 pending；下一步 cg(op=ccg, action=review, "
+                         "ccg={node_id, blocking:true}) 交编外单元复核"
+                         "——编译者不得自证（E041）" if res.success else
+                         "编译未通过：" + (res.errors[0] if res.errors else "未知错误"))}
+
+    if act == "review":
+        got = ccgc.load_pending(cg, node_id)
+        if not got.get("ok") or not got.get("hash_ok"):
+            return {"ok": False, "op": "ccg", "action": "review",
+                    "error": got.get("error") or "pending 产物与编译时不一致（hash 不符）",
+                    "hint": "先 cg(op=ccg, action=compile, ccg={node_id, dialog}) 生成候选"}
+        compiled = got["compiled"]
+        role = str(o.get("role") or _units.REFLECT).strip().lower()
+        prompt = _units.prompt_for(role, compiled, dialog=str(o.get("dialog") or ""))
+        # 第 17 条 D 案：不再透传 autostart（模型面已移除；能力留代码内/部署侧通道）。
+        r = _units.review(prompt=prompt, role=role, node_id=node_id, jobs=jobs,
+                          model=o.get("model") or "",
+                          timeout_s=int(o.get("timeout_s") or _units.DEFAULT_TIMEOUT_S),
+                          allow_degrade=bool(o.get("allow_degrade")),
+                          channel=o.get("channel") or "",
+                          wait_s=float(o.get("wait_s") or _units.DEFAULT_TIMEOUT_S),
+                          blocking=bool(o.get("blocking")), cg=cg, actor=actor)
+        unit = r.get("unit")
+        out = {"ok": True, "op": "ccg", "action": "review", "state": r["state"],
+               "role": role, "node_id": node_id, "job_id": r.get("job_id"),
+               "transport": r.get("transport"), "verdict": (unit or {}).get("verdict"),
+               "passed": bool((unit or {}).get("verdict") == ccgc.ACCEPT),
+               "unit": unit, "channel": r.get("channel") or "",
+               "blocking": bool(o.get("blocking")), "hint": r.get("hint") or ""}
+        if r["state"] != _units.HIVE:
+            out["ok"] = False
+            out["prompt"] = r.get("prompt")      # 降级/配置路径：把复核请求包交回调用方
+            return out
+        if unit:                                  # 已获编外裁决 → 自动签章
+            args = r.get("attest") or {}
+            at = ccgc.attest(node_id, args.get("verdict") or ccgc.DEFER,
+                             args.get("verifier") or "", compiled.actor or actor,
+                             slot_corrections=args.get("slot_corrections"),
+                             evidence=args.get("evidence") or "", cg=cg,
+                             verifier_token=str(args.get("verifier_token") or ""))
+            out["attest"] = ccgc.asdict(at)
+            out["pending"] = ccgc.save_pending(cg, compiled, at)
+            out["hint"] = ("已签章（%s）；下一步 cg(op=ccg, action=link, "
+                           "ccg={node_id, apply:true}) 落库"
+                           % (args.get("verifier") or "-") if at.ok else
+                           "签章未通过：" + (at.error or "DEFER/REJECT 不构成准入"))
+        return out
+
+    if act == "attest":
+        got = ccgc.load_pending(cg, node_id)
+        if not got.get("ok") or not got.get("hash_ok"):
+            return {"ok": False, "op": "ccg", "action": "attest",
+                    "error": got.get("error") or "pending 产物与编译时不一致（hash 不符）",
+                    "hint": "先 cg(op=ccg, action=compile, ...) 生成候选"}
+        compiled = got["compiled"]
+        at = ccgc.attest(node_id, str(o.get("verdict") or ""),
+                         str(o.get("verifier") or ""),
+                         str(o.get("compiled_by") or compiled.actor or actor),
+                         slot_corrections=o.get("slot_corrections"),
+                         evidence=str(o.get("evidence") or ""), cg=cg,
+                         verifier_token=str(o.get("verifier_token") or ""))
+        return {"ok": bool(at.ok), "op": "ccg", "action": "attest",
+                "attest": ccgc.asdict(at),
+                "pending": ccgc.save_pending(cg, compiled, at),
+                "hint": ("签章通过；下一步 cg(op=ccg, action=link, ccg={node_id, apply:true})"
+                         if at.ok else "签章未通过：" + (at.error or "DEFER/REJECT 不构成准入"))}
+
+    if act == "link":
+        apply = bool(o.get("apply"))
+        res = ccgc.link_pending(cg, node_id, apply=apply, actor=actor,
+                                basis=str(o.get("basis") or "ccgc link"))
+        return {"ok": bool(res.ok), "op": "ccg", "action": "link", "apply": apply,
+                "link": ccgc.asdict(res),
+                "hint": ("已落库（entry_id=%s，written=%s）" % (res.entry_id, res.written)
+                         if res.ok and apply else
+                         ("准入通过（dry_run 未写库）；apply=true 才落库" if res.ok else
+                          "；".join(res.errors or []) or "准入未通过"))}
+
+    if act == "recalibrate":
+        corr = o.get("slot_corrections") or o.get("corrections") or {}
+        verifier = str(o.get("verifier") or "").strip()
+        compiled_by = str(o.get("compiled_by") or "").strip()
+        if not verifier or verifier == compiled_by:
+            return {"ok": False, "op": "ccg", "action": "recalibrate",
+                    "error": "E041 自证拒绝：recalibrate 须由编外验证方给出"
+                             "（verifier 必填且 != compiled_by）"}
+        res = ccgc.recalibrate(node_id, corr, verifier, compiled_by,
+                               evidence=str(o.get("evidence") or ""), cg=cg,
+                               apply=bool(o.get("apply")))
+        return {"ok": bool(res.ok), "op": "ccg", "action": "recalibrate",
+                "recalibrate": ccgc.asdict(res),
+                "hint": ("；".join(res.errors or []) or "修正已应用（apply=true）" if res.ok
+                         else "；".join(res.errors or []) or "修正未通过")}
+
+    return {"ok": False, "op": "ccg", "action": act,
+            "error": "ccg 未知 action：%s（可选 compile|review|attest|link|recalibrate|"
+                     "units|catalog）" % act}
+
+
+# 生效条件：act=(a.get("action") or "recall").strip().lower()；act=="note" 时若 principal 非 None 且其 can_write 为假先 require_admin("session_note")，再调 cg.session_note(summary/text/content 之一或 ""，importance=float(0.6 if a.get("importance") is None else a.get("importance")) 等)；act=="recall" 时调 cg.session_recall(...)；act=="compact" 时若 a.get("note") 为真且 principal 非 None 且无写权先 require_admin("session_compact")，再调 cg.session_compact(...)；其余 act 抛 ValueError。
+def _session_call(cg, a):
+    """会话三件套（P0）：note 写要点 / recall 续接 / compact 压摘要。
+
+    定位：hook 缺失时的**库侧替代**——载体负责「何时自动做」，库保证
+    「一次调用就够用」。权限：note 与 compact(note=True) 属写入 → can_write；
+    recall 只读（output 角色可用）。
+    """
+    act = (a.get("action") or "recall").strip().lower()
+    principal = getattr(cg, "principal", None)
+    if act == "note":
+        if principal is not None and not getattr(principal, "can_write", False):
+            principal.require_admin("session_note")   # 无写权 → 抛 AccessDenied
+        imp = a.get("importance")
+        return cg.session_note(
+            a.get("summary") or a.get("text") or a.get("content") or "",
+            session=a.get("session"), tags=a.get("tags"),
+            layer=a.get("layer") or "contextual",
+            importance=float(0.6 if imp is None else imp),
+            sensitivity=a.get("sensitivity"), conditions=a.get("conditions"),
+            basis=a.get("basis") or "data")
+    if act == "recall":
+        return cg.session_recall(
+            session=a.get("session"), limit=int(a.get("limit") or 5),
+            recent_limit=int(a.get("recent_limit") or 10),
+            # `is not None`：显式 0 不再被吞成默认 1200（2026-09-24 修复）
+            budget_tokens=int(a["budget_tokens"])
+            if a.get("budget_tokens") is not None else 1200,
+            include_state=bool(a.get("include_state", True)))
+    if act == "compact":
+        if a.get("note") and principal is not None \
+                and not getattr(principal, "can_write", False):
+            principal.require_admin("session_compact")
+        imp = a.get("importance")
+        return cg.session_compact(
+            session=a.get("session"), limit=int(a.get("limit") or 40),
+            max_points=int(a.get("max_points") or 8), note=bool(a.get("note")),
+            importance=float(0.5 if imp is None else imp))
+    raise ValueError(f"session 未知 action：{act}（允许 note/recall/compact）")
+
+
+# 生效条件：flag=a.get("prune", True)，flag 为字符串时重算为 flag.strip().lower() not in ("false","0","no","off","")；若 not flag 或 stats.get("truncated") 为真则返回 None；否则返回 refindex.prune_orphans(cg, kind=kind, root=root, items=items, dry_run=bool(a.get("prune_dry_run"))).
+def _prune_after_index(cg, a, *, kind, root, items, stats):
+    """索引后的**节点级对账**：清退「同 root + 同 path 的过期代」。
+
+    存在理由：`node_id` 含 heading_path，文档一改标题整篇 id 重算，而
+    `add_items` 只做**同 id 幂等 upsert**——不补这步，旧代节点与新代并存，
+    同一文档被召回两份（旧代引用的区间往往已失效）。水位层 `reconcile`
+    只剪水位条目、不剪节点，所以必须在索引后显式清。
+
+    开关：`prune=false` 关闭；`prune_dry_run=true` 只列清单不落删除；
+    截断时一律跳过（没扫完 ≠ 剩下的都过期）。
+    """
+    from . import refindex
+    flag = a.get("prune", True)
+    if isinstance(flag, str):
+        flag = flag.strip().lower() not in ("false", "0", "no", "off", "")
+    if not flag or stats.get("truncated"):
+        return None
+    return refindex.prune_orphans(
+        cg, kind=kind, root=root, items=items,
+        dry_run=bool(a.get("prune_dry_run")))
+
+
+# 生效条件：sd=list(stats.get("skipped_dirs") or [])，返回 {"skipped_dirs": sd[:limit], "skipped_dirs_count": len(sd), "skip_dirs": list(stats.get("skip_dirs") or [])}，且仅当 len(sd)>limit 时追加 skipped_dirs_note。
+def _skip_dirs_report(stats, limit=20):
+    """把「本次被 skip_dirs 排掉的目录」压成可审计字段。
+
+    与截断同一纪律——**不许静默**：调用方据此能把「源文件真的少了」与「被规则
+    排掉了」区分开。目录多时只回前 `limit` 个并给出总数，避免回报体被噪声撑爆。
+    """
+    sd = list(stats.get("skipped_dirs") or [])
+    out = {"skipped_dirs": sd[:limit], "skipped_dirs_count": len(sd),
+           "skip_dirs": list(stats.get("skip_dirs") or [])}
+    if len(sd) > limit:
+        out["skipped_dirs_note"] = f"另有 {len(sd) - limit} 个被排除目录未列出"
+    return out
+
+
+# 生效条件：先经 check_path_root(a.get("path"), "MDCG_INGEST_ROOT", "ingest")（path 空时放行；env 未配置走三级回落链、不再放开，越界抛 PermissionError；2026-10-10 裁定 dsh #85 选 A）；act=(a.get("action") or "stat").strip().lower()；act 属 ("file","dir","jsonl") 且 principal 非 None 且其 can_write 为假时先 require_admin(f"ingest_{act}")，随后以 action=act 及各透传参数调 sources.run 并返回。
+def _ingest_call(cg, a):
+    """文件摄取分派（P0）：file / dir / jsonl / stat。
+
+    权限：写链（file/dir/jsonl）需 can_write；stat 只读。
+    支持 dry_run 预演（对应计划「可预演」要求）。
+    """
+    from . import sources
+    from .security import check_path_root
+    act = (a.get("action") or "stat").strip().lower()
+    # issue #351（2026-10-16 DSH 端）：dir 的**空 path 不得回落记忆库根**——库根下
+    # 是各层节点文件、trash/、_protected_history/，把它们当外部文档切成 doc_ref
+    # 节点会 (a) 把 restricted 正文抄进 internal 节点（访客可检索）、(b) 把已
+    # forget 并 accept 删除的节点复活。缺省根改由 MDCG_INGEST_ROOT 显式给，
+    # 且**在白名单检查之前**解析，让 env 值照过 check_path_root。
+    _p351 = a.get("path")
+    if act == "dir" and not (_p351 or "").strip():
+        _p351 = os.environ.get("MDCG_INGEST_ROOT") or ""
+        if _p351:
+            a = dict(a, path=_p351)
+    # P1-4（批次 26）：ingest 的 path 是模型可控输入——根白名单约束
+    # （MDCG_INGEST_ROOT 设置时越界即拒；未设置保持现状）
+    check_path_root(_p351, "MDCG_INGEST_ROOT", "ingest")
+    principal = getattr(cg, "principal", None)
+    if act in ("file", "dir", "jsonl") and principal is not None \
+            and not getattr(principal, "can_write", False):
+        principal.require_admin(f"ingest_{act}")      # 无写权 → 抛 AccessDenied
+    return sources.run(
+        cg, action=act, path=_p351, layer=a.get("layer"),
+        sensitivity=a.get("sensitivity"), patterns=a.get("patterns"),
+        max_files=a.get("max_files"), max_items=a.get("max_items"),
+        incremental=a.get("incremental"), dry_run=a.get("dry_run"),
+        max_events=a.get("max_events"))
+
+
+# 生效条件：先经 require_admin("export_{act}")（principal 非 None 时）与 check_path_root(a.get("out"), "MDCG_EXPORT_ROOT", "export")（env 未设置或 out 空时放行，越界抛 PermissionError）；act=(a.get("action") or "stat").strip().lower()；principal 非 None 时一律先 require_admin(f"export_{act}")，随后以 include_content=True if a.get("include_content") is None else bool(a.get("include_content")) 等参数调 _ex.run 并返回。
+def _export_call(cg, a):
+    """全库导出（P0）：graph / nodes / slice / stat。
+
+    导出整库属**管理操作** → 一律 require_admin（designer 专属）。
+    """
+    from . import export as _ex
+    from .security import check_path_root
+    act = (a.get("action") or "stat").strip().lower()
+    principal = getattr(cg, "principal", None)
+    if principal is not None:
+        principal.require_admin(f"export_{act}")
+    # P1-4（批次 26）：export 的 out 是写路径——根白名单约束
+    check_path_root(a.get("out"), "MDCG_EXPORT_ROOT", "export")
+    # issue #85 建议 3（2026-10-09 DSH 端）：**export 默认不得覆盖已存在文件**。
+    # 原实现直接写 out + ".tmp" 再 publish 改名 ⇒ 传一个**已有文件**的路径即被静默覆盖
+    # （issue 实测：designer 令牌 cg(op=export, out=<根外已有文件>) → ok:true，原文件被覆盖）。
+    # 处置：目标已存在即拒，并给出**显式逃生口** overwrite=true（不改变常规用法——
+    # 不传 out 时走 _default_out 带时间戳，本就不冲突）。
+    _out85 = a.get("out")
+    # issue #211：管理员 overwrite=true 也不得把导出写进 _keys.json / 层目录 /
+    # 辅助根（自伤面：覆写密钥库后整库 private 永久不可解）。
+    if _out85:
+        from .security import check_export_target
+        check_export_target(_out85, cg.root, "export", allow_overwrite=True)
+    if _out85 and os.path.exists(_out85) and not a.get("overwrite"):
+        raise PermissionError(
+            "export 目标已存在：%s（如确要覆盖，请显式传 overwrite=true）" % _out85)
+    inc = a.get("include_content")
+    return _ex.run(
+        cg, action=act, out=a.get("out"), ids=a.get("ids"),
+        layer=a.get("layer"), since=a.get("since"), until=a.get("until"),
+        tag=a.get("tag"), limit=a.get("limit"),
+        include_content=True if inc is None else bool(inc))
+
+
+# 生效条件：act=(a.get("action") or "stat").strip().lower()，apply=bool(a.get("apply"))，mode=str(a.get("mode") or "").strip().lower()；principal 非 None 时对 act=="rollback"、act in ("importance","separate") 且 apply、act=="longterm" 且 apply、act=="prefeed" 且 a.get("write") 真且无写权、act in ("backfill","cap","exempt") 且 apply、act in ("backfill_rollback","cap_rollback","exempt_rollback")、act=="vision_evidence" 且 apply、act=="vision_evidence_rollback"、act=="refine" 且 apply 分别 require_admin；随后 act=="longterm" 且 mode in ("list","ls","show","read") 时仅以 action/mode/limit/snapshot_id 调 cg.maintain，否则以全部参数调 cg.maintain。
+def _maintain_call(cg, a):
+    """记忆维护（P1）：importance / longterm / prefeed / separate / rollback / stat / propagate / reload。
+
+    权限**按 action 分档**（比整 op 收窄更贴合语义）：
+      · 只读（stat / history / longterm mode=list|show / reload 读面代际刷新）→ 不额外拦截；
+      · 写入侧闸门（prefeed write=True）→ 需 can_write；
+      · 批量改写（importance / separate / longterm 的 apply，以及 rollback 本身
+        即反向写入、无 dry-run 语义）→ require_admin。
+    注意：**dry-run 不等于写入**——importance / separate 的预演只出报表、不改盘，
+    因此对持有 maintain 授权的写层角色放行，使其能先看清影响面再请示管理层。
+    """
+    act = (a.get("action") or "stat").strip().lower()
+    principal = getattr(cg, "principal", None)
+    apply = bool(a.get("apply"))
+    mode = str(a.get("mode") or "").strip().lower()
+    actor = getattr(principal, "actor", None) if principal is not None else None
+    # P4 可验证记忆单元（2026-09-19）：**多跳**失效传播巡检（写路径只做一跳同步，
+    # 保写入延迟恒定——多跳的重算成本交给巡检面）。
+    #   · 预演（默认 apply=False）→ 只出可达集报表，放行写层角色先看影响面；
+    #   · apply=True → 直接改写下游验证态（同步写盘）→ 管理操作。
+    if act == "propagate":
+        from . import trust as _trust
+        if apply and principal is not None:
+            principal.require_admin("maintain_propagate")
+        rep = _trust.propagate(cg, apply=apply,
+                               max_nodes=int(a.get("max_nodes") or 500),
+                               actor=actor or "patrol")
+        rep.update({"op": "maintain", "action": "propagate"})
+        return rep
+    if principal is not None and act == "rollback":
+        principal.require_admin("maintain_rollback")
+    if principal is not None and act in ("importance", "separate") and apply:
+        principal.require_admin(f"maintain_{act}")
+    if principal is not None and act == "longterm" and apply:
+        principal.require_admin("maintain_longterm")
+    if principal is not None and act == "prefeed" and a.get("write") \
+            and not getattr(principal, "can_write", False):
+        principal.require_admin("maintain_prefeed_write")
+    # 真实库对齐（P32）：backfill/cap 的 apply 与 rollback 都直接改写 md → 管理操作；
+    # 预演（plan）与留痕查询只出报表/读日志，放行写层角色以便先看影响面。
+    if principal is not None and act in ("backfill", "cap", "exempt") and apply:
+        principal.require_admin(f"maintain_{act}")
+    if principal is not None and act in ("backfill_rollback", "cap_rollback",
+                                         "exempt_rollback"):
+        principal.require_admin(f"maintain_{act}")
+    # G5 视觉证据回填：apply 直接改写 md 证据面 → 管理操作；rollback 反向写入同样
+    # 需管理层；预演（plan）与留痕查询只出报表/读日志，放行写层角色。
+    if principal is not None and act == "vision_evidence" and apply:
+        principal.require_admin("maintain_vision_evidence")
+    if principal is not None and act == "vision_evidence_rollback":
+        principal.require_admin("maintain_vision_evidence_rollback")
+    # G6 提炼抽检：plan/gate/history 只读；apply 只追加抽检留痕（不改节点），
+    # 但它决定后续是否放行**扩批**（真写节点由 consolidate.induce 另批承担），
+    # 故按管理面处理——写层角色可先看工单/预演，改判需管理层。
+    if principal is not None and act == "refine" and apply:
+        principal.require_admin("maintain_refine")
+    if act == "longterm" and mode in ("list", "ls", "show", "read"):
+        return cg.maintain(action="longterm", mode=mode,
+                           limit=a.get("limit"), snapshot_id=a.get("snapshot_id"))
+    return cg.maintain(
+        action=act, layer=a.get("layer"), limit=a.get("limit"), apply=apply,
+        min_delta=a.get("min_delta"), max_rows=a.get("max_rows"),
+        force=bool(a.get("force")), keep=a.get("keep"), mode=a.get("mode"),
+        snapshot_id=a.get("snapshot_id"), batch=a.get("batch"),
+        entry_ids=a.get("entry_ids"),
+        content=a.get("content") or a.get("text") or a.get("summary"),
+        role=a.get("role"),
+        verification_basis=a.get("basis") or a.get("verification_basis"),
+        importance_hint=a.get("importance"), node_id=a.get("node_id"),
+        write=bool(a.get("write")), min_jaccard=a.get("min_jaccard"),
+        ids=a.get("ids"), actor=actor, include_partial=a.get("include_partial"),
+        # issue #315/#313（审阅 B1「正确落点」）：action=prefeed 的调用方声明
+        # 密级在此前**整条丢失**——本分派不读 a["sensitivity"]，下游
+        # maintain 也没有该形参 ⇒ MERGE 裁决时 reinforce 收 None，
+        # merge_downgrades(target, None) 恒 False ⇒ 声明 private 的正文以
+        # 明文聚合行并入 internal 节点（隔离沙箱实测）。现逐级透传到
+        # cg.prefeed 的两条落库支（add / reinforce）。
+        sensitivity=a.get("sensitivity"),
+        min_conf=a.get("min_conf"), basis_text=a.get("basis_text"),
+        prefixes=a.get("prefixes"), aeis_root=a.get("aeis_root"),
+        sample_n=a.get("sample_n"), prefix=a.get("prefix"),
+        verdicts=a.get("verdicts"), reason=a.get("reason"))
+
+
+# 生效条件：act=(a.get("action") or "promote").strip().lower()；principal 非 None 时一律先 require_admin(f"consolidate_{act}")；imp=a.get("min_importance")，为 None 时回落为 a.get("importance")，随后以 imp 等参数调 cg.consolidate_run 并返回。
+def _consolidate_call(cg, a):
+    """离线固化（P1）：promote / promote_rollback / promote_history。
+
+    批量提升属**管理操作** → 一律 require_admin（designer 专属）。
+    """
+    act = (a.get("action") or "promote").strip().lower()
+    principal = getattr(cg, "principal", None)
+    if principal is not None:
+        principal.require_admin(f"consolidate_{act}")
+    imp = a.get("min_importance")
+    if imp is None:
+        imp = a.get("importance")
+    return cg.consolidate_run(
+        action=act, source_layer=a.get("source_layer"),
+        target_layer=a.get("target_layer"), min_merge=a.get("min_merge"),
+        min_importance=imp, require_conditions=a.get("require_conditions"),
+        min_cluster=a.get("min_cluster"), min_jaccard=a.get("min_jaccard"),
+        max_nodes=a.get("max_nodes"), prefixes=a.get("prefixes"),
+        reason=a.get("reason"),
+        limit=a.get("limit"), apply=bool(a.get("apply")),
+        node_ids=a.get("node_ids") or a.get("ids"), batch=a.get("batch"),
+        actor=getattr(principal, "actor", None) if principal is not None else None)
+
+
+# 生效条件：act=(a.get("action") or "outlook").strip().lower()，apply=bool(a.get("apply"))；principal 非 None 时 can_write=bool(principal.can_write)，对 act in ("record","verify") 且无写权、act in ("fork","branch_rewrite","branch_merge") 且无写权、act in ("reconstruct","learn") 且 apply、act=="branch_discard" 分别 require_admin；随后以 action=act 等参数调 cg.insight 并返回。
+def _insight_call(cg, a):
+    """洞察（P2）：window / record / verify / list / report / reconstruct / learn /
+    outlook / catalog / fork / branch_rewrite / branch_search / branch_merge /
+    branch_discard / branches / tickets。
+
+    权限**按 action 分档**（与 maintain 同构，比整 op 收窄更贴合语义）：
+      · 只读（window / list / report / reconstruct 预演 / outlook / catalog /
+        branch_search / branches / fork 预演 / tickets 预演）→ 不额外拦截；
+      · 条件层记账（record / verify）与分支写操作（fork / branch_rewrite /
+        branch_merge）→ 需 can_write；
+      · 落库（reconstruct apply / learn apply / tickets apply 批量建卡）与
+        分支弃置（branch_discard，改变库可见性）→ require_admin
+        （discard 库层还有第二道闸）。
+    这样 output 角色能读洞察但不能记；reflect 能重构与学习预演；批量落库须请示。
+    """
+    act = (a.get("action") or "outlook").strip().lower()
+    principal = getattr(cg, "principal", None)
+    can_write = bool(getattr(principal, "can_write", False))
+    apply = bool(a.get("apply"))
+    actor = getattr(principal, "actor", None) if principal is not None else None
+    if principal is not None and act in ("record", "verify") and not can_write:
+        principal.require_admin(f"insight_{act}")     # 无写权 → 抛 AccessDenied
+    # issue #348-A（2026-10-16 DSH 端）：`verify` 是**裁决动作**，与 `mdcg_verify`
+    # 同口径要求 verify op。修前只查 can_write ⇒ record/reflect/sustain（ops_allow
+    # 含 insight、无 verify op，forbidden 明列「裁决与删除」）可以给自己写的洞见
+    # 定案 verified（importance 保底 0.9 + protected=True），也能把属主的洞见判
+    # falsified——#320 在 insight 面的相邻出口。库层不动：直接调
+    # MdCGSecure.insight 的面（N197 守卫 1f/1h）语义不变。
+    if (principal is not None and act == "verify"
+            and hasattr(principal, "require_op")):
+        principal.require_op("verify")
+    if principal is not None and act in ("fork", "branch_rewrite",
+                                         "branch_merge") and not can_write:
+        principal.require_admin(f"insight_{act}")     # 分支写 → 需写权
+    if principal is not None and act in ("reconstruct", "learn",
+                                         "tickets") and apply:
+        principal.require_admin(f"insight_{act}")     # 批量落库 → 需 admin
+    if principal is not None and act == "branch_discard":
+        principal.require_admin("branch_discard")     # 弃置：分发层+库层双闸
+    return cg.insight(
+        action=act, layer=a.get("layer"), limit=a.get("limit"),
+        conditions=a.get("conditions"), apply=apply, actor=actor,
+        statement=a.get("statement"), category=a.get("category"),
+        source=a.get("source"), tags=a.get("tags"),
+        importance=a.get("importance"), node_id=a.get("node_id"),
+        content=a.get("content"),
+        evidence=a.get("evidence"), v_types=a.get("v_types"),
+        verdict=a.get("verdict"), state=a.get("state"),
+        window_days=a.get("window_days"), clues=a.get("clues"),
+        ids=a.get("ids"), neighbors=a.get("neighbors"),
+        branch_id=a.get("branch_id"), note=a.get("note"),
+        reason=a.get("reason"),
+        blindspot_id=a.get("blindspot_id"), horizon=a.get("horizon"),
+        max_branches=a.get("max_branches"), recent_days=a.get("recent_days"),
+        sample_limit=a.get("sample_limit"), max_nodes=a.get("max_nodes"),
+        types=a.get("types"), min_blindspot=a.get("min_blindspot"),
+        bypass_gain=a.get("bypass_gain"))
+
+
+# 生效条件：当 cg、a 传入时，按 a.get('action') or 'read'（空串/None 回退 'read'）分派：action=stat 返回 {'ok': True, 'action': 'stat', 'ledger': refindex.Ledger(cg.root).summary(), 'note': 'ref 索引水位（_refindex.json）：files/nodes 是已登记量；last_index.truncated=true 表示最近一次索引被截断。'}；action=check 返回 refindex.check_refs(cg, ledger=refindex.Ledger(cg.root), max_nodes=int(a.get('max_nodes') or refindex.MAX_CHECK)) 的结果并补 action='check' 与 note（max_nodes 假值回落 refindex.MAX_CHECK）；action 为 prune/prune_dangling 返回 refindex.prune_dangling(cg, only_roots=a.get('roots'), dry_run=bool(a.get('dry_run')), max_nodes=int(a.get('max_nodes') or refindex.MAX_CHECK)) 的结果并补 action='prune' 与 note（max_nodes 假值回落常量，dry_run 缺键为 False）；action 为 read/get 时 nid=(a.get('node_id') or '').strip()，若 nid 非空但 cg.get(nid) 为假返回 {'ok': False, 'error': '节点不存在：nid'}，ref 取 a.get('ref') 当且仅当它是 dict，否则若 node 非 None 用 refindex.ref_of(node)，若 ref 仍为假返回 {'ok': False, 'error': '该节点没有 code_ref/doc_ref（不是索引节点）'}，否则返回 refindex.read_ref(ref, root=a.get('root'), ref_kind=ref_kind) 的结果并设 out['node_id']=nid or None；其他 action 抛 ValueError；
+def _ref_call(cg, a):
+    """按 ref 回读被索引的源位置（认知图只存注释/接口，正文在这里取回）。
+
+    为什么需要它：索引节点存的是**注释与接口**，正文一律不复制（避免出现
+    第二份真相）。若没有回读入口，`code_ref` 就只是一串没人消费的坐标——
+    「能索引到实际代码」这句话就没有兑现。回读同时用 `codeindex.region_hash`
+    复算被引用行的哈希，因此它同时也是**漂移检测**：源文件改过之后，回读会
+    明确回 stale=True，而不是继续返回一个已经错位的区间。
+
+    ref 来源二选一：传 `node_id`（取该节点的 frontmatter.code_ref 或 doc_ref），
+    或直接传 `ref` 对象。代码索引节点与文档索引节点共用本入口——两者的区间
+    语义一致（相对 path + lineno..end + hash + root），只是 ref 字段名不同。
+    `root` 可用参数覆盖（ref 里的 root 是索引时的机器本地绝对路径，跨机器搬迁
+    后需显式给 root）。
+
+    `action`（默认 read）：
+      · read  —— 回读源区间（本函数主体）；
+      · check —— 全库漂移/悬空巡检（stale / dangling），只读、不抛、不改源文件；
+      · stat  —— 看 `_refindex.json` 水位（files/nodes/最近一次索引是否被截断）。
+    回读与巡检共用 `refindex.probe_ref` 的唯一判定实现，避免两套口径打架。
+    """
+    from . import refindex
+    action = (a.get("action") or "read").strip().lower()
+    if action == "stat":
+        return {"ok": True, "action": "stat",
+                "ledger": refindex.Ledger(cg.root).summary(),
+                "note": "ref 索引水位（_refindex.json）：files/nodes 是已登记量；"
+                        "last_index.truncated=true 表示最近一次索引被截断。"}
+    if action == "check":
+        res = refindex.check_refs(
+            cg, ledger=refindex.Ledger(cg.root),
+            max_nodes=int(a.get("max_nodes") or refindex.MAX_CHECK))
+        res["action"] = "check"
+        res["note"] = ("stale=源已改动（区间哈希不匹配）→ 重跑 op=index_code / "
+                       "op=index_doc 重建；dangling=源已删除 → 走 op=ref action=prune "
+                       "（软删，可 restore）或恢复真源后重建。巡检只读、不改源文件；"
+                       "op=sustain action=heal 只对 stale 自动重建（悬空需人工处置）。")
+        return res
+    if action in ("prune", "prune_dangling"):
+        res = refindex.prune_dangling(
+            cg, only_roots=a.get("roots"), dry_run=bool(a.get("dry_run")),
+            max_nodes=int(a.get("max_nodes") or refindex.MAX_CHECK))
+        res["action"] = "prune"
+        res["note"] = ("清退悬空节点（ref 指向的源文件已删除，回读必然失败）。"
+                       "check 只报告、prune 才处置；dry_run=true 先列清单。"
+                       "受保护节点（self/anchor 层、protected 标记、"
+                       "importance≥0.7）会被拦下并列入 skipped_protected，"
+                       "不越权强删；删除可经 op=restore 回滚。")
+        return res
+    if action not in ("read", "get"):
+        raise ValueError(f"ref 未知 action：{action}（支持 read|check|stat|prune）")
+    nid = (a.get("node_id") or "").strip()
+    node = None
+    if nid:
+        node = cg.get(nid)
+        if not node:
+            return {"ok": False, "error": f"节点不存在：{nid}"}
+    ref = a.get("ref") if isinstance(a.get("ref"), dict) else None
+    ref_kind = "ref"
+    if ref is None and node is not None:
+        ref_kind, ref = refindex.ref_of(node)
+    if not ref:
+        return {"ok": False,
+                "error": "该节点没有 code_ref/doc_ref（不是索引节点）"}
+    # P1-X（两份独立报告合并）：ref 回读是任意文件读原语——
+    # 自报 root、inline ref 自带的 root/path 均模型可控，probe_ref 直接
+    # os.path.join 后 open 全文回读（绝对 path 丢弃 root、'..' 上跳同漏）。
+    # 按最终将打开的完整路径过根白名单（2026-10-10 设计者裁定 dsh #85 选 A：
+    # 未配置**不再放开**，走三级回落链——env 已配置用它；未配置回落 mdcg 实际
+    # 配置库根；连库根也无则取工作区并把它配置下来；判据真源 =
+    # security._whitelist_roots 与其 P1-4 注释块）；越界一律拒（fail-closed），
+    # 上跳与绝对路径在 realpath 归一后自然涵盖。
+    from .security import check_path_root
+    check_path_root(
+        os.path.join(a.get("root") or ref.get("root") or "",
+                     ref.get("path") or ""),
+        "MDCG_INGEST_ROOT", "ref")
+    from . import logref
+    if node is not None and isinstance(ref.get("src"), dict) and ref["src"]:
+        # P2：检索命中 → 区间回读。**区间文本仍由 refindex.read_ref 取**（logref.
+        # read_index_node 内部就是它，本分支不另写读取与哈希）；相对此前的差别只有一
+        # 点：日志节点的 root 一律取 **ref 自带的转写根**（path 是相对根写死的，用调用
+        # 方自报的 root 拼会读到别的文件——上面那道 check_path_root 也按同一路径判）。
+        # 另带 span 状态机与再生指路：stale ⇒ 重跑落库、不自动覆写；dangling ⇒ 转写被
+        # 清理，指路离线 `--repair 1`（服务态零写临时目录）。
+        out = logref.read_index_node(node, with_src=bool(a.get("with_src")))
+    else:
+        out = refindex.read_ref(ref, root=a.get("root"), ref_kind=ref_kind)
+        # 真源身份层（zstd 日志本体）按 with_src 显式开——默认关，因为每条命中都
+        # 整读一遍大 zstd 是不可接受的代价；返回带 src_verified:false 明示「本次
+        # 未看真源」。probe_src 内部挂的是与上面**同一条** MDCG_INGEST_ROOT 闸。
+        # 部署前提（评审⑦）：MDCG_INGEST_ROOT 一旦按安全审计建议设置，转写根
+        # （%TEMP%/dsh-log-transcripts）也会被该闸拒 ⇒ 日志节点回读恒 PermissionError
+        # （fail-closed 拒读，不静默降级）。加固部署须把 transcript_root 一并写进
+        # MDCG_INGEST_ROOT（支持 os.pathsep 多根）。
+        if a.get("with_src"):
+            out["src"] = logref.probe_src(ref)
+    out["node_id"] = nid or None
+    return out
+
+
+# 生效条件：始终 import 白箱模块并返回 whitebox.dispatch(cg, a)。
+def _whitebox_call(cg, a):
+    """显式调用白箱能力库（AEIS 降为本地库后的唯一入口）。
+
+    显式调用映射：md_cg.whitebox.dispatch
+    见 docs/mdcg/功能调用映射表_v0.1.md。
+    """
+    from . import whitebox
+    return whitebox.dispatch(cg, a)
+
+
+# 生效条件：op=(a.get("op") or "").strip().lower()；op=="relation" 时返回 stg.relation(cg, a.get("a",""), a.get("b",""), time_axis=axis)；op=="timeline" 时返回 stg.timeline(cg, layer=a.get("layer"), limit=int(a.get("limit") or 50), desc=bool(a.get("desc", True)), time_axis=axis, session=a.get("session"))（session 缺省不过滤读遍所有会话，"*" = 显式跨会话，其它值 = 本会话视图）；op=="anchors" 时返回 stg.anchors(cg, time_window=a.get("time_window"), bbox=a.get("bbox"), layer=a.get("layer"), limit=int(a.get("limit") or 50))；op=="consistency" 时返回 stg.consistency(cg, layer=a.get("layer"), limit=int(a.get("limit") or 50))；op 为空或其它的值抛 ValueError；返回体**原样透传**——stg 三接口的 truncated/scanned/kept/hint 读数与修正后的 count 语义（条件命中总数，issue #52）不经本层裁剪或改写，max_scan 本批不开显式入参。
+def _stg_call(cg, a):
+    """语义时空图唯一入口。
+
+    四个 op 均支持 `time_axis`：**缺省 `observed`**（与旧行为逐位一致；stg 的
+    时间语义历来是观察轴），`effective` 走效力轴端点比较。此处与 `cg(op=read)`
+    的透传策略**相反**——`cg` 侧缺省由库层定（不启用的时间算子），`stg` 侧轴
+    决定「排序/关系依据」必须**恒有值**，故在此填默认；非法轴仍由
+    `trust.time_axis_of` fail-closed 抛错（本层不预先白名单，避免两套枚举）。
+
+    返回体**原样透传**（issue #52）：timeline/anchors/consistency 新增的
+    `truncated` / `scanned` / `kept` 读数与截断时的 `hint` 随返回值自动带出，
+    本层不裁剪、不改写；`count` 语义已是**条件命中总数**（不再受索引切片影响，
+    在役对照 `timeline(session=…)` 由 25 恢复为 229）。`max_scan` 本批不在
+    MCP 面开显式入参（契约：数值不是修法——需要收窄时细化生效条件/
+    不适用条件，或按设计稿建立条件索引）。
+    """
+    from . import stg
+    op = (a.get("op") or "").strip().lower()
+    axis = a.get("time_axis") or "observed"
+    if op == "relation":
+        return stg.relation(cg, a.get("a", ""), a.get("b", ""), time_axis=axis)
+    if op == "timeline":
+        return stg.timeline(cg, layer=a.get("layer"),
+                            limit=int(a.get("limit") or 50),
+                            desc=bool(a.get("desc", True)), time_axis=axis,
+                            # 会话视图：缺省读遍所有会话，"*" = 显式跨会话，
+                            # 其它值 = 本会话视图（自动召回走这条防串台）
+                            session=a.get("session"))
+    if op == "anchors":
+        return stg.anchors(cg, time_window=a.get("time_window"), bbox=a.get("bbox"),
+                           layer=a.get("layer"), limit=int(a.get("limit") or 50),
+                           time_axis=axis)
+    if op == "consistency":
+        return stg.consistency(cg, layer=a.get("layer"),
+                               limit=int(a.get("limit") or 50), time_axis=axis)
+    if op == "state_chain":
+        # 第 5 op：状态槽位投影（flag MDCG_STG_STATE **默认关**）。关臂由 stg 侧
+        # 返回 disabled 返回体（**不抛**——「没开」不是错误，是与「没命中」可分辨的
+        # 如实答复）；开臂委托 md_cg/state_slots.py 现算（本层不复制投影逻辑）。
+        # time_axis 与本 op 无关：台账事件行只有落账时间戳 t，无第二轴（不伪造）。
+        return stg.state_chain(
+            cg, subject=a.get("subject"), slot=a.get("slot"),
+            include_retired=bool(a.get("include_retired", False)),
+            history=bool(a.get("history", True)),
+            limit=int(a.get("limit") or 50))
+    if not op:
+        # fail-closed 且给出可操作提示：stg 的 op 四值签名区分度低于 cg（relation 需
+        # a+b、timeline/anchors/consistency 皆以 layer+limit 为主），**不做签名推导**
+        # ——猜错会静默返回错误视图，比报错更贵。
+        raise ValueError("stg 的 op 为必填参数（缺失即报错，不静默降级）；"
+                         "允许 op：relation | timeline | anchors | consistency | "
+                         "state_chain")
+    raise ValueError(f"stg 未知 op：{op}（允许 relation | timeline | anchors | "
+                     f"consistency | state_chain）")
+
+
+# --------------------------------------------------------------------------
+# 工具实现
+# --------------------------------------------------------------------------
+
+# 生效条件：a=args or {}，unit=(a.get("as_unit") or "").strip()，sess=_declared_session(a.get("session"))；cg.principal 为 None 或 unit 与 sess 皆为空时直接返回 _dispatch(cg,name,a)；否则先 narrowed_principal(cg.principal, unit)（TokenError 时返回 {"ok":False,"error":f"as_unit 非法：{e}"}），sess 非空时再以 copy 出的 Principal 覆盖 session，暂存 cg.principal/cg.session、置为作用域值、try 返回 _dispatch、finally 还原。
+# 生效条件：cg 为已构造的安全客户端、args 为 mdcg_search 的原始入参、defer_s>0 时——
+# 立即返回 {job_id,status=pending,hint}，并在守护线程里以**同一份入参（去掉 defer_s/job_id）**
+# 调 call_tool(cg,"mdcg_search",...)；失败也落进工单（status=error），不抛到调用方。
+_SEARCH_JOBS = {}
+_SEARCH_JOBS_LOCK = __import__("threading").Lock()
+_SEARCH_JOB_TTL = 600.0      # 秒：工单保留时长（过期即丢，防常驻进程无限涨）
+_SEARCH_JOB_MAX = 64         # 条：同时保留的工单上限
+
+
+def _search_job_gc(now=None, reserve=0):
+    """清过期/超量工单（调用方持锁）。TTL 与条数双闸，防常驻进程内存无界。"""
+    import time as _t
+    now = _t.time() if now is None else now
+    for _k in [k for k, v in _SEARCH_JOBS.items()
+               if now - float(v.get("created") or 0) > _SEARCH_JOB_TTL]:
+        _SEARCH_JOBS.pop(_k, None)
+    _keep = max(0, _SEARCH_JOB_MAX - int(reserve or 0))
+    if len(_SEARCH_JOBS) > _keep:
+        for _k, _v in sorted(_SEARCH_JOBS.items(),
+                             key=lambda kv: float(kv[1].get("created") or 0))[:len(_SEARCH_JOBS) - _keep]:
+            _SEARCH_JOBS.pop(_k, None)
+
+
+def _search_job_submit(cg, args, defer_s):
+    """提交异步检索：返回工单，不等待检索完成。"""
+    import random as _rnd
+    import threading as _th
+    import time as _t
+    with _SEARCH_JOBS_LOCK:
+        _search_job_gc(reserve=1)      # 给自己预留一格，插入后不超过上限
+        jid = "sjob_%d_%04d" % (int(_t.time() * 1000), _rnd.randint(0, 9999))
+        rec = {"job_id": jid, "status": "pending", "created": _t.time(),
+               "query": args.get("query"), "result": None, "error": None,
+               "elapsed_s": None}
+        _SEARCH_JOBS[jid] = rec
+    payload = {k: v for k, v in args.items() if k not in ("defer_s", "job_id")}
+
+    def _run():
+        _t0 = _t.time()
+        try:
+            out = call_tool(cg, "mdcg_search", payload)
+            with _SEARCH_JOBS_LOCK:
+                rec["status"] = "done"
+                rec["result"] = out
+                rec["elapsed_s"] = round(_t.time() - _t0, 3)
+        except Exception as exc:      # noqa: BLE001 —— 工单承接失败，不抛给调用方
+            with _SEARCH_JOBS_LOCK:
+                rec["status"] = "error"
+                rec["error"] = "%s: %s" % (type(exc).__name__, exc)
+                rec["elapsed_s"] = round(_t.time() - _t0, 3)
+
+    _th.Thread(target=_run, name="mdcg-search-job", daemon=True).start()
+    return {"job_id": jid, "status": "pending",
+            "poll_after_s": int(defer_s) if defer_s else 10,
+            "hint": "检索在后台进行；请约 %d 秒后再用 job_id 调用一次 mdcg_search 取结果"
+                    % (int(defer_s) if defer_s else 10)}
+
+
+def _search_job_result(jid):
+    """取异步检索结果：pending 原样回报，done 带 result，error 带 error。"""
+    with _SEARCH_JOBS_LOCK:
+        _search_job_gc()
+        rec = _SEARCH_JOBS.get(str(jid))
+        if rec is None:
+            return {"job_id": str(jid), "status": "unknown",
+                    "error": "未知或已过期的 job_id（工单保留 %d 秒）" % int(_SEARCH_JOB_TTL)}
+        snap = dict(rec)
+    out = {"job_id": snap["job_id"], "status": snap["status"],
+           "elapsed_s": snap.get("elapsed_s")}
+    if snap["status"] == "done":
+        out["result"] = snap.get("result")
+    elif snap["status"] == "error":
+        out["error"] = snap.get("error")
+    else:
+        out["poll_after_s"] = 10
+    return out
+
+
+def call_tool(cg, name, args):
+    """MCP tools/call 入口：按 `as_unit` 做**请求级身份收窄**（单进程多身份），
+    按 `session` 做**请求级会话归因**（单进程多会话）。
+
+    三个身份维度的职责分离（勿混）：
+      · env 身份（MDCG_TOKEN）—— **谁装了这个大脑**，是权限上限，进程级恒定；
+      · `as_unit` —— 本次调用以哪个**单元**执行，请求级、可缺省，参与授权；
+      · `session` —— 本次调用属于哪个**会话**，请求级、可缺省，**只影响归因**
+        （不参与任何 ops 裁决；来源优先级见 `_declared_session`）。
+
+    收窄由 `tokens.narrowed_principal` 保证「只能变小不能变大」（求交 +
+    can_admin 恒 False），故调用方即使伪造 `as_unit` 也无法提权——最坏等于
+    不传（owner 全权）。这是本机制**不需要对 `as_unit` 额外鉴权**的根据。
+    `session` 同理不需要额外鉴权：它不参与任何 ops 裁决，最坏是贴错标签。
+
+    `as_unit` 与 `unit` 字段**职责分离**：
+      · `as_unit` —— 受限枚举（五单元），参与授权；未知值 fail-closed 报错；
+      · `unit`    —— 自由文本，仅归因（进 _audit / _recent），不参与授权。
+    """
+    a = args or {}
+    p = getattr(cg, "principal", None)
+    if p is None:
+        return _dispatch(cg, name, a)
+    unit = (a.get("as_unit") or "").strip()
+    sess = _declared_session(a.get("session"))
+    scope = p
+    if unit:
+        from .tokens import TokenError, narrowed_principal
+        try:
+            scope = narrowed_principal(p, unit)
+        except TokenError as e:
+            return {"ok": False, "error": f"as_unit 非法：{e}"}
+    # 请求级 session 只做**归因**（cg.session，写入归属/_attribution 取它），
+    # **不**改 principal.session——绑定档（private/secret）的读授权锚定连接级
+    # 身份（issue #35 会话隔离定稿：调用方自报的会话不得成为看他人 private
+    # 的授权；与上方「session 不参与任何 ops 裁决」的原设计意图一致）。
+    if scope is p and not sess:
+        return _dispatch(cg, name, a)
+    saved_p, saved_s = cg.principal, getattr(cg, "session", None)
+    had_s = hasattr(cg, "session")
+    cg.principal = scope             # 单线程 stdin 循环：无并发竞争
+    if had_s:
+        cg.session = sess or scope.session
+    try:
+        return _dispatch(cg, name, a)
+    finally:
+        cg.principal = saved_p
+        if had_s:
+            cg.session = saved_s
+
+
+# P1-1（批次 24，外部审查报告）：mdcg_* 工具的 op 要求映射——此前 require_op
+# 只在 _cg_dispatch（cg 工具）内生效，mdcg_* 分支直接落库层（只验
+# can_write/层/密级，不验 ops_allow）→「--ops-allow read」的只读令牌仍可经
+# mdcg_remember 写入，权限收窄形同虚设。映射用令牌签发域内的既有 op 词
+# （read/write/verify——tokens.ROLE_SPECS 全角色都含 read，写类角色含
+# write），ops_allow=None（不限）令牌零影响。
+#: 工具名 → **规范面 op 词**（工具面闸词的**唯一来源**）：`_MDCG_OP_REQUIRE` 由本表 ＋
+#: `op_table._OP_TABLE` 的 `require` **派生**（见 `_op_require`），**不再在下面写一遍死值**
+#: ——同一语义只有一处真源。issue #398：本条形态（工具面闸词弱于规范面）在本仓已被修过
+#: N201/N227/N228/N229/#435 五次，逐点修治不住；改派生后「工具面弱于真源」在结构上不再可写。
+_MDCG_TOOL_OP = {
+    # 写面
+    "mdcg_remember": "write", "mdcg_reflect": "write",
+    "mdcg_flywheel": "write", "mdcg_mine_fix_pairs": "write",
+    "mdcg_rejected": "write", "mdcg_unresolved": "write",
+    "mdcg_propose": "write", "mdcg_review_decide": "write",
+    "mdcg_forget": "write", "mdcg_restore": "write",
+    "mdcg_ingest": "write",
+    "mdcg_consistency": "write",
+    # 读面
+    "mdcg_recall": "read", "mdcg_search": "read", "mdcg_get": "read",
+    # issue #398 站点 2：裁决记录台账属**裁决面**（`cg(op=review, action=records)` 要
+    # require_op("review")），此前映射粗粒度 read ⇒ 无令牌访客（guest，仅 read）可经
+    # 工具面明文读回裁决台账（id/path/tags[含 pid、round]/created_at）。对齐真源 review。
+    "mdcg_review_records": "review",
+    "mdcg_identity": "read",
+    # issue #398 站点 1：自我状态机（refresh 会**真写 self 层**状态卡、override=True）
+    # 在规范出口要 require_op("self_state")，此前工具面只查 read ⇒ 无 self_state op 的
+    # 令牌可经工具面驱动它。对齐真源 self_state。
+    "mdcg_metacognition": "read", "mdcg_self_state": "self_state",
+    "mdcg_predict": "read", "mdcg_causal": "read",
+    "mdcg_health": "read",
+    "mdcg_whoami": "read", "mdcg_watermarks": "read",
+    "mdcg_whitebox": "read",
+    # issue #578 / dsh-bounty#435：本入口**不在这张表里** ⇒ _dispatch 取
+    # `_MDCG_OP_REQUIRE.get(name)` 得 None ⇒ 跳过 require_op。而它回吐的
+    # `principal.as_dict()` 与受 read 闸管着的 `mdcg_whoami` 是**同一份**身份清单
+    # （含 token_id / session / ops_allow），外加库根绝对路径 ⇒ 只读访客与
+    # 「被 --ops-allow 收窄到不含 read」的令牌都能拿到。闸词对齐 whoami 的 read。
+    "mdcg_service_info": "read",
+    # 治理/裁决面（仅高权角色域含 verify/review/protect/evolution）
+    "mdcg_verify": "verify",
+    # N228（2026-09-28）：写保护面此前被映射到**粗粒度 write**，而 protect 在
+    # cg 面是 designer 专属 op（`cg(op="protect")` 前置 require_op("protect")）
+    # ⇒ 任何 can_write 角色可经工具面 action=snapshot 真落盘 _protected_history
+    # 且（修前）零审计，stats/check 亦回带保护面盘点。两条出口对齐到 protect。
+    #
+    # issue #118（2026-10-11）：本键**在本映射中只允许出现一次**——修前它另有一处
+    # 陈旧重复项（"mdcg_protect": "write"），Python 字典**后者胜**故运行期口径正确，
+    # 但**安全属性完全依赖书写次序**：任何人重排两行即静默回退为粗粒度 write。
+    # 现陈旧重复项已删；「唯一性」不再靠人眼，由 `scripts/check_duplicate_keys.py`
+    # 全仓 AST 守卫钉住（同键两次取值不同 ⇒ 非零退出）。改口径请只改这一处。
+    "mdcg_protect": "protect",
+    # N227（2026-09-28）：演化账本是治理面（行含节点 id 与自由文本），此前映射
+    # read（guest 可达）而规范出口 `cg(op="evolution")` 要 op "evolution"。
+    "mdcg_evolution": "evolution",
+    # N229（2026-09-28）：遗忘留痕是同族治理台账（行内 actor/verdict/reason 属
+    # 他人写入裁决，行级可见性过滤闭不掉「可见节点上的他人裁决」这一维），而
+    # 规范出口 `cg(op="protect", action="forgetting")` 要 op "protect"。两条
+    # 出口对齐到 protect（库层 `cg.forgetting_history()` 仍按行过滤可用）。
+    "mdcg_forgetting_history": "protect",
+    # N201（2026-09-28）：审核队列属**裁决面**而非普通读面。此前映射 "read"，
+    # 而 read 是 tokens.ROLE_SPECS 全角色（含无令牌访客 guest）都持有的 op ⇒
+    # 细粒度工具 mdcg_review_list 对任何只读身份明文返回全部待审提案正文与
+    # actor/session 归属；同库规范出口 cg(op=review, action=list) 却要
+    # require_op("review")。两条出口口径对齐到 review（库层
+    # MdCGSecure.review_list 另有同款自证闸 + _readable 过滤，两层互不依赖，
+    # 任一层被绕过都仍拦得住）。
+    "mdcg_review_list": "review",
+}
+
+
+# 生效条件：op 为 `op_table._OP_TABLE` 的键时返回其 `require`（缺键时返回 op 自身）；
+# op 不在表中（基础 op 词，如 write/read）时返回 op 自身。不做 IO、不看环境变量。
+def _op_require(op):
+    """op 词 → 规范面的 require 词（**从单一真源派生**，issue #398）。"""
+    from . import op_table as _ot
+    entry = _ot._OP_TABLE.get(op)
+    if not isinstance(entry, dict):
+        return op                      # 基础 op 词（write/read/…）不在表内，自身即闸词
+    return entry.get("require") or op
+
+
+_MDCG_OP_REQUIRE = {name: _op_require(op) for name, op in _MDCG_TOOL_OP.items()}
+
+
+# 生效条件：四个布尔入参任意组合下无条件返回 "max"（当 use_fuzzy 或 use_semantic 或 use_goal 或 use_causal 任一为真）或 None（全为假）；use_temporal 不参与判据；不做 IO、不看环境变量；
+def recall_fusion_default(use_fuzzy, use_semantic, use_goal, use_causal,
+                          use_temporal=False):
+    """`mdcg_recall` 的**缺省融合口径**判据（唯一单点，供守卫断言）。
+
+    P3-遗留 A（2026-10-01 补披露）：`use_causal` **缺省 True** ⇒ 默认 recall 的
+    融合口径由 `sum` 变成 **`max`**（影响**所有**默认召回调用，与库是否有边无关）。
+    该口径符合设计稿 §6.2「因果路融合缺省 max」与既有先例表达式
+    （fuzzy/semantic/goal 同款），故**保留**；本函数只把那个表达式从调用点提为
+    **可断言的名字**——否则「缺省到底是 sum 还是 max」只能靠读表达式，
+    静默漂移（少写一个 `or use_causal`）无守卫可抓。
+
+    `use_temporal` **刻意不入判据**：时间路是**排名项**（§6.3(e)：与 S4 层级
+    激活同类，不是单路独有召回型），它开着也不改变融合口径。
+    """
+    return ("max" if (use_fuzzy or use_semantic or use_goal or use_causal)
+            else None)
+
+
+# 生效条件：name 为已注册工具名之一（cg / stg / mdcg_whitebox / mdcg_service_info / mdcg_remember 等）；name 属 _MDCG_OP_REQUIRE 且 cg.principal 具 require_op 属性时先 require_op（越权抛 AccessDenied），principal 为 None 或无该方法时跳过；cg 走 _cg_call、stg 走 _stg_call、whitebox 走 _whitebox_call；未识别的 name 返回含 error 的响应字典而不抛异常，进程不因此中断；mdcg_forget 走 cg.forget_gated（同 cg(op=forget) 的档位路径）、mdcg_remember 的非 gated 直写分支在同 id 覆写时先过 cg.write_qualify 再按档位判定（三档自治批次②）；
+# issue #86（2026-10-09 DSH 端）：**令牌运行期复检**。
+# 背景：令牌只在服务启动时 verify_token 一次（_identity），之后全程用缓存的
+# Principal；security.Principal.expired() 存在但**运行期没有任何调用点**读
+# revoked_at / expires_at ⇒ 用户 revoke 之后，常驻宿主（DSH/IDE 里的 MCP 进程）
+# 一直有效到重启（issue 实测：吊销后同进程 write 仍 True，只有新进程 rc=3 才拒）。
+# 实现口径（按 issue 建议 2）：在 _dispatch 入口做一次**廉价**复检——
+# 按 *_tokens.json 的 (mtime_ns, size)* 缓存解析结果，文件没变时开销 = 一次 stat；
+# 变了才重查该 token_id 是否已不存在（=被吊销/清理）或带 revoked_at。
+# **fail-open**：表读不到/解析失败一律放行（与既有语义一致，且绝不因复检本身
+# 让服务不可用）；非令牌身份（env/anon，token_id 为空）不适用。
+_TOK_RECHECK_CACHE = {}
+
+
+def _runtime_token_recheck(p):
+    """返回拒绝原因字符串；放行返回 None。"""
+    tid = getattr(p, "token_id", None)
+    if not tid:
+        return None                      # 非令牌身份：不适用
+    try:
+        from .tokens import _load, token_file
+        path = token_file(None)
+        st = os.stat(path)
+        key = (path, st.st_mtime_ns, st.st_size)
+        cache = _TOK_RECHECK_CACHE
+        if cache.get("key") != key:
+            cache = {"key": key, "tokens": (_load(path).get("tokens") or {})}
+            _TOK_RECHECK_CACHE.clear()
+            _TOK_RECHECK_CACHE.update(cache)
+        rec = (_TOK_RECHECK_CACHE.get("tokens") or {}).get(tid)
+        if rec is None:
+            return "令牌记录已不存在（可能已被吊销或清理）"
+        if isinstance(rec, dict) and rec.get("revoked_at"):
+            return "令牌已吊销（revoked_at=%s）" % rec.get("revoked_at")
+    except Exception as _e86:
+        sys.stderr.write("[mdcg-mcp] ⚠ #86 运行期令牌复检异常（已放行）：%s: %s\n"
+                         % (type(_e86).__name__, _e86))
+        return None
+    return None
+
+
+# 生效条件：给定 nid 与工具面入参 dict a 时，调用 writepipe.oversize_response —— 全仓
+# 写入硬上限的**唯一构造点**（issue #212）——返回拒收响应体，或 None 表示过闸。
+# issue #557 R2：本仓 31 个 mdcg_* 入口里此前只有 whitebox/service_info/remember 三处
+# 判上限，而 rejected / unresolved / propose 等**写内容的入口全部不判** ⇒ 「5 个 >1 MiB
+# 文件落盘；record 令牌 8 次写满 10 MB」。此处复用同一构造点、延迟 import 防环，
+# 不新增常量、不复制判据（#324 分支会量「除 content 之外其余字段」的总字节，故
+# hypothesis/reason/question/known_clues 同样受约束）。
+def _oversize_r2(nid, a):
+    from .writepipe import oversize_response as _os
+    return _os(nid, a or {})
+
+
+def _dispatch(cg, name, args):
+    a = args or {}
+    # issue #86（2026-10-09 DSH 端）：**令牌运行期复检**（见 _runtime_token_recheck）
+    _re86 = _runtime_token_recheck(getattr(cg, "principal", None))
+    if _re86:
+        from .security import AccessDenied as _AD86
+        raise _AD86("令牌运行期复检未通过：%s" % _re86)
+    # P1-1：mdcg_* 面的角色作用域闸（与 cg 工具的 require_op 同一语义——
+    # ops_allow=None 令牌不受影响；受限令牌越权即 AccessDenied）
+    _need_op = _MDCG_OP_REQUIRE.get(name)
+    if _need_op:
+        _p = getattr(cg, "principal", None)
+        if _p is not None and hasattr(_p, "require_op"):
+            _p.require_op(_need_op)
+    if name == "cg":
+        return _cg_call(cg, a)
+    if name == "stg":
+        return _stg_call(cg, a)
+    if name == "mdcg_whitebox":
+        return _whitebox_call(cg, a)
+
+    if name == "mdcg_service_info":
+        return {"server": SERVER_NAME, "version": SERVER_VERSION,
+                "protocol": PROTOCOL_VERSION, "root": cg.root, "actor": cg.actor,
+                "nodes": len(cg.index["nodes"]),
+                "surface": SURFACE, "tools": len(tools_for_surface()),
+                "tool_names": [t["name"] for t in tools_for_surface()],
+                "principal": getattr(cg, "principal", None) and cg.principal.as_dict()}
+
+    if name == "mdcg_remember":
+        # B1（2026-09-30）：自动 id 委托**唯一铸造点**（mdcg.mint_auto_id：
+        # 毫秒位 + 6 位 hex 随机段 + 「已存在则换随机段重生成」的有界存在性闸）。
+        # 原先此处与 writepipe.execute 各写一份裸毫秒形态，同毫秒自动写入
+        # 铸出同一 id → add 的 upsert 语义静默顶替（返回 committed 却 0 命中）。
+        from .mdcg import mint_auto_id
+        nid = a.get("node_id") or mint_auto_id(cg)
+        # issue #212 缺口 1（2026-10-13 DSH 端）：**工具面此前完全不过写入硬上限**。
+        # 同一内容走 cg(op=write) 被 writepipe 入口的 MAX_WRITE_BYTES 闸硬拒
+        # （gate='writelimit_size'），走 mdcg_remember 却 committed=True 落盘
+        # （实测 1,048,677 字节）——两通路结论相反，而工具面正是 hooks 自动记忆
+        # 走的通路。处置：在**分支分叉之前**补同一道闸（gated 与直写两条出口共用），
+        # 判据与响应体**不是复制**而是调用动词面的同一实现 oversize_response
+        # ⇒ 两个面拿到的读数逐键相等（守卫 W2a 断言这一点）。
+        # 位置口径：与动词面一致——按**原始入参**判（打码只减不增，不会因打码漏放）。
+        from .writepipe import oversize_response as _oversize212
+        _ov212 = _oversize212(nid, a)
+        if _ov212 is not None:
+            return _ov212
+        # issue #93（2026-10-09 DSH 端）：**这条通路此前不过 policy 的 forbidden 规则**。
+        # 同样内容走 writepipe（cg(op=write)）会被判 REJECT 或打码，而 mdcg_remember
+        # ——hooks 自动记忆走的正是它——直接落盘 ⇒ AKIA / ghp_ / URL 内嵌凭据 /
+        # PEM 私钥块等**明文入库**，且无令牌 guest 可检索。
+        # 处置与 REJECT 分支**同口径**：按片段**打码**而非整条拒绝（自动记忆是 hooks
+        # 通路，整条拒绝会静默丢记忆，比打码更糟）；打码失败不阻塞写入。
+        # 与 #69 甲自洽：inbox（待裁决区）保原文可追溯，而**记忆库是可被 guest 检索的对外面**。
+        try:
+            from . import audit as _audit93
+            _rb93 = _audit93.load_rulebook()
+            if isinstance(_rb93, tuple):
+                _rb93 = _rb93[0]
+            _red93 = _audit93.redact_forbidden(a.get("content", ""), _rb93)
+            if _red93 and _red93 != a.get("content", ""):
+                a = dict(a)
+                a["content"] = _red93
+        except Exception:                      # noqa: BLE001 —— 打码失败不阻塞写入
+            pass
+        hint = a.get("importance_hint")
+        if hint is None and a.get("importance") is not None:
+            hint = float(a["importance"])
+        # ★issue #418：role 类型闸（**分叉之前**，gated 与直写两出口共用）。
+        # 非法 role 落盘后会被装载器判 frontmatter 损坏而**隔离**（get/search 读不到），
+        # 而修前回执仍是 committed=true ⇒ 入口 fail-closed 拒收（与 check_recent_event
+        # 的「类型错 ⇒ 不静默降级」逐字同款）；判据走单点 nodefile.valid_role。
+        # 位置：紧邻分叉点——既在两条出口之前，也不推移本分支上半段的源码窗口。
+        from . import nodefile as _nf418
+        if not _nf418.valid_role(a.get("role")):
+            # 返回体照协议声明面：WRITE_TRIO 用 id；形态取 gate_hard_reject
+            # （ok/id/committed/gate/error/verdict/hint）；verdict=None 是盲区声明。
+            return {"ok": False, "id": nid, "committed": False,
+                    "gate": "role_type", "error": "role_not_str", "verdict": None,
+                    "got_type": type(a.get("role")).__name__,
+                    "hint": "role 须为字符串（省略即合法）；非字符串会让节点落盘后被自家"
+                            "装载器判 frontmatter 损坏而**隔离**（不进索引、get/search 读不到）。"}
+        if a.get("gated"):
+            res = cg.remember_gated(
+                nid, a.get("content", ""), layer=a.get("layer") or "contextual",
+                # B2（2026-09-30）：密级透传（本分支是落盘路径：remember_gated
+                # → add；此前两分支都不传，声明 private 在此静默降级 internal）。
+                sensitivity=a.get("sensitivity"),
+                role=a.get("role"), tags=a.get("tags"),
+                condition_space=a.get("condition_space"),
+                verification_basis=a.get("verification_basis"),
+                # A1 补接（2026-10-05）：检验强度同族透传（remember_gated 内部
+                # add(**kw) 直达；此前声明在 gated 分支静默丢弃）。
+                check_strength=a.get("check_strength"),
+                # 0.8.0 身体×脑对接（四条裁定之二，2026-10-06）：`spatial`
+                # 自定义键**直存**——约定 {"coords3d": {x,y,z}} 米制（可选 bbox
+                # 投影后补）；不改既有 fm.spatial.bbox 的 2D 语义。
+                # 缺省不传（_spatial_kw）——未声明时零落键，既有 fm 形态逐位不变。
+                **_spatial_kw(a),
+                non_applicable_conditions=a.get("non_applicable_conditions"),
+                importance_hint=hint, override=bool(a.get("override")),
+                consistency=bool(a.get("consistency", True)),
+                on_conflict=a.get("on_conflict") or "defer",
+                derived_from=_split_ids(a.get("derived_from")),
+                relation=a.get("relation"))
+            res.setdefault("ok", res.get("verdict") == "ACCEPT")
+            return res
+        # ⑥（P-9b）：直写**不去重**是文档化现状（writelimit.py 模块头注 :9-12：
+        # 限流/同构聚合只作用 contextual 层，knowledge 等手动纪律写入不受限）
+        # ——本分支**不改落盘行为、不改 verdict**，只在返回体给出「同内容已存在」
+        # 的提示（dup_of/dup_ratio）与「本次是覆写」的读数（overwrite_of/
+        # overwrite_ratio），由调用方决定是否处理。判据复用主动遗忘闸门的**同一
+        # 实现**（forgetting.redundancy / prior_node / self_coverage），不另写
+        # 一份重复度算法；两个读数都必须在 `cg.add` **之前**取（add 之后索引里
+        # 必有 nid，覆写判据恒真、覆盖度恒 1.0）。
+        from . import forgetting as _forgetting
+        _layer = a.get("layer") or "knowledge"
+        _content = a.get("content", "")
+        _prior = _forgetting.prior_node(cg, nid)
+        _prior_cov = (_forgetting.self_coverage(cg, _prior, _content)
+                      if _prior is not None else None)
+        _dup = _forgetting.redundancy(cg, _content, layer=_layer, exclude=nid)
+        # 三档自治批次②（设计 §三）：本分支是**热写入路径的第二落点**（另两处 =
+        # writepipe 链尾执行器、remember_gated）——同 id 已存在 ⇒ C 改写、
+        # 不存在 ⇒ A 新增，判据复用 forgetting.prior_node（不另写一份存在性判据）。
+        # 位置：既有 `if a.get("gated")` 分支之后、`cg.add` 之前（直写面没有别的
+        # 资格闸；audit/限流属 gated 分支的链）。确认档 ⇒ 出单且不落盘。
+        from . import autonomy_modes as _am
+        _action = _am.C_REWRITE if _prior is not None else _am.A_ADD
+        if _prior is not None:
+            # 资格在先（纯加严）：见 writepipe._gate_autonomy 同款注释——覆写的
+            # 层闸/写保护闸在 cg.add 内部，档位闸不得抢在它们之前把拒绝变成入队。
+            cg.write_qualify(nid, target_layer=_layer,
+                             override=bool(a.get("override")),
+                             actor=getattr(cg, "actor", None))
+        _dec = _am.decide(_action)
+        if _dec["decision"] != _am.ALLOW:
+            _aut = {"mode": _dec["mode"], "action": _dec["action"],
+                    "action_name": _dec["action_name"],
+                    "decision": _dec["decision"]}
+            if _dec["decision"] == _am.FORBID:
+                # 同属 gate_short_circuit 形态（兜底拒绝分支）：补 verdict 键，
+                # 与出单分支同口径——直写面无校验闸，故取 None（不编造裁决）。
+                return {"ok": False, "id": nid, "committed": False,
+                        "moved_to": "autonomy_forbidden",
+                        "error": "autonomy_forbid", "autonomy": _aut,
+                        "verdict": None,
+                        "hint": _dec["hint"]}
+            _meta = {k: a[k] for k in
+                     ("tags", "condition_space", "verification_basis",
+                      "non_applicable_conditions", "derived_from", "relation",
+                      # A1 补接（2026-10-05）：检验强度入复现 meta——与
+                      # writepipe._AUTONOMY_META_KEYS 同款（两条路径元数据等价）。
+                      "check_strength",
+                      # 0.8.0 对接：spatial 同样随单落复现 meta（入队后
+                      # accept 落盘与直接落盘**元数据等价**，判据不分叉）。
+                      "spatial",
+                      "role", "importance") if a.get(k) is not None}
+            # 直写面的裁决参数（本分支的 add 会自己跑冲突闸）：随单落进复现 meta，
+            # 否则「确认后落盘」与「直接落盘」两条路径的判据不等价。
+            _meta["consistency"] = bool(a.get("consistency", True))
+            _meta["on_conflict"] = a.get("on_conflict") or "reject"
+            _meta["override"] = bool(a.get("override"))
+            _pay = _am.mutation_payload(
+                _action, nid, after=_content,
+                reason="mdcg_remember 直写（%s）" % _am.ACTION_NAMES[_action],
+                primitive="add", meta=_meta)
+            _pr = _am.propose_mutation(cg, _action, nid, payload=_pay,
+                                       layer=_layer,
+                                       sensitivity=a.get("sensitivity"),
+                                       info=True)
+            # 自治档位出单属 protocol.gate_short_circuit 形态：WRITE_TRIO +
+            # moved_to + verdict + hint。**verdict 键必在场**——直写面不跑校验闸
+            # （audit 在 gated 分支的链上），本路径**没有 audit 裁决可透出**，故取
+            # None。
+            # ★2026-10-12 设计者裁定（对 #109 题3(b) 的收束）：None 不是「编造裁决」，
+            # 而是**盲区声明**——「我们知道这里没填」。原裁定「硬补 verdict 等于编造
+            # 判据」的判断仍然成立（那说的是编造一个**有值**的裁决）；正因如此才需要
+            # 为「无法识别/未填」这件事**留一个显式标记**，而盲区就是为这种情况设计的。
+            # 形态见 protocol.VERB_SPECS["write"]["shapes"]["autonomy_ticket"]
+            # （required 含 verdict；None 的语义由 protocol.VERDICT_BLINDSPOT 声明）。
+            # issue #426-A：入队回执透出 dedup 归因。
+            return _am.apply_dedup(
+                {"ok": True, "id": nid, "committed": False,
+                 "moved_to": "review_queue", "verdict": None,
+                 "pid": _pr["pid"],
+                 "mutation": _pay, "autonomy": _aut,
+                 "hint": "%s 本次未落盘：变更单已入审核队列（pid=%s，目标 %s）。"
+                         % (_dec["hint"], _pr["pid"], nid)}, _pr)
+        written = cg.add(nid, _content, layer=_layer,
+                         # B2：同上——落盘面丢字段＝上游声明静默失效。
+                         sensitivity=a.get("sensitivity"),
+                         role=a.get("role"), tags=a.get("tags"),
+                         condition_space=a.get("condition_space"),
+                         importance=float(a.get("importance", 0.5)),
+                         verification_basis=a.get("verification_basis"),
+                         # A1 补接（2026-10-05）：检验强度透传（同 B2）。
+                         check_strength=a.get("check_strength"),
+                         # 0.8.0 对接：spatial 直存透传（同 B2）；缺省不传（零落键）。
+                         **_spatial_kw(a),
+                         non_applicable_conditions=a.get("non_applicable_conditions"),
+                         override=bool(a.get("override")),
+                         consistency=bool(a.get("consistency", True)),
+                         on_conflict=a.get("on_conflict") or "reject",
+                         derived_from=_split_ids(a.get("derived_from")),
+                         relation=a.get("relation"))
+        if written is None:
+            # 冲突 DEFER 同属 protocol.gate_short_circuit 形态：WRITE_TRIO +
+            # moved_to + verdict + hint。此前只有 ok/id/verdict/reason ⇒ 判 committed
+            # 的调用方读不到「未提交」，也读不到去向与下一步。
+            # 语义（mdcg.py:2192 生效条件 + :2319-2321）：on_conflict=defer 时
+            # REJECT/BLINDSPOT **既不落盘也不入队**——故去向**不可**写 review_queue，
+            # 用 conflict_deferred 表达「被冲突闸挡下、未进任何队列」。
+            # （去向词：2026-10-12 设计者裁定为 conflict_deferred。）
+            return {"ok": False, "id": nid, "committed": False,
+                    "moved_to": "conflict_deferred",
+                    "verdict": "DEFER",
+                    "reason": "节点间冲突检测未通过（on_conflict=defer）",
+                    "hint": "本次未落盘、未入队（defer 语义）：如需落盘请显式处置冲突——"
+                            "修正正文后重写 / on_conflict=reject 取明确拒绝 / "
+                            "override=true 覆写（需相应权限）"}
+        # issue #109 相邻面：工具面**同一返回体**在闸门短路分支给 committed=False，
+        # 成功分支此前却不给 committed ⇒ 判 committed 的调用方会把「成功」读成
+        # 「未提交」（与 #109 报的「把待审读成已提交」是同一处的两面）。
+        # 三键铁律（protocol.WRITE_TRIO / 协议文档 :28「任一形态必含 ok/id/committed」）
+        # 在此补齐：不改写入语义，只补判据键。
+        out = {"ok": True, "id": nid, "committed": True}
+        if _prior is not None:
+            out["overwrite_of"] = _prior
+            out["overwrite_ratio"] = _prior_cov
+        if _dup["with"] and _dup["max"] >= _forgetting.DUP_MERGE:
+            out["dup_of"] = _dup["with"]
+            out["dup_ratio"] = round(_dup["max"], 4)
+            out["dup_compared"] = _dup["compared"]
+            out["dup_hint"] = (
+                "同内容已存在于 %s（覆盖度 %.2f≥%.2f）；本路径是直写"
+                "（gated=false：knowledge 层手动纪律写入不受限流/去重约束，"
+                "见 writelimit.py 模块头注），正文已按原样落盘为新节点——"
+                "如需并入既有节点请显式处理"
+                % (_dup["with"], _dup["max"], _forgetting.DUP_MERGE))
+        return out
+
+    if name == "mdcg_recall":
+        # recall 面保持词法默认：其「缺省六路」与 sum/max 融合口径都是**已登记契约**
+        # （test_time_core_lint G8b/G8c、test_p3 A2）。BM25 默认开只落在检索面
+        # （mdcg_search / cg(op=read) 回退），recall 仍 opt-in。
+        use_bm25 = bool(a.get("bm25")) and hasattr(cg, "search_rrf")
+        use_fuzzy = bool(a.get("fuzzy"))
+        use_semantic = bool(a.get("semantic"))
+        use_goal = bool(a.get("goal_path") or a.get("goal"))
+        # P3（裁定 9「全进默认检索」）：因果路（chain）/ 时间路（temporal）**进缺省集**，
+        # 但**每路可单独关**——显式传 causal=false / temporal=false 即从本次调用剔除。
+        # 未显式传（None）= 缺省进路；与既有 fuzzy/semantic/goal 的「显式启用」语义相反，
+        # 这是刻意的非对称：这两路在无 edges / 无时间参数的库上自然为空，缺省开不产噪声。
+        use_causal = a.get("causal")
+        use_temporal = a.get("temporal")
+        use_causal = True if use_causal is None else bool(use_causal)
+        use_temporal = True if use_temporal is None else bool(use_temporal)
+        if (use_bm25 or use_fuzzy or use_semantic or use_goal
+                or not use_causal or not use_temporal):
+            paths = ["bm25" if use_bm25 else "lexical", "bucket", "entity", "graph"]
+            if use_fuzzy:
+                paths.append("fuzzy")
+            if use_semantic:
+                paths.append("semantic")
+            if use_goal:
+                paths.append("goal")
+            if use_causal:
+                paths.append("chain")
+            if use_temporal:
+                paths.append("temporal")
+            paths = tuple(paths)
+        else:
+            paths = None          # 缺省六路（mdcos.search_rrf 的缺省集）
+        # fuzzy 路缺省用 max 融合：实测（memory-bench-1000，870 查询）sum 会把
+        # self@1 拉低 10.1%，因为求和奖励「多路共识」、低估「模糊路独有」的目标。
+        # semantic 路同理：条件结构命中常是「独有召回」，故一并缺省 max。
+        # P3：因果路按设计稿 §6.2「融合口径」同为**单路独有召回型**，照抄本条先例
+        # 形态（同一表达式内追加条件，不另起第二套判据）。
+        # P3-遗留 A（2026-10-01）：表达式提为 `recall_fusion_default` 单点，
+        # 使「缺省口径 = max」可被守卫直接断言（防静默漂移）。
+        fusion = a.get("fusion") or recall_fusion_default(
+            use_fuzzy, use_semantic, use_goal, use_causal)
+        # 默认单条上限从 mdcos 取（该模块只在 main() 里惰性导入，模块级没有名字，
+        # 直接引用 mdcos.DEFAULT_MAX_ITEM_TOKENS 会 NameError —— 故此处按需导入）。
+        from .mdcos import DEFAULT_MAX_ITEM_TOKENS as _DEFAULT_MAX_ITEM
+        # 注入面强制闸（使用者裁定 2026-10-21「未验证、未信任的信息本来就不应该执行」）：
+        # recall 是**进上下文**的通路，故此处把带 untrusted 标记的条目剔出 pack，
+        # 并在 meta 记数。检索面（mdcg_search）仍可查见它们——查得到但不进提示词。
+        _pack = cg.recall(a.get("query", ""),
+                         # `is not None`：显式 0 不再被吞成默认 1200（2026-09-24 修复）
+                         budget_tokens=int(a["budget_tokens"])
+                         if a.get("budget_tokens") is not None else 1200,
+                         max_item_tokens=int(a["max_item_tokens"])
+                         if a.get("max_item_tokens") is not None
+                         else _DEFAULT_MAX_ITEM,
+                         excerpt_strategy=a.get("excerpt_strategy") or "prefix",
+                         k=_int_arg(a, "k", 20), context=a.get("context"),
+                         include_work=bool(a.get("include_work")),
+                         paths=paths, fusion=fusion,
+                         goal_text=a.get("goal"),
+                         include_recent=bool(a.get("include_recent")),
+                         recent_limit=int(a.get("recent_limit") or 10),
+                         query_expand=_make_query_expand(a.get("expand")),
+                         session=a.get("session"),
+                         validity=a.get("validity"))
+        # 注入面强制闸（使用者裁定 2026-10-21「未验证、未信任的信息本来就不应该执行」）：
+        # recall 是进上下文的通路，故把带 untrusted 标记的条目剔出 pack 并记数；
+        # 检索面（mdcg_search）仍可查见——查得到，但不进提示词。
+        try:
+            _items = _pack.get("pack") if isinstance(_pack, dict) else None
+            if isinstance(_items, list):
+                _kept, _drop = [], 0
+                for _it in _items:
+                    _fm = {}
+                    if isinstance(_it, dict):
+                        _node = _it.get("node") if isinstance(_it.get("node"), dict) else _it
+                        _fm = _node.get("frontmatter") or {}
+                    if _fm.get("untrusted"):
+                        _drop += 1
+                        continue
+                    _kept.append(_it)
+                if _drop:
+                    _pack["pack"] = _kept
+                    _pack.setdefault("meta", {})["untrusted_excluded"] = _drop
+        except Exception:
+            pass
+        # issue #653：recall 面此前完全不读 exclude_doc（schema 挂在它身上却不生效）。
+        if isinstance(_pack, dict):
+            _pk, _pk_drop = drop_doc_nodes(
+                _pack.get("pack") or [], lambda it: (it or {}).get("id"),
+                a.get("exclude_doc", False))
+            if _pk_drop:
+                _pack = dict(_pack)
+                _pack["pack"] = _pk
+                _pack["meta"] = _note_doc_filter(_pack.get("meta"), _pk_drop,
+                                                 a.get("exclude_doc", False))
+        return _pack
+
+    if name == "mdcg_search":
+        # ---- 异步检索（2026-10-21）：把「怕超时」变成「先拿工单，过几秒来取」----
+        # 背景：真实库首次检索曾要 8.4 秒、握手 5 秒，客户端 hook 若把超时设得较短
+        # 就会整单失败。异步面不改检索语义：后台线程跑的是**同一个** call_tool，
+        # 只是把「等待」从客户端挪到工单上。默认关（不带 defer_s 即同步）。
+        if a.get("job_id"):
+            return _search_job_result(str(a.get("job_id")))
+        try:
+            _defer = float(a.get("defer_s") or 0)
+        except (TypeError, ValueError):
+            _defer = 0.0
+        if _defer > 0:
+            return _search_job_submit(cg, a, _defer)
+        from . import refindex
+        # ---- query 级热缓存（默认面接线，2026-10-21）----
+        # 热缓存的读写在 search_rrf 内，而默认检索面走 cg.search（本分支）——
+        # 故此处补一层工具级缓存：键按 hotcache 既有口径 + 全部入参 + 环境开关 + 索引代际。
+        # 命中直接返回上一次的**整个工具返回体**（形状与未命中一致）；
+        # 显式 node_id / op 的调用一律绕过（那是"读某条"，不是"查一次"）。
+        from . import hotcache as _hc
+        # 工具层用**独立实例**：与 search_rrf 共用同一 _queries 字典会让两种值形状
+        # 共处一个键空间——一旦键相等就是「静默错答/解包炸裂」（蜂巢反思单元 P0）。
+        if not hasattr(cg, "_hotcache_tool"):
+            cg._hotcache_tool = _hc.HotCache()
+        # validity=True 的查询需要时钟窗，工具层不带窗口语义 ⇒ 一律不缓存（P1）。
+        _hcobj = None if ("node_id" in a or a.get("op") or a.get("validity")) else cg._hotcache_tool
+        _ckw = None
+        if _hcobj is not None:
+            try:
+                _extra = {k: v for k, v in a.items() if k not in ("query", "bm25")}
+                _extra["env_switch"] = _hc.env_switch_key()
+                if hasattr(cg, "_index_generation"):
+                    _extra["index_gen"] = cg._index_generation()
+                # 安全自检（2026-10-21）：检索结果按 **调用者身份** 过滤
+                # （MdCGSecure._candidates → _readable 按 session/密级判可见），
+                # 故缓存键必须含**有效身份**，否则高密级/他会话的结果会被低密级命中。
+                # 口径：principal(tenant/actor/clearance) + 有效 session（cg.session 覆盖入参）。
+                _pr = getattr(cg, "principal", None)
+                _eff_sess = getattr(cg, "session", None) or a.get("session")
+                _extra["identity"] = (
+                    getattr(_pr, "tenant", None), getattr(_pr, "actor", None),
+                    getattr(_pr, "clearance", None), _eff_sess)
+                # 键里直接用原始 k（不调 _int_arg：那是「六处委托单点」的守卫计数面，
+                # 多一处调用会被 test_read_face_input_gates M1-B2 判成第二份实现）。
+                _ckw = dict(k=a.get("k"), layer=a.get("layer"),
+                            session=a.get("session"), validity=a.get("validity"),
+                            extra=_extra or None)
+                _hit = _hcobj.get_query(a.get("query", ""), **_ckw)
+            except Exception:
+                _hit = None
+            if _hit is not None:
+                import copy as _copy
+                _rows, _tag = (_hit if isinstance(_hit, tuple) and len(_hit) == 2 else (None, {}))
+                if (isinstance(_tag, dict) and _tag.get("surface") == "mdcg_search"
+                        and _tag.get("v") == 1 and isinstance(_rows, list) and len(_rows) == 1
+                        and isinstance(_rows[0], dict)):
+                    # 深拷贝：hotcache 的 _copy_row 只浅一层，_out["results"] 列表会共享
+                    return _copy.deepcopy(_rows[0])
+                _hit = None          # 形状/版本不符 ⇒ 当未命中，不猜
+        res, meta = cg.search(a.get("query", ""), layer=a.get("layer"),
+                              k=_int_arg(a, "k", 20), context=a.get("context"),
+                              roles=tuple(a["roles"]) if a.get("roles") else None,
+                              include_work=bool(a.get("include_work")),
+                              pools=a.get("pools"),
+                              session=a.get("session"),
+                              validity=a.get("validity"))
+        # issue #653：search 面此前同样不读 exclude_doc（直调库层）。
+        res, _sd_drop = drop_doc_nodes(
+            res, lambda x: (x[0] or {}).get("id"), a.get("exclude_doc", False))
+        meta = _note_doc_filter(meta, _sd_drop, a.get("exclude_doc", False))
+        from . import conflict_surface
+        _cf = conflict_surface.as_meta([n for n, _s, _q in res])
+        if _cf:
+            meta = dict(meta or {})
+            meta.update(_cf)
+        _out = {"meta": meta,
+                "results": [{"node": _node_view(n), "score": s, "state": q.get("state"),
+                             "reason": q.get("reason"),
+                             # 未信任标记透出到结果行：上层据此把它当数据、不当指令
+                             "untrusted": bool((n.get("frontmatter") or {}).get("untrusted")),
+                             **refindex.ref_fields(n)}
+                            for n, s, q in res]}
+        if _hcobj is not None and _ckw is not None:
+            try:
+                # 写入时深拷贝：否则**未命中那一次**返回给调用方的对象与缓存同一份，
+                # 调用方原地改（append/改 score）就污染了缓存（蜂巢验证单元指出 _copy_row 只浅一层）。
+                import copy as _copy2
+                _hcobj.put_query(a.get("query", ""), [_copy2.deepcopy(_out)],
+                                 {"surface": "mdcg_search", "v": 1}, **_ckw)
+            except Exception:
+                pass
+        return _out
+
+    if name == "mdcg_get":
+        _nid = a.get("node_id", "")
+        node = cg.get(_nid)
+        if not node:
+            # 裸 null 让调用方无从区分「id 不存在」与「密级不可读」（2026-09-24 修复）
+            return {"ok": False, "error": "not_found", "node_id": _nid,
+                    "readable_sensitivities": _readable_sensitivities(cg),
+                    "hint": "id 不存在（或已被清退/证伪移入 rejected），"
+                            "或该节点密级高于当前身份可读——whoami 可查 clearance"}
+        return _node_view(node, offset=int(a.get("offset") or 0))
+
+    if name == "mdcg_reflect":
+        res, _ = cg.search(a.get("query", ""), k=_int_arg(a, "k", 10),
+                           record=False)
+        return cg.reflect(a.get("query", ""), res, a.get("feedback"))
+
+    if name == "mdcg_verify":
+        return cg.verify(a.get("node_id", ""), a.get("evidence", ""),
+                         a.get("verdict", ""),
+                         override=bool(a.get("override")))
+
+    if name == "mdcg_flywheel":
+        return cg.flywheel_step(a.get("error_report") or {})
+
+    if name == "mdcg_mine_fix_pairs":
+        return cg.mine_fix_pairs(a.get("events") or [])
+
+    if name == "mdcg_rejected":
+        # issue #557 R2：本入口原无写入硬上限闸 —— 负记忆正文（hypothesis/reason）
+        # 由调用方给，可单次写入任意大。复用 write/remember 的**唯一构造点**
+        # （#324 分支会量「除 content 之外其余字段」的总字节，故 hypothesis/reason
+        # 同样受约束），不新增常量、不复制判据。
+        _ov = _oversize_r2(a.get("node_id") or "", a)
+        if _ov:
+            return _ov
+        return {"id": cg.add_rejected(a.get("hypothesis", ""), a.get("reason", ""),
+                                      verification_basis=a.get("verification_basis") or "test",
+                                      tags=a.get("tags"))}
+
+    if name == "mdcg_unresolved":
+        _ov = _oversize_r2(a.get("node_id") or "", a)   # issue #557 R2：同上
+        if _ov:
+            return _ov
+        return {"id": cg.add_unresolved(a.get("question", ""), a.get("known_clues", ""),
+                                        a.get("goal", ""))}
+
+    if name == "mdcg_propose":
+        _ov = _oversize_r2(a.get("node_id") or "", a)   # issue #557 R2：propose 入队前同判
+        if _ov:
+            return _ov
+        pr = cg.propose(a.get("node_id", ""), a.get("content", ""), info=True,
+                        layer=a.get("layer") or "knowledge",
+                        tags=a.get("tags"), condition_space=a.get("condition_space"),
+                        **_proposal_extras(a))
+        out = {"pid": pr["pid"], "dedup": bool(pr.get("dedup"))}
+        if pr.get("dedup"):
+            out["dup_of"] = pr["pid"]
+            out["dup_status"] = pr.get("dup_status")
+            out["hint"] = ("同内容提案已存在（pid=%s，状态=%s），幂等返回既有提案、"
+                           "未重复入队，无需重试"
+                           % (pr["pid"], pr.get("dup_status") or "pending"))
+        return out
+
+    if name == "mdcg_review_list":
+        return {"pending": cg.review_list()}
+
+    if name == "mdcg_review_decide":
+        return cg.review_decide(a.get("pid", ""), a.get("decision", ""),
+                                edits=a.get("edits"), merge_into=a.get("merge_into"),
+                                reason=a.get("reason", ""),
+                                redteam=a.get("redteam"), issues=a.get("issues"),
+                                override=bool(a.get("override")))
+
+    if name == "mdcg_review_records":
+        nid = a.get("node_id")
+        if nid:
+            return cg.verify_review_record(nid)
+        return {"records": cg.review_records(pid=a.get("pid"))}
+
+    if name == "mdcg_forget":
+        # 三档自治批次②：与 cg(op=forget) 同一档位路径（forget_gated，见该分支注释）。
+        return cg.forget_gated(a.get("node_id", ""), a.get("reason", ""),
+                               override=bool(a.get("override")))
+
+    if name == "mdcg_restore":
+        return cg.restore(a.get("node_id", ""), force=bool(a.get("force")),
+                          overwrite_live=bool(a.get("overwrite_live")))
+
+    if name == "mdcg_protect":
+        return _protect_call(cg, a)
+
+    if name == "mdcg_forgetting_history":
+        return {"records": cg.forgetting_history(limit=int(a.get("limit") or 100))}
+
+    if name == "mdcg_identity":
+        return _identity_call(cg, a)
+
+    if name == "mdcg_consistency":
+        return _consistency_call(cg, a)
+
+    if name == "mdcg_metacognition":
+        return _metacognition_call(cg, a)
+
+    if name == "mdcg_self_state":
+        return _self_state_call(cg, a)
+
+    if name == "mdcg_predict":
+        return _predict_call(cg, a)
+
+    if name == "mdcg_causal":
+        return _causal_call(cg, a)
+
+    if name == "mdcg_evolution":
+        return _evolution_call(cg, a)
+
+    if name == "mdcg_health":
+        return cg.health_os()
+
+    if name == "mdcg_whoami":
+        return cg.whoami()
+
+    if name == "mdcg_ingest":
+        from .sources import DSHSessionSource, JsonlSource, Ingestor
+        from .security import check_path_root, whitelist_root_configured
+        src_arg = (a.get("source") or "auto").strip()
+        # P1-4（批次 26）：报告点名「mdcg_ingest 完全没有权限闸」——权限闸
+        # 已由批次 24 _MDCG_OP_REQUIRE（write）补上，此处补路径根约束。
+        #
+        # issue #326-①：auto **不是「没有路径」**——它经 discover_detailed() 扫
+        # ~/.dsh/sessions 并**整份 ingest**（跨项目数据；实测该目录 2474 文件 /
+        # ≈469MB）。只判 `src_arg != "auto"` 等于把「没有入参」当成了「没有路径」，
+        # auto 遂成绕过白名单的通路。故 auto 也要过**同一条** MDCG_INGEST_ROOT 闸，
+        # 但**仅在白名单根被显式配置时**：未配置时 _whitelist_roots 回落「记忆库根」，
+        # ~/.dsh/sessions 不在其中 ⇒ 无条件给 auto 过闸会把**默认工作流整个拦死**
+        # （报告实测的回归陷阱）。「是否已显式配置」的判据单点在
+        # security.whitelist_root_configured——**本处不另读一次 os.environ**
+        # （同一语义不得两个落点各一份判据）。
+        if src_arg != "auto":
+            check_path_root(src_arg, "MDCG_INGEST_ROOT", "mdcg_ingest")
+        ing = Ingestor(cg)
+        picked, cands = None, []
+        if src_arg == "auto":
+            # `discover_detailed` 是排序的唯一真源；候选明细留在手里，
+            # 才能在返回体里回答「为什么选中它」（issue #23 附带建议）。
+            cands = DSHSessionSource.discover_detailed()
+            if not cands:
+                return {"error": "no_dsh_session_found"}
+            picked = cands[0]
+            # 发现到的会话路径过**同一条**白名单闸（仅在显式配置时——见上）。
+            if whitelist_root_configured("MDCG_INGEST_ROOT"):
+                check_path_root(picked[0], "MDCG_INGEST_ROOT", "mdcg_ingest")
+            src = DSHSessionSource(picked[0])
+        else:
+            src = _pick_source(src_arg)
+        res = ing.ingest(src,
+                         mine_fix_pairs=bool(a.get("mine_fix_pairs", False)),
+                         max_events=a.get("max_events"),
+                         dry_run=bool(a.get("dry_run")))
+        if picked is not None:
+            res["selection"] = {
+                "policy": "max_size",
+                "selected": picked[0],
+                "selected_size": picked[1],
+                "selected_mtime": picked[2],
+                "candidate_count": len(cands),
+                "candidates": [{"path": p, "size": s, "mtime": m}
+                               for p, s, m in cands[:5]],
+                "hint": ("auto 按会话**文件体积**降序选取（**不是**按最近活动），"
+                         "故可能选中很久以前的会话；如需指定会话请显式传 "
+                         "source=<会话文件路径>，或先看 selected_mtime / "
+                         "candidates[].mtime 判断新鲜度。"),
+            }
+        return res
+
+    if name == "mdcg_watermarks":
+        from .sources import Ingestor
+        return {"watermarks": Ingestor(cg).watermarks()}
+
+    raise ValueError(f"未知工具：{name}")
+
+
+# --------------------------------------------------------------------------
+# JSON-RPC / stdio 主循环
+# --------------------------------------------------------------------------
+
+# 生效条件：error 非 None 时 msg 含 "error"=error、否则含 "result"=result，随后向 sys.stdout 写 _j(msg)+"\n" 并 flush，无返回值。
+def _reply(rid, result=None, error=None):
+    msg = {"jsonrpc": "2.0", "id": rid}
+    if error is not None:
+        msg["error"] = error
+    else:
+        msg["result"] = result
+    sys.stdout.write(_j(msg) + "\n")
+    sys.stdout.flush()
+
+
+# 生效条件：os.environ.get("MDCG_SUSTAIN","1") 取值属 ("0","false","False") 时返回 None；否则以 name=os.environ.get("MDCG_SUSTAIN_NAME") or "md_cg"、各 interval=float(os.environ.get(...) or sustain.DEFAULT_*)（空串回落默认）、各 auto_* 取 os.environ.get 默认值且值属 ("0","false","False") 时为关，调 sustain.ensure_loop 后 lp.start() 并返回 lp。
+def _start_sustain(cg):
+    """启动常驻自维持循环（MDCG_SUSTAIN=0 关闭；间隔可用环境变量调）。"""
+    if os.environ.get("MDCG_SUSTAIN", "1") in ("0", "false", "False"):
+        return None
+    from . import sleep as _sleep
+    from . import sustain
+    name = os.environ.get("MDCG_SUSTAIN_NAME") or "md_cg"
+    lp = sustain.ensure_loop(
+        cg, name,
+        beat_interval=float(os.environ.get("MDCG_SUSTAIN_BEAT")
+                            or sustain.DEFAULT_BEAT_INTERVAL),
+        heal_interval=float(os.environ.get("MDCG_SUSTAIN_HEAL")
+                            or sustain.DEFAULT_HEAL_INTERVAL),
+        # 四档 auto_* 一律经 sustain 的**单一真源读取器**（P0-2）：缺省值只在
+        # `sustain.AUTO_DEFAULTS` 定义一处，此处不得再写字面量（含 env 键名——
+        # 键名真源是 `sustain.AUTO_ENVS`）。整理巡检缺省开：确定性动作、
+        # 永不删除节点（可逆可审计）；opt-out `MDCG_AUTO_TIDY=0`。
+        auto_heal=sustain.auto_from_env("auto_heal"),
+        scrub_interval=float(os.environ.get("MDCG_SCRUB_INTERVAL")
+                             or sustain.DEFAULT_SCRUB_INTERVAL),
+        auto_scrub=sustain.auto_from_env("auto_scrub"),
+        evolve_interval=float(os.environ.get("MDCG_EVOLVE_INTERVAL")
+                              or sustain.DEFAULT_EVOLVE_INTERVAL),
+        auto_evolve=sustain.auto_from_env("auto_evolve"),
+        tidy_interval=float(os.environ.get("MDCG_TIDY_INTERVAL")
+                            or sustain.DEFAULT_TIDY_INTERVAL),
+        auto_tidy=sustain.auto_from_env("auto_tidy"),
+        # 第六档睡眠周期（§4.7）：五个值一律经 `md_cg/sleep.py` 的**单一真源
+        # 读取器**——键名真源是 `sleep.SLEEP_ENV_KEYS`、缺省真源是
+        # `sleep.SLEEP_ENV_DEFAULTS`，本处（与 op 路径）都不得再写字面量。
+        sleep_interval=_sleep.sleep_interval(),
+        auto_sleep=_sleep.sleep_enabled(),
+        sleep_merge=_sleep.sleep_merge_mode(),
+        sleep_window=_sleep.sleep_window(),
+        sleep_scrub_apply=_sleep.sleep_scrub_apply())
+    lp.start()
+    return lp
+
+
+# 生效条件：s=str(s or "").strip()；不以 "session-" 开头、或去前缀按 "-" 分组后长度不等于 [8,4,4,4,12]、或某组字符不都在 "0123456789abcdef" 时返回 False，三者皆过返回 True。
+def _is_dsh_session(s: str) -> bool:
+    """DSH 会话 id 形态判定：session-<8>-<4>-<4>-<4>-<12>（uuid4）。"""
+    s = str(s or "").strip()
+    if not s.startswith("session-"):
+        return False
+    groups = s[len("session-"):].split("-")
+    if [len(g) for g in groups] != [8, 4, 4, 4, 12]:
+        return False
+    return all(all(c in "0123456789abcdef" for c in g) for g in groups)
+
+
+# 生效条件：s=str(raw or "").strip()；s 为空返回 "anonymous"；非 DSH 形态返回 s；DSH 形态时以 root=os.environ.get("MDCG_DSH_SESSIONS_ROOT") or ~/.dsh/sessions 遍历条目，存在 root/<name>/s 目录则返回 s，os.listdir 抛 OSError 时返回 s，否则返回 "anonymous"。
+def _is_session5_like(s):
+    """会话身份五元组形态（s5.*）判定 —— 权威定义见 md_cg/session5.py。
+
+    设计者 2026-10-09 定稿：s5.<harness>.<unit>.<workspace>.<epoch>.<digest12>；
+    语义是会话身份由 (harness, unit, 工作区, 会话创建时间, 首条 user 消息)
+    确定性推导 —— 任何进程/端都能复算同一值，不依赖 env 传递。
+
+    为何不改主校验而走本分支：_is_dsh_session 只认 uuid4 形态，session- 前缀的
+    非 uuid4 串会被它判假进而降级 anonymous；s5.* 属「载体自定的会话名」，走
+    _normalize_session 的『非 DSH 形态原样采用』分支即可，无需改主路径。
+
+    延迟 import（且兼容包内/脚本两种加载形态），使本判定在 session5 模块缺失时
+    安全退化为「非 s5」，不影响既有会话归因。
+    """
+    try:
+        from session5 import is_session5
+    except ImportError:
+        try:
+            from md_cg.session5 import is_session5
+        except ImportError:
+            return False
+    try:
+        return bool(is_session5(s))
+    except Exception:
+        return False
+
+
+def _normalize_session(raw):
+    """会话 id 归一 + 轻校验（只影响归因，不影响写入）。
+
+    规则：
+      · DSH 形态且根目录下存在该会话 → 原样采用（可重算校验，防编造会话 id）；
+      · DSH 形态、根目录可读但无该会话 → "anonymous"（降级不拒绝，防特殊环境丢记忆）；
+      · 根目录不存在/不可读（未装 DSH 等）→ 原样采用（fail-soft：不因环境差异
+        丢失会话标记，此时校验降级为「仅形态判定」，是刻意的取舍）；
+      · 非 DSH 形态（载体自定的会话名）→ 原样采用；
+      · 目录根可用 MDCG_DSH_SESSIONS_ROOT 覆盖（默认 ~/.dsh/sessions）。
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return "anonymous"
+    if _is_session5_like(s):          # s5 五元组形态（见 md_cg/session5.py）
+        return s
+    if not _is_dsh_session(s):
+        return s
+    root = (os.environ.get("MDCG_DSH_SESSIONS_ROOT")
+            or os.path.join(os.path.expanduser("~"), ".dsh", "sessions"))
+    try:
+        for name in os.listdir(root):
+            if os.path.isdir(os.path.join(root, name, s)):
+                return s
+    except OSError:
+        return s                      # 目录不可读：不因环境差异丢失会话标记
+    return "anonymous"
+
+
+# 生效条件：raw=str(raw or "").strip()；raw 为空或恰为 "*" 时返回 None（不构成归因声明）；部署侧 MDCG_SESSION 或 DSH_SESSION_ID 去空白后非空时返回 None（环境权威，请求声明被否决）；否则返回 _normalize_session(raw)。
+def _declared_session(raw):
+    """**请求级会话归属声明**（归因维度，与授权正交）。
+
+    「记忆写入必须带会话身份」是既定设计，但身份来源要分场景：
+
+      · 部署侧能把会话固定在**连接**上（每会话一条 MCP 连接，或进程 env 里给了
+        `MDCG_SESSION`）→ 环境即权威，请求里的声明一律忽略，客户端不得改写归属：
+        这正是 `MdCGSecure._attribution` 注释里「MCP 面不透传该入参——客户端不得
+        伪造归属」要守的纪律；
+      · 单进程多会话的载体（如 DSH web 一个 MCP 进程服务多个前端会话）没法把会话
+        写进进程 env，此时才允许调用方在请求里声明，**且必须过 `_normalize_session`
+        的防编造校验**（DSH 形态须真存在，否则降级 anonymous），不是照单全收。
+
+    优先级（高 → 低）：env（MDCG_SESSION / DSH_SESSION_ID）> 请求声明 > 进程身份。
+
+    与 `as_unit` 的分工：`as_unit` 收窄**授权**（求交，只能变小，见 `call_tool`）；
+    本项只改**归因**、不动任何 ops 裁决——即使声明被伪造，最坏后果是「记忆贴错
+    会话标签」，拿不到任何额外权限；而归因里的 `writer` 恒为令牌 actor，请求面
+    改不了「真正谁写的」。`"*"` 是**读取**侧的跨会话视图语法（见 `stg.timeline`），
+    不是会话名，故在此一律返回 None。
+    """
+    s = str(raw or "").strip()
+    if not s or s == "*":
+        return None
+    if (os.environ.get("MDCG_SESSION")
+            or os.environ.get("DSH_SESSION_ID") or "").strip():
+        return None                  # 环境已固定会话：客户端不得改写归属
+    return _normalize_session(s)
+
+
+# --------------------------------------------------- 第 17 条 D 案：工具面移除参数
+# 裁定（设计者 2026-10-10 当场裁定「按推荐做」＝ 待裁清单第 17 条 D 案）：把 `autostart`
+# 从**模型可达的工具面**移除。为什么：该参数一经透传即触发 `units.autostart_serve` 的
+# detached `Popen`（拉起 hive serve）——即「模型经一次 MCP 调用即可拉起一个进程」，
+# 与仓内同族留档 G6/N178（`docs/eval/缺陷挖掘_自主迭代_v21.md`：review 带 autostart
+# 可在模型选的目录拉起 serve）同向。D 的边界＝**只去掉模型面的表达面**：
+#   · `units.review(autostart=...)` 与 `units.autostart_serve` **原样保留**（默认 False，
+#     供部署侧/显式代码通道使用，两仓零调用方显式置 true，故去掉透传不破坏任何调用方）；
+#   · 模型侧携带该参数 = **显式拒绝**（不是静默忽略——静默会让调用方按「已拉起」继续
+#     推理，属假成功；本仓既有教训：静默降级 = 观测面全绿而事实已偏）。
+# 本段位置说明：定义点**刻意放在 `_ccg_call` 之后**——本仓行号锚守卫
+# `scripts/check_line_anchors.py` 冻结了两处现存绿锚（`bypass_gain` 与 `MDCG_SESSION`
+# 所在行，均在 `_ccg_call` 与 `_normalize_session` 之间），在它们之前插行即把它们打红；
+# Python 按调用期解析名字，故后置定义无碍。
+_CCG_REMOVED_PARAMS = ("autostart",)
+
+
+# 生效条件：o 非 dict 时返回 ok=False 的「ccg 参数须为对象」拒答（removed_params 为空表）；o 为 dict 时 hit 取 _CCG_REMOVED_PARAMS 中存在于 o 的键（保留 _CCG_REMOVED_PARAMS 顺序），返回 ok=False、error 点名 hit、removed_params=hit 并附可照做 hint 的拒答。恒返回 dict，不做任何派发。
+def _ccg_param_gate(o) -> dict:
+    """`ccg` 对象入参闸：对象形态 ＋ **模型面已移除参数**（第 17 条 D 案）。
+
+    fail-closed：命中 `_CCG_REMOVED_PARAMS` 即拒，绝不降级为「忽略该键继续执行」。
+    """
+    if not isinstance(o, dict):
+        return {"ok": False, "op": "ccg",
+                "error": "ccg 参数须为对象：{action, node_id, dialog, ...}",
+                "removed_params": []}
+    hit = [k for k in _CCG_REMOVED_PARAMS if k in o]
+    return {"ok": False, "op": "ccg",
+            "action": str(o.get("action") or "").strip().lower(),
+            "error": "ccg 参数 %s 已从工具面移除（第 17 条 D：进程拉起不由模型面触发）"
+                     % "/".join(hit),
+            "removed_params": hit,
+            "hint": "去掉该参数后重发；serve 由部署侧拉起"
+                    "（`hive/serve_start.py` 或 `hive.exe serve --jobs <jobs>`），"
+                    "通道体检走 cg(op=ccg, action=units, doctor=true)"}
+
+
+# 生效条件：环境变量 MDCG_SESSION（优先）或 DSH_SESSION_ID 去空白后非空时把 p.session 设为 _normalize_session(raw) 并把 p.session_auto 置 False（env=声明来源，写归因三态收口据此不改写），MDCG_HARNESS 去空白后非空时把 p.harness 设为该值，MDCG_UNIT 去空白后非空时把 p.unit 设为该值，三者均为空串或未设置时 p 的对应字段保持原值（session_auto 保持构造值）；
+def _apply_attribution(p):
+    """归因维度注入（嵌套身份：(harness, session)），**不参与授权**。
+
+    · session —— MDCG_SESSION 优先（载体注入的稳定会话 id），退回 DSH_SESSION_ID
+      （DSH 每次 shell 调用注入的会话 header id），都没有则保留 Principal 自带的
+      进程随机 uuid（fail-soft，不拒绝启动）；
+    · harness / unit —— 承载端与单元分工，仅入 _audit / _recent 元数据。
+    """
+    raw = (os.environ.get("MDCG_SESSION")
+           or os.environ.get("DSH_SESSION_ID") or "").strip()
+    if raw:
+        p.session = _normalize_session(raw)
+        # 2026-10-07 三态：env 是**声明来源**（部署侧权威）——清进程自动标记，
+        # 使写归因三态收口（MdCGSecure._attributed_session）不对 env 值改写。
+        p.session_auto = False
+    harness = (os.environ.get("MDCG_HARNESS") or "").strip()
+    if harness:
+        p.harness = harness
+    unit = (os.environ.get("MDCG_UNIT") or "").strip()
+    if unit:
+        p.unit = unit
+
+
+# 生效条件：环境变量 MDCG_TOKEN 去空白后非空时经 verify_token(token, tenant=os.environ.get("MDCG_TENANT")) 构造——抛 TokenError 则返回 (None, f"令牌校验失败：{e}")，成功则返回 (_attach_theory(p), None)；否则 MDCG_LEGACY_ENV_AUTH 值为 "1"/"true"/"True" 时按 MDCG_CAN_ADMIN/MDCG_CAN_WRITE 落角色（P1-5 批次 26：admin 需 MDCG_CAN_ADMIN 与 MDCG_LEGACY_ENV_ADMIN 同时为真，只设前者时降级 recorder 并写 stderr 提示），两者都不满足时构造 can_write=False、can_admin=False、auth_mode="anonymous" 的 guest 身份，后两条路径同样返回 (_attach_theory(p), None)；
+def _build_principal():
+    """构造 Principal（令牌优先，fail-closed）。返回 (principal, error)。
+
+    优先级：
+      ① MDCG_TOKEN —— 权威路径。校验失败即拒绝启动（不降级为可用）。
+      ② MDCG_LEGACY_ENV_AUTH=1 —— 兼容旧部署的 env 直连身份（不推荐）。
+      ③ 都没有 —— 降级为只读访客 guest（不写、不管理）。
+
+    版本层（蜂群互联层0）：构造完成后统一附加 theory 状态。声明不合法时
+    theory_ok=False → 写/管理操作全拒（保留 theory 修复入口），**不拒绝启动**
+    ——身份可信但公理状态未知，禁止改写事实层即可。
+    """
+    from .security import Principal
+    from .tokens import TOKEN_ENV, TokenError, role_spec, verify_token
+
+    token = (os.environ.get(TOKEN_ENV) or "").strip()
+    if token:
+        try:
+            p = verify_token(token, tenant=os.environ.get("MDCG_TENANT"))
+        except TokenError as e:
+            return None, f"令牌校验失败：{e}"
+        # 密级口径冲突必须开口（2026-09-24 修复）：令牌优先时 MDCG_CLEARANCE
+        # **完全不参与**（令牌里冻结的 clearance 说了算），而插件侧
+        # config.mdcg.clearance 默认 'private'——配置写 private、实际 internal
+        # 会让 private/secret 节点静默读不到（本机实测：readable=[public,internal]）。
+        _want = (os.environ.get("MDCG_CLEARANCE") or "").strip()
+        if _want and _want != (p.clearance or ""):
+            sys.stderr.write(
+                f"[mdcg-mcp] ⚠ 密级配置被令牌覆盖：MDCG_CLEARANCE={_want} 但令牌"
+                f" clearance={p.clearance}（令牌优先，实际可读密级以令牌为准）。"
+                f"要让配置生效：用 --clearance {_want} 重新签发令牌，"
+                f"或删除 MDCG_TOKEN 走 legacy/env 身份。\n")
+        _apply_attribution(p)
+        return _attach_theory(p), None
+
+    if os.environ.get("MDCG_LEGACY_ENV_AUTH", "0") in ("1", "true", "True"):
+        # P1-5（批次 26，外部审查报告）：legacy env 直连身份不再能给 admin——
+        # 「环境变量可达即 designer/can_admin」= 配置即提权后门。保留兼容但
+        # admin 需**显式二次开关** MDCG_LEGACY_ENV_ADMIN=1；只设 MDCG_CAN_ADMIN
+        # 时降级 recorder 并 stderr 提示（不静默）。
+        _want_admin = os.environ.get("MDCG_CAN_ADMIN", "0") in ("1", "true", "True")
+        can_admin = _want_admin and os.environ.get(
+            "MDCG_LEGACY_ENV_ADMIN", "0") in ("1", "true", "True")
+        if _want_admin and not can_admin:
+            sys.stderr.write(
+                "[mdcg-mcp] ⚠ MDCG_CAN_ADMIN=1 在 legacy env 身份下已不生效："
+                "管理员需要二次开关 MDCG_LEGACY_ENV_ADMIN=1（P1-5 收紧，防 env "
+                "注入自授 admin）。当前降级为 recorder。\n")
+        can_write = os.environ.get("MDCG_CAN_WRITE", "1") not in ("0", "false", "False")
+        role = "designer" if can_admin else ("recorder" if can_write else "output")
+        spec = role_spec(role)
+        p = Principal(
+            tenant=os.environ.get("MDCG_TENANT", "default"),
+            actor=os.environ.get("MDCG_ACTOR", "mcp-client"),
+            clearance=os.environ.get("MDCG_CLEARANCE", "internal"),
+            can_write=can_write, can_admin=can_admin, role=role,
+            layers_allow=spec["layers_allow"], ops_allow=spec["ops_allow"],
+            auth_mode="legacy_env")
+        _apply_attribution(p)
+        return _attach_theory(p), None
+
+    spec = role_spec("guest")               # 无令牌：只读访客
+    p = Principal(
+        tenant=os.environ.get("MDCG_TENANT", "default"),
+        actor=os.environ.get("MDCG_ACTOR", "mcp-client"),
+        clearance="internal", can_write=False, can_admin=False, role="guest",
+        layers_allow=spec["layers_allow"], ops_allow=spec["ops_allow"],
+        auth_mode="anonymous")
+    _apply_attribution(p)
+    return _attach_theory(p), None
+
+
+# 生效条件：p 传入后调用 theory.ensure() 得到 st，把 p.theory_ok 置为 bool(st.get("theory_ok"))（缺键或假值均为 False，而非保留原值或 None），p.theory_version 置为 st.get("version")（缺键为 None），返回 p，且校验过程不抛异常；
+def _attach_theory(p):
+    """附加版本层状态（theory_ok / theory_version）。校验永不抛异常。
+
+    用 `ensure()`：无声明则落盘默认声明（声明常态化），异常声明才降级只读。
+    """
+    from .theory import ensure as _theory_ensure
+    st = _theory_ensure()
+    p.theory_ok = bool(st.get("theory_ok"))
+    p.theory_version = st.get("version")
+    return p
+
+
+# 生效条件：环境变量 MDCG_ROOT 非空且其 os.path.abspath 规范化后的 basename 小写不以 "_md_cg_" 开头、且 _build_principal() 返回的 err 为空时，构造 MdCGSecure(root, principal=principal, autoflush=1) 并对 sys.stdin 逐行 method 分派（initialize 回 protocolVersion=PROTOCOL_VERSION 与 SERVER_NAME/SERVER_VERSION，tools/list 回 tools_for_surface()，tools/call 经 call_tool 后回 content，shutdown 跳出循环），遍历结束后调用 sustain.stop_all() 与 cg.close() 并返回 0；MDCG_ROOT 为空或 basename 命中 "_md_cg_" 前缀返回 2，令牌校验失败返回 3；
+# 生效条件：a/b 任一为空串或 None 时返回 False；否则返回 os.path.realpath(a) == os.path.realpath(b)（realpath 解析 junction/symlink；抛 OSError 时返回 False）。
+def _same_root(a, b) -> bool:
+    """判两个路径是否指向**同一物理位置**（issue #542）。
+
+    为何必须 realpath 而非 abspath：abspath 只做字符串归一（解析 `..`），
+    **不解析 junction / symlink**，故「同一目录的两种写法」会被判为不同根。
+    实测（Windows）：
+      · `os.path.realpath(junction) == os.path.realpath(真实目标)` → True
+      · `os.path.abspath(junction) == os.path.abspath(真实目标)` → **False**
+    ⇒ 用 abspath 做租户根同一性判定时，junction 指向他人登记根**不命中反查**，
+    #98「身份与根未对照」的 fail-closed 失效（可跨租户读）。
+
+    另注大小写变形（`ROOTB`）同理：只按原串比较时亦不命中。
+    """
+    if not a or not b:
+        return False
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except OSError:
+        return False
+
+
+# 生效条件：env 缺省取 os.environ；返回 (root, err)——MDCG_TENANT 已登记（登记表路径可经 MDCG_TENANT_REGISTRY 覆盖，缺省 ~/.mdcg/_tenants.json）时 root=登记根，与显式 MDCG_ROOT 冲突（按 _same_root 判同一物理位置，非字符串比较）返回 (None, 冲突说明)；未登记租户回落 MDCG_ROOT；两者皆空返回 (None, None)；登记表损坏/不可读（TenantRegistry.load_error 留痕或读取抛异常，N124 2026-09-25）时向 stderr 写「登记根绑定失效回落 MDCG_ROOT」告警后按未登记同形回落（零闸变、只开口）；#98 反查分支同样以 _same_root 判同一性。
+def _resolve_root(env=None):
+    """租户 × 认知图根解析（issue #35 接线，独立函数供守卫测试）。
+
+    口径：MDCG_TENANT 已登记 → 登记根；与显式 MDCG_ROOT 不一致 → 冲突
+    （fail-closed，由调用方拒启）；未登记租户 → 维持 MDCG_ROOT（零变更）。
+    登记表损坏/不可读 → 同未登记回落，但必须开口（N124）：静默回落会让
+    租户根物理隔离绑定无声消失、写入落进公共根，且下方冲突 fail-closed
+    检测连带失效。
+    """
+    env = env if env is not None else os.environ
+    root = env.get("MDCG_ROOT")
+    tenant = env.get("MDCG_TENANT")
+    # issue #319（2026-10-14 DSH 端）：t_root 必须在**分支之外**先置 None——
+    # 否则「声明了未登记租户」这条路径上 t_root 未定义，下方反查面无法表达
+    # 「身份与根未对照」这一条件。
+    t_root = None
+    if tenant:
+        reg_err = ""
+        try:
+            from .security import TenantRegistry
+            reg = TenantRegistry(env.get("MDCG_TENANT_REGISTRY") or None)
+            t_root = reg.root_of(tenant)
+            reg_err = getattr(reg, "load_error", "") or ""
+        except Exception as e:                           # noqa: BLE001
+            reg_err = f"{type(e).__name__}: {e}"
+            t_root = None
+        if reg_err:
+            # N124（2026-09-25 止血）：登记表损坏/不可读时隔离绑定无声消失，
+            # 对照 MDCG_CLEARANCE 覆盖告警同款口径——零闸变、只开口。
+            sys.stderr.write(
+                f"[mdcg-mcp] ⚠ 租户登记表损坏/不可读（{reg_err}）："
+                f"MDCG_TENANT={tenant} 的登记根绑定失效，本次回落 "
+                f"MDCG_ROOT={root or '(未设)'}；请修复登记表"
+                f"（MDCG_TENANT_REGISTRY，缺省 ~/.mdcg/_tenants.json）。\n")
+        if t_root:
+            # issue #542：同一性判定必须 realpath（解析 junction/symlink）。
+            # 修前用 abspath（只做字符串归一）⇒ junction 形态被误判为「与登记根不一致」
+            # 而 **误拒**（可用性面；此为 `:4267` 侧的失效方向）。
+            if root and not _same_root(root, t_root):
+                return None, (f"MDCG_TENANT={tenant} 已登记根 {t_root}，"
+                              f"与显式 MDCG_ROOT={root} 不一致（fail-closed）")
+            root = t_root
+    # issue #319（2026-10-14 DSH 端）：反查面的条件从「未声明 MDCG_TENANT」
+    # 扩展为「未声明 **或** 声明的租户未登记」。#98 只堵了 tenant 为假这一条
+    # 路径：tenant 为真但未登记时 t_root 为 None，原 `else:` 不执行，程序直接
+    # 用 MDCG_ROOT 不做任何对照 ⇒ 只多设一个 MDCG_TENANT=default（未登记）
+    # 就能拿自己的令牌打开别的已登记租户的根（读 internal 正文 + 写入）。
+    if not (tenant and t_root):
+        # issue #98（2026-10-09 DSH 端）：**MDCG_TENANT 未设时的残余面**——原实现此时
+        # 直接返回 MDCG_ROOT，既不与登记表对照、也不看令牌属于哪个租户 ⇒
+        # 「A 的令牌 + MDCG_ROOT=B 的登记根」可跨租户读 internal 并写入。
+        # 手法（按 issue 建议 2）：**反向查登记表**——若 MDCG_ROOT 命中任一已登记租户
+        # 的登记根，而本进程未声明 MDCG_TENANT，即属身份与根未对照，fail-closed 拒绝。
+        # 无需解令牌即可堵住该形态；自建（未登记）根不受影响。
+        if root:
+            try:
+                from .security import TenantRegistry as _TR98
+                _reg98 = _TR98(env.get("MDCG_TENANT_REGISTRY") or None)
+                _owner98 = None
+                # 登记表内部就是 tenant -> 根 的 dict（TenantRegistry.data，
+                # security.py:282）；无 all_tenants() 方法，故直接迭代 data。
+                # 登记表结构 = {"schema":1,"tenants":{租户:{root,...}}}（security.py:302/:316）
+                # —— 故须迭代 data["tenants"] 的键，而不是 data 本身的键（首版即栽在此：
+                # 迭代到 schema/tenants 两个字面键，root_of 全落空 ⇒ 反查恒不命中、G1 恒红）。
+                _map98 = (getattr(_reg98, "data", None) or {}).get("tenants") or {}
+                for _tn in list(_map98.keys()):
+                    try:
+                        _tr = _reg98.root_of(_tn)
+                    except Exception:
+                        continue
+                    # issue #542：反查同一性同样必须 realpath。
+                    # 修前用 abspath ⇒ junction/大小写变形**不命中反查** ⇒ #98 的
+                    # 「身份与根未对照」fail-closed 被绕过（安全面；此为 `:4366` 侧
+                    # 的失效方向，与上方 :4267 的误拒相反）。
+                    if _tr and _same_root(_tr, root):
+                        _owner98 = _tn
+                        break
+                if _owner98:
+                    # issue #319：本面现在也覆盖「声明了未登记租户」这条路径，
+                    # 文案必须按实际情况说——否则失败信息指向错误的原因
+                    # （明明声明了 MDCG_TENANT，却说「未声明」，排查会被带偏）。
+                    _decl = (f"声明的 MDCG_TENANT={tenant} 未登记"
+                             if tenant else "未声明 MDCG_TENANT")
+                    return None, (
+                        f"MDCG_ROOT={root} 是租户 {_owner98} 的登记根，"
+                        f"但本进程{_decl} —— 身份与根未对照，"
+                        f"拒绝启动（fail-closed，issue #98/#319）")
+            except Exception:
+                pass   # 登记表不可用按未登记处理（与上方口径一致）
+    return root, None
+
+
+# 生效条件：sys.stdin/stdout/stderr 三个流逐个 reconfigure(encoding="utf-8", errors="replace")，
+# 流不支持 reconfigure（AttributeError，如被替换为非 TextIO 对象）或取值非法（ValueError）时静默跳过该流，无返回值。
+def _force_utf8_stdio():
+    """进程内强制 stdio 三流 = UTF-8（issue #39 纵深防线）。
+
+    MCP 协议是 UTF-8 JSON，但 Windows 控制台默认代码页（如 CP936/GBK）会让
+    stdio 管道跟随 locale——宿主按 UTF-8 发来的中文参数被按 GBK 解码：strict
+    下读侧直接 UnicodeDecodeError，surrogateescape 下解出代理对（\\udcXX），
+    ``_j()``（ensure_ascii=False）按 UTF-8 编码时即抛 ``UnicodeEncodeError:
+    surrogates not allowed``，整条请求失败（写英文正常，故用户难自查）。
+    桥层已在 ``src/lib/mdcg_client.ts`` 的 ``mdcgChildEnv()`` 注入
+    ``PYTHONUTF8=1``，但只覆盖 DSH 桥路径——Claude Code / code CLI 直接
+    mcp.json 接入不经桥，仍踩（issue #39）。进程内 reconfigure 是对桥层
+    防线的纵深补位；``errors="replace"`` 保证坏字节最多丢字符、不炸整条请求。
+    必须在 main() 首行调用：早于一切 stderr 中文写与 stdin 读取。
+    """
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
+# 生效条件：name 不是非空字符串、args 非对象或已提供的 op/action/as_unit 非字符串时返回可操作的参数错误提示；其余返回 None，不访问大脑、不修改参数。
+def _tool_call_input_error(name, args):
+    """校验工具调用外壳及分发控制字段（issue #83.2）。
+
+    只检查分发前消费的字符串；业务数据仍由对应工具校验，兼容现有
+    tags 等字段接受列表或逗号串的接口。显式 null 不是省略参数。
+    """
+    if not isinstance(name, str) or not name.strip():
+        return "name 必须为非空 string；请传入 tools/list 返回的工具名"
+    if not isinstance(args, dict):
+        return "arguments 必须为 object；无参数请省略 arguments 或传 {}"
+    for field in ("op", "action", "as_unit"):
+        if field in args and not isinstance(args[field], str):
+            return f"arguments.{field} 必须为 string；请按工具参数说明传值"
+    return None
+
+
+# 生效条件：已解析消息为对象时分派 JSON-RPC 方法；tools/call 先检查 params 与分发参数类型，不合法回 -32602 且不调用工具；非对象回 -32600；shutdown 返回 True，其余返回 False，未处理异常回 -32603。
+def _serve_line(cg, msg) -> bool:
+    """处理一行已解析的 JSON-RPC 消息；返回 True 表示请求进程下线（shutdown）。
+
+    入口**类型闸**（N206，2026-09-28 legacy）：此前这条分派链直接写在 main() 的
+    for 循环体里，紧跟 ``json.loads`` 就裸调 ``msg.get(...)``，tools/call 分支又
+    裸调 ``params.get("name")``——而 ``json.loads`` 的产物**不必是对象**：
+    ``[]`` / ``123`` / ``null`` / ``"x"`` / 批量数组都是合法 JSON。任何能写该
+    server stdin 的一方（MCP 宿主 / 被注入的宿主插件 / stdio 管道交错写入者）
+    发一行即得未捕获 ``AttributeError: 'list' object has no attribute 'get'``
+    逃出 main()，整个 stdio 进程退出（实测 rc=1、stdout 只到崩溃前那条）：
+    工具面 tools/list 永无应答，崩溃期间记忆面（含写入）全不可用，且零凭据可达。
+    工具层 try 只包 ``call_tool``，包不到入口解析——这是**入口面**的缺口。
+
+    同族已在位：``hive/hive_mcp/mcp_server.py`` 的 ``_rpc``（-32600/-32602 双闸）
+    + main 入口兜底（2026-09-25 v2-N16 DoS），md_cg 是漏网面。此处按**同一口径**
+    补齐：非对象 → id=null 的 -32600；tools/call 的 params 非 dict → -32602 且
+    不进工具；整体兜底 -32603。fail-closed 的语义是「坏行被拒且进程继续服务」，
+    不是「坏行杀进程」。
+    """
+    if not isinstance(msg, dict):
+        # 非对象无从取 id → 按 JSON-RPC 2.0 回 id=null 的 Invalid Request。
+        _reply(None, error={"code": -32600,
+                            "message": "Invalid Request：请求体必须为 JSON 对象"
+                                       "（收到 %s）" % type(msg).__name__})
+        return False
+    rid = msg.get("id")
+    method = msg.get("method")
+    try:
+        if method == "initialize":
+            _reply(rid, {"protocolVersion": PROTOCOL_VERSION,
+                         "capabilities": {"tools": {}},
+                         "serverInfo": {"name": SERVER_NAME,
+                                        "version": SERVER_VERSION}})
+        elif method in ("notifications/initialized", "initialized"):
+            # 2026-10-21 冷启动预热（MCP 读写超时的实测根因之一）：
+            # 本进程**首次**检索要读 26k 个候选文档（真实库实测 8.4 秒），
+            # 而读过一次之后**任意**新查询只要 0.26 秒（readcache 已热）。
+            # 故在握手完成后立刻起一个后台线程做一次"暖查询"，把这次一次性成本
+            # 挪到客户端等 initialize 之后的空档里；用户真正发起检索时通常已热。
+            # 不改变任何检索语义（record=False、结果丢弃），失败静默。
+            try:
+                if os.environ.get("MDCG_WARM_SEARCH", "1") != "0" and not globals().get("_warm_started"):
+                    globals()["_warm_started"] = True
+                    import threading as _th
+
+                    def _warm():
+                        try:
+                            cg.search("灵枢", k=1, record=False)
+                        except Exception:
+                            pass
+
+                    _th.Thread(target=_warm, name="mdcg-warm", daemon=True).start()
+            except Exception:
+                pass
+        elif method == "tools/list":
+            _reply(rid, {"tools": tools_for_surface()})
+        elif method == "tools/call":
+            params = msg.get("params")
+            # params 类型闸：非 dict（[1,2] / "x" / 7）时下方 params.get 抛
+            # AttributeError——工具层 try 包不到这里，回 -32602 不进工具。
+            # params 缺省/None 归为空对象，再由下方工具名校验给出参数提示。
+            if params is not None and not isinstance(params, dict):
+                _reply(rid, error={"code": -32602,
+                                   "message": "Invalid params：params 必须为 "
+                                              "object（收到 %s）"
+                                              % type(params).__name__})
+                return False
+            params = params or {}
+            name = params.get("name")
+            args = params.get("arguments", {})
+            input_error = _tool_call_input_error(name, args)
+            if input_error:
+                _reply(rid, error={"code": -32602,
+                                   "message": "Invalid params：" + input_error})
+                return False
+            try:
+                out = call_tool(cg, name, args)
+                _reply(rid, {"content": [{"type": "text", "text": _j(out)}],
+                             "isError": False})
+            except Exception as exc:      # noqa: BLE001 —— 工具错误以 MCP 结果返回
+                # issue #34：失败路径必须带「怎么办」——AccessDenied 的 hint
+                # （guest 配凭据 / 令牌补授权 / 过期重签）随结构化错误透出。
+                err = {"error": f"{type(exc).__name__}: {exc}"}
+                _hint = getattr(exc, "hint", None)
+                if _hint:
+                    err["hint"] = _hint
+                _reply(rid, {"content": [{"type": "text",
+                                          "text": _j(err)}],
+                             "isError": True})
+        elif method == "shutdown":
+            _reply(rid, {})
+            return True
+        elif rid is not None:
+            _reply(rid, error={"code": -32601, "message": f"method not found: {method}"})
+    except Exception as exc:              # noqa: BLE001 —— 入口兜底不崩 server
+        sys.stderr.write("[mdcg-mcp] 主循环兜底（继续服务）: %r\n" % (exc,))
+        _reply(rid, error={"code": -32603,
+                           "message": f"internal error: {type(exc).__name__}"})
+    return False
+
+
+# 生效条件：rep 为 audit.policy_report() 的返回值（或同形 dict）且 rep["available"] 为假时，返回含「⚠ 写入策略不可用」「code=」「写入将 fail-closed」与 hint 的单行文本（以 "\n" 结尾）；available 为真时返回含「写入策略：来源=」「path=」「forbidden=」「required=」的单行文本（以 "\n" 结尾）；rep 为假值或缺键时按空值渲染，恒不抛异常。
+def _policy_stderr_note(rep) -> str:
+    """启动 stderr 的策略来源单行（issue #43 契约④）——内容**单点**。
+
+    为什么单列成函数：守卫要对「启动面报出来源」做定点变异（改成空串即应转红），
+    把渲染收在一处，变异锚点才稳定、也不会与 main() 的大函数纠缠。
+    """
+    rep = rep or {}
+    err = rep.get("error") or {}
+    if not rep.get("available"):
+        return ("[mdcg-mcp] ⚠ 写入策略不可用（来源=%s code=%s）：%s；"
+                "写入将 fail-closed（不落盘、不入审核队列）。%s\n"
+                % (rep.get("source"), err.get("code"), err.get("reason"),
+                   err.get("hint") or ""))
+    return ("[mdcg-mcp] 写入策略：来源=%s path=%s（forbidden=%s required=%s）\n"
+            % (rep.get("source"), rep.get("path"),
+               rep.get("forbidden"), rep.get("required")))
+
+
+# 生效条件：以 audit.resolve_rulebook() 解析策略来源后，把单行 JSON（server/version/policy{source,path,available,forbidden,required,error}）写到 stdout 并返回 0；**恒返回 0**——不可用时 available=false 且 error 非空（含策略自描述自身抛异常的兜底形状），不判是否可用（诊断面不是失败，与 hive serve_start 的 --show-config 同语义）；不解析 root、不建 cg、不落盘、不拉起任何进程。
+def _show_config() -> int:
+    """只读配置诊断面（`python -m md_cg.mcp_server --show-config`）。
+
+    issue #43 契约④：策略来源必须在**可查询面**可见——env(MDCG_POLICY_FILE) /
+    包内默认 / 不可用。读取面与写入闸门读同一个 `audit.resolve_rulebook()`，
+    不另建判据（两套判据必然漂移）。
+
+    为什么**恒退出 0**（issue #43 键类型面补强）：本命令就是用来诊断「策略出
+    什么问题」的，策略畸形（键类型面）时它若自己 rc=1 且 stdout 空，运维手上
+    就只剩一个「看起来像崩了」的诊断器——与「不可用时 available=false」的契约
+    直接相反。故策略自描述的异常在此收口成同形状的不可用自描述；进程退出码
+    只表达「诊断面自身是否跑完」。
+    """
+    from . import audit
+    try:
+        pol = audit.policy_report()
+    except Exception as exc:                      # noqa: BLE001 —— 恒退出 0
+        pol = audit.unavailable_report(exc)
+    doc = {"server": SERVER_NAME, "version": SERVER_VERSION, "policy": pol}
+    sys.stdout.write(json.dumps(doc, ensure_ascii=False) + "\n")
+    return 0
+
+
+# 生效条件：_force_utf8_stdio() 先执行（stdio 三流强制 UTF-8，issue #39）；argv 含 --show-config 时改走只读诊断面 _show_config() 并原样返回其退出码（不解析 root、不起服务）；随后对 mdcg_root()/aux_root() 各探一次，抛 ValueError（Windows 保留设备名末段被 GetFullPathNameW 吞成设备路径，datapath._abs_host_path 守卫）时向 stderr 写一行含原始消息的告警并返回 2；此后 _resolve_root() 返回 err 非空时向 stderr 写冲突说明并返回 2；root 为空写缺少 MDCG_ROOT 并返回 2；root 的 basename 小写以 _md_cg_ 开头返回 2，令牌校验失败返回 3；其余构造 MdCGSecure 并进入 stdin 分派循环——每行经 _serve_line 处理（非对象 JSON 回 -32600 且不崩、tools/call 的非 dict params 回 -32602、分派体异常回 -32603，单行请求不得杀 server），_serve_line 返回 True（shutdown）或 stdin EOF 后脱离循环，随后 sustain.stop_all() 与 cg.close() 并返回 0。
+def main():
+    _force_utf8_stdio()
+    if "--show-config" in sys.argv:
+        return _show_config()
+    # 启动早期承接受理（Windows 保留设备名守卫）：MDCG_ROOT/MDCG_AUX_ROOT/
+    # MDCG_DATA_ROOT 等覆盖值末段若是保留设备名（aux/con/nul/com1-9/lpt1-9…），
+    # ntpath.abspath 经 GetFullPathNameW 会把整个路径吞成设备命名空间形态
+    # （例 D:\sandbox\aux → \\.\aux），datapath._abs_host_path 即抛 ValueError。
+    # 此处先探一次 root/aux 解析，命中即拒绝启动（对照下方 `_md_cg_` 前缀守卫
+    # 先例「启动即拒绝，不带病运行」）——否则首个 aux 常量面（crypto/links/
+    # signer/theory/tokens/evidence 的模块级 aux_root()）会在下方 import 处
+    # 裸崩 traceback，密钥/令牌/信任面被指到不存在的设备路径。
+    try:
+        from .datapath import mdcg_root as _probe_root
+        from .datapath import aux_root as _probe_aux
+        _probe_root()
+        _probe_aux()
+    except ValueError as _ve:
+        sys.stderr.write(f"[mdcg-mcp] {_ve}\n"
+                         "[mdcg-mcp] 拒绝启动（fail-closed）：请把上述覆盖键"
+                         "改指向末段不含保留设备名的普通目录。\n")
+        return 2
+    root, _terr = _resolve_root()
+    if _terr:
+        sys.stderr.write(f"[mdcg-mcp] 租户根冲突：{_terr}。"
+                         "请二选一：清空 MDCG_ROOT 走租户登记根，或从登记表"
+                         "（~/.mdcg/_tenants.json）移除该租户。\n")
+        return 2
+    if not root:
+        sys.stderr.write("[mdcg-mcp] 缺少 MDCG_ROOT 环境变量\n")
+        return 2
+    # root 守卫（fail-closed）：`_md_cg_` 前缀目录是 md_cg 工具链的导出/评测
+    # 产物（白箱语料 _md_cg_wisdom_graph、评测灌库 _md_cg_eval_* 等——只读
+    # 或可再生语义），不是认知图 root；配成 root 写入会污染双表示
+    # （2026-09-13 workdone_readme_en500 错写白箱语料事故根因）。
+    # 启动即拒绝，不带病运行。
+    _base = os.path.basename(os.path.normpath(os.path.abspath(root)))
+    if _base.lower().startswith("_md_cg_"):
+        sys.stderr.write(
+            "[mdcg-mcp] MDCG_ROOT 指向 md_cg 工具链产物目录（`_md_cg_` 前缀，"
+            "白箱语料/评测快照，只读或可再生语义），禁止作为认知图 root：\n"
+            f"    {root}\n"
+            "[mdcg-mcp] 请指向主认知图目录（如仓库内 md_cg/）。\n")
+        return 2
+    from .mdcos import MdCGSecure
+    # 数据面迁出插件包（issue #18 相邻问题）：旧版把运行时数据与路径配置写在包内
+    # `<pkg>/data`，pnpm 更新会连目录一起替换（实机实证 data/ 54 文件 → 0）。首启把
+    # 「旧位置仍有货」的数据**复制**到用户级数据根——node 侧插件启动时已做过一次，
+    # 这里是 python 独立使用（不经插件）时的同口径兜底。fail-safe：迁移只是增益，
+    # 任何失败都不阻塞启动，但不静默（走 stderr）。
+    try:
+        from .datapath import migrate_legacy_data as _migrate_legacy
+        _mig = _migrate_legacy()
+        if _mig.get("ran"):
+            sys.stderr.write(
+                "[mdcg-mcp] 数据面已迁出插件包（旧位置只复制未删除）：%s → %s"
+                "（%d 项）\n" % (_mig["from"], _mig["to"], _mig["copied"]))
+        elif _mig.get("failed"):
+            sys.stderr.write("[mdcg-mcp] 数据面迁移部分失败（不阻塞启动）：%s\n"
+                             % (_mig["failed"],))
+    except Exception as _mig_exc:       # 迁移故障不得影响服务可用性
+        sys.stderr.write("[mdcg-mcp] 数据面迁移检查失败（不阻塞启动）: %r\n"
+                         % (_mig_exc,))
+    # 两个根一并留痕（2026-09-24）：记忆真源与「身份/凭据根」**有意分离**
+    # （身份不随认知图迁移），但分居两处必须可见——历史事故多为「以为在一处」。
+    try:
+        from .datapath import aux_root as _aux_root
+        sys.stderr.write(
+            "[mdcg-mcp] 路径：记忆真源 root=%s · 身份/凭据根 aux=%s"
+            "（aux 可用 MDCG_AUX_ROOT 覆盖）\n" % (root, _aux_root()))
+    except Exception:                   # 仅日志：任何失败都不影响启动
+        pass
+    principal, err = _build_principal()
+    if err:
+        sys.stderr.write(
+            f"[mdcg-mcp] {err}\n"
+            "[mdcg-mcp] 拒绝启动（fail-closed）。签发令牌：\n"
+            "    python -m md_cg.tokens issue --role designer --actor <你>\n"
+            "然后设置 MDCG_TOKEN=<返回的明文令牌>。\n")
+        return 3
+    # 会话归属（归因维度，不参与授权）：部署侧可为每个 agent 连接注入固定
+    # 会话 id（MDCG_SESSION），多会话共用一个 root 时按 frontmatter.session
+    # 区分「本会话记忆 / 其他会话记忆」；缺省=进程自动生成（sess_<uuid>）——
+    # 2026-10-07 三态：该自动态在**写归因落盘**时收口为 'unattributed'
+    # （MdCGSecure._attributed_session；本处注入值是声明来源，须清自动标记）。
+    _p_session = os.environ.get("MDCG_SESSION", "").strip()
+    if _p_session:
+        principal.session = _p_session
+        principal.session_auto = False
+    # 索引可见性（2026-09-16）：autoflush=1 —— 逐条写入立即落分片日志
+    # `_index_log/`。根因（第4条取证）：默认 autoflush=64 且常驻进程不 close，
+    # 单条写入在达阈值前**对其他进程不可见**（`_load_index` = 快照 + 分片日志
+    # 重放；`_index.json` 只在 compact/rebuild 时重写），表现为「写入返回
+    # committed=true 但第16条读回确认在跨进程读面上不可检索」。本参数是
+    # server 级兜底：覆盖不经 writepipe 写链的路径（propose / remember_gated /
+    # add_rejected 等）；写链另有显式提交边界（writepipe._commit_visibility）。
+    cg = MdCGSecure(root, principal=principal, autoflush=1)
+    # 外部验证器注入（**能力外置**）：识图/实测/验收等能力不在认知图内，
+    # 由 MDCG_VERIFIER_MODULES（逗号分隔 import 路径）声明的外部模块注入，
+    # 通常位于私有运行时仓。加载失败不阻塞启动——失败原因写进 stderr 与
+    # service_info，未注入的 content_kind 恒判 DEFER（诚实，不假装通过）。
+    from . import audit as _audit
+    # 写入策略来源（issue #43 契约④）：策略不可见时用户只看得到「text 写入进
+    # 审核队列」这一症状，看不到第一因（策略从哪来 / 有没有）。故启动即报来源；
+    # 不可用时写明后续写入会 fail-closed，而不是让写入在暗处降级。
+    # 诊断面**不得让 server 退出**（issue #43 键类型面补强，N225 教训）：这一行
+    # 在 main() 的任何 try 之外，启动期崩＝记忆面整体不可用——策略畸形恰好是
+    # 最需要被看见的处境，不是拒绝启动的理由。策略自描述自身的异常在此收口
+    # （形状闸是第一道防线，本条是第二道），启动继续，写入侧另有 fail-closed。
+    try:
+        sys.stderr.write(_policy_stderr_note(_audit.policy_report()))
+    except Exception as _pol_exc:                 # noqa: BLE001
+        sys.stderr.write("[mdcg-mcp] ⚠ 策略自描述失败（不阻塞启动）：%r\n"
+                         % (_pol_exc,))
+    _verifiers = _audit.load_external_verifiers()
+    if _verifiers.get("loaded") or _verifiers.get("failed"):
+        sys.stderr.write("[mdcg-mcp] 外部验证器: loaded=%s failed=%s\n"
+                         % (_verifiers.get("loaded"), _verifiers.get("failed")))
+    # ③ 两段式对账：上个进程若被杀在「落盘前后」之间，账本里会留下「有意图
+    # 无结果」的写入——启动即清账（内容确已落盘 → 补账 committed；没落上 →
+    # 如实标记 interrupted）。失败**不阻塞启动**：对账是增益，不是服务前提，
+    # 但必须上报（stderr），不静默。
+    try:
+        _rep = cg.reconcile_writes()
+        if _rep.get("unpaired"):
+            sys.stderr.write("[mdcg-mcp] 写入两段式对账: 未结清=%s 补账=%s "
+                             "中断=%s\n" % (_rep.get("unpaired"),
+                                            _rep.get("committed"),
+                                            _rep.get("interrupted")))
+    except Exception as _exc:         # 对账故障不得影响服务可用性
+        sys.stderr.write("[mdcg-mcp] 两段式对账失败（不阻塞启动）: %r\n"
+                         % (_exc,))
+    # ③' 启动对账 reconcile v0（v0.3 T9 自稳定定理落地，落地清单 P0-3）：两段式
+    # 清账只覆盖「有意图无结果的写入」，这里补全量 diff——索引（派生态）vs 盘面
+    # 真源：多/缺索引条目与内容哈希漂移三类，以盘面为真源**增量**修复索引面；
+    # 真源自身损坏只告警留痕不自动改写（T9 边界：结构合法≠内容正确）。告警与
+    # 留痕由模块发声（diff 非空才输出，干净库零噪声）；MDCG_RECONCILE=0 关闭
+    # （缺省开，开关真源 reconcile.enabled）。失败不阻塞启动，与③同风格。
+    # 2026-10-21 启动耗时：reconcile_state 实测 2.92 秒（真实库 31,688 节点），
+    # 是 initialize 5.18 秒里最大的一块。它自己的注释与 reconcile 模块都写明
+    # 「失败不阻塞启动、属增益」，故默认放到**后台线程**跑：握手不再等它。
+    # MDCG_RECONCILE_BG=0 可退回同步（旧行为，便于对照与排障）。
+    def _reconcile_bg():              # noqa: D401 —— 承接面：cg.reconcile_state()
+        try:
+            cg.reconcile_state()
+        except Exception as _exc:     # 对账故障不得影响服务可用性
+            sys.stderr.write("[mdcg-mcp] 启动对账 v0 失败（不阻塞启动）: %r\n"
+                             % (_exc,))
+
+    if os.environ.get("MDCG_RECONCILE_BG", "1") == "0":
+        _reconcile_bg()
+    else:
+        import threading as _thr
+        _thr.Thread(target=_reconcile_bg, name="mdcg-reconcile",
+                    daemon=True).start()
+    # 进程自报（诊断设施，fail-safe）：把「md_cg 实际加载源 + render 契约代际」
+    # 落成 `<tempdir>/md_cg_servers/<pid>.json`，供 `scripts/mdcg_stale_servers.py`
+    # 机械判定**活进程代际**。根因（第4条取证）：原先只能比「进程启动时间 vs
+    # md_cg/*.py 最新 mtime」，该判据有活体盲区——npm 副本进程启动于 11:37~11:39
+    # 而源码 mtime 为 09:24，故 stale=False，却持插件包 0.4.8 的旧契约
+    # `codeindex.render`，把全量重建成果刷回 old_synth（AGENTS.md §5 运维注记）。
+    # 自报给的是**绝对事实**（进程自己报出实际加载源），不再依赖相对量推断。
+    # 失败不阻塞启动：自报是增益，不是服务前提，但必须上报（stderr），不静默。
+    try:
+        from . import selfreport
+        _sr = selfreport.report(tag="mcp_server")
+        if _sr:
+            sys.stderr.write(
+                "[mdcg-mcp] 自报: source=%s render_version=%s\n"
+                "[mdcg-mcp] 自报文件: %s\n"
+                % (_sr.get("source_dir"), _sr.get("render_version"),
+                   _sr.get("self_report_path")))
+        else:
+            sys.stderr.write("[mdcg-mcp] 自报写入失败（不阻塞启动；"
+                             "该进程的代际将无法被外部机械判定）\n")
+    except Exception as _exc:             # noqa: BLE001 —— 自报不得阻塞启动
+        sys.stderr.write("[mdcg-mcp] 自报异常（不阻塞启动）: %r\n" % (_exc,))
+    # 代校验（generation 单点，2026-09-30）：stdio 服务**真正开始服务之前**，把盘面
+    # 上所有「函数内延迟导入」在本进程的模块面上试解析一遍（导入目标模块 → getattr
+    # 取名字）。根因（第4条取证）：长驻进程只在模块首次导入时读盘，而 md_cg 内有
+    # 大量写在函数里的延迟导入（AST 实测 328 处，相当一部分是为避开循环导入）——
+    # 升级后旧代已载入模块与新代惰性模块跨代混用，实测表现为 cg 写入返回
+    # `ImportError: cannot import name 'mint_auto_id' from 'md_cg.mdcg'` 而盘面完全
+    # 正常（该延迟导入要到运行期才炸，且报错点离根因很远）。此处提前到启动期显式
+    # 判一次：**名字缺失即拒绝启动**（fail-closed，消息自带「请重启常驻 MCP 进程」
+    # 指引）；外部可选模块缺失（不在盘面的可选降级面，如 whitebox_kb/aeis_core 的
+    # 惰性身体面）非致命，但计数如实上报，不静默。
+    # 调用点必须在**函数体内**：这些延迟导入里相当一部分是为避开循环导入才写在函数
+    # 里的，本校验若放到模块顶层会把避环结构重新咬回来（同族守卫
+    # md_cg/test_generation_guard.py 有 AST 断言钉死这一点）。
+    try:
+        from . import generation as _gen
+        _dep = _gen.verify_delegations()
+    except Exception as _dep_exc:        # noqa: BLE001 —— 未通过即拒绝服务，不带病运行
+        sys.stderr.write("[mdcg-mcp] 代校验未通过（拒绝启动，fail-closed）：%s\n%s\n"
+                         % (type(_dep_exc).__name__, _dep_exc))
+        return 4
+    sys.stderr.write(
+        "[mdcg-mcp] 代校验：延迟导入 %d 项 / 目标模块 %d 个 / 已解析 %d 项 / "
+        "可选缺失 %d 项 · 代 %s\n"
+        % (_dep.get("delegations"), _dep.get("target_modules"),
+           _dep.get("resolved"), len(_dep.get("unavailable") or []),
+           _gen.STARTUP_FINGERPRINT[:12]))
+    _start_sustain(cg)
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            # #151（2026-10-12 DSH 端）：**拒 NaN / Infinity 字面量**。
+            # Python 的 json.loads 默认接受 `NaN`/`Infinity`/`-Infinity`（非标准 JSON
+            # 扩展），解析出的 float 会一路带进写入面（importance/confidence 等）成为
+            # 非有限值。用 parse_constant 直接抛 ValueError ⇒ 走下方既有的 -32700
+            # Parse error 通道（客户端拿到明确信号，不再是「看起来合法」的请求）。
+            def _reject_const(s):
+                raise ValueError("非标准 JSON 字面量：%s（JSON-RPC 不接受 NaN/Infinity）" % s)
+            msg = json.loads(line, parse_constant=_reject_const)
+        except (ValueError, RecursionError) as _pe:
+            # issue #83.1：非法 JSON 按 JSON-RPC 2.0 回 -32700 Parse error。
+            # 修前此处静默 continue —— 客户端只能等超时，且无任何信号；
+            # 解析失败时无从取 id（JSON-RPC 规定 Parse error 的 id 为 null）。
+            # issue #321（2026-10-14）：捕获面还须含 RecursionError——它属
+            # RuntimeError 族**不是** ValueError：一行约 20 KB、嵌套约 1 万层的
+            # **合法** JSON 会让 json.loads 抛 RecursionError，旧 except 只捕
+            # ValueError 即被它逃出 main 的 try ⇒ 常驻 server rc=1 退出，攻击行
+            # 之后的请求（含写入）全无应答；且解析在鉴权之前，零凭据可达。
+            # 口径与 hive 侧 N231（hive/hive_mcp/mcp_server.py:1362）同源：超深
+            # 输入不进入解析面，按 -32700 回一行、继续服务。
+            try:
+                _reply(None, error={"code": -32700,
+                                    "message": "Parse error：请求体不是合法 JSON"})
+            except Exception:      # noqa: BLE001 —— 回写失败不带崩 server
+                pass
+            sys.stderr.write("[mdcg-mcp] Parse error（已回 -32700）: %r\n" % (_pe,))
+            continue
+        # N206：msg 非 dict（`[]`/`123`/`null`/`"x"`/批量数组都是合法 JSON）
+        # 由 _serve_line 的入口类型闸拦下（-32600，不崩）；此处再兜一层——
+        # 兜底件本身失败（stdout 已断等）也只少一条应答，不带走整个 server。
+        try:
+            stop = _serve_line(cg, msg)
+        except Exception as exc:          # noqa: BLE001 —— 入口兜底不崩 server
+            sys.stderr.write("[mdcg-mcp] 主循环兜底（继续服务）: %r\n" % (exc,))
+            try:
+                _reply(msg.get("id") if isinstance(msg, dict) else None,
+                       error={"code": -32603,
+                              "message": f"internal error: {type(exc).__name__}"})
+            except Exception:             # noqa: BLE001 —— 回写失败不再叠加异常
+                pass
+            continue
+        if stop:                          # shutdown：跳出读循环，正常下线
+            break
+
+    try:                                  # 正常下线：清戳，对端看到的是 stopped
+        from . import sustain
+        sustain.stop_all()
+    except Exception:                     # noqa: BLE001
+        pass
+    try:
+        cg.close()
+    except Exception:                     # noqa: BLE001
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

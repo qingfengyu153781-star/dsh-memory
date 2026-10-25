@@ -1,0 +1,59 @@
+name: discipline-check
+
+# 工作纪律真源 → 各端产物的一致性守卫（外部评审建议 2：守卫接入 CI）。
+# 硬失败四项：产物缺失 / 孤儿声明 / 工具名未随端标注 / 产物陈化（渲染产物**缺**内嵌
+# 真源指纹，或内嵌指纹 ≠ 真源指纹）。
+# 陈化与缺失同级退出 1——改真源未重渲染的产物会把旧纪律继续注入各端，放行等于无守卫。
+# N253（2026-10-05，high）：陈化面的「缺内嵌指纹」此前只对**指针型**产物兑现
+# （verify_discipline.py 指针分支记 missing 硬失败），渲染型产物走的是「无指纹 ⇒
+# stale=False ⇒ ok=True」——删行 / 大写十六进制 / 空白插在「前16位」与「）：」之间 /
+# 16 位 hex 内含空白四种形态实测皆 sha=None、missing=0、ok=True，本项硬失败被整体
+# 静默绕过。现对 render 非 false 的目标同样记 missing 硬失败；仅 render:false 的
+# 真·手工投影豁免（其漂移由字段级逐字比对兜底）。
+#
+# --allow-missing：仓外目标（~/.dsh 受管块）与本地私有件（AGENTS.md，.gitignore）
+# 在 CI 上不存在属预期；缺失跳过，但产物存在时仍逐字严格校验。
+# 触发面（2026-10-23 修）：本检查是 main 分支保护的**必需检查**（required_status_checks.contexts 含 discipline），
+# 此前按 paths 过滤 ⇒ 不触碰纪律路径的 PR（如只改 md_cg/*.py、docs/theory/*.md、README）
+# **永不触发**该 workflow ⇒ 必需检查「从未出现」⇒ GitHub 判 mergeState=BLOCKED，只能管理员绕过。
+# 已三次复现：PR #577（README 精简）/ #593（docs/theory 入仓）/ #661（关系类型白名单）。
+#
+# 现删除 paths 过滤：**必需检查必须总跑**，否则「不碰纪律面」的 PR 结构性无法通过常规流程。
+# 反方案（若不删而保留 paths）只有一个：把 discipline 从 required contexts 移除——
+# 那等于放松保护，不取。
+# 代价：每次 PR 多跑一次本 workflow（约 1-3 分钟）；收益：纪律漂移在每个 PR 上都被检，
+# 而不只在「碰巧改了纪律文件」的 PR 上被检。
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  discipline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      # 守卫链的硬依赖：两个校验步骤都 import render_discipline，后者用 yaml.safe_load
+      # 读 docs/discipline/harnesses.yaml（适配矩阵真源）。
+      # 20260917 取证：本步骤此前缺失 → 自 d99c707 引入起 7/7 运行全红
+      # （ModuleNotFoundError: No module named 'yaml'，崩在 verify_discipline.py L25
+      # → render_discipline.py L28），门禁形同未上线：红着等于没门禁。
+      - name: 安装守卫链依赖（PyYAML：render_discipline 解析 harnesses.yaml）
+        run: python -m pip install pyyaml
+      # A2（2026-10-05 使用者裁决）：投影判据体必须在全部自动化面**真的执行**——此前无
+      # --cg-root 时 verify 静默 [SKIP] 退 0（判据体从未跑过）。CI 环境没有本机认知图库，
+      # 故先用仓内既有 discipline_nodes.py 在 checkout 里建一个最小库（只有 structural/ 层，
+      # 由真源同步而来、逐字节可重放），再把它的路径显式交给守卫；root 三态一律 fail-closed。
+      - name: 建最小认知图库（投影判据体的执行面；root 不存在则建）
+        run: python scripts/discipline_nodes.py --init --write --cg-root .tmp/discipline-cg
+      - name: 纪律真源 ↔ 各端产物一致性（缺失/孤儿/工具名随端/陈化 四项硬校验）
+        run: python scripts/verify_discipline.py --allow-missing --cg-root .tmp/discipline-cg
+      # 注入面守卫自检：祖先链发现 / 槽位声明完备 / path_dup·root_shadow 硬判据 / dir 别名折叠
+      # （junction 别名折叠项在 Linux 上自动 SKIP——mklink 不存在，属环境差异非失败）
+      - name: 注入面发现与防重复自检（Pi⑦⑤）
+        run: python scripts/test_injection_chain.py

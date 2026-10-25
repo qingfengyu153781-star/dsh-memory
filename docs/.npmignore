@@ -1,0 +1,44 @@
+# npm 打包排除清单（docs/ 子目录级）
+#
+# ⚠️ 为什么必须放这里而不是仓库根：npm 在 package.json 存在 files 白名单时，
+# 根级 .npmignore 被整体忽略，只有「白名单目录自身的 .npmignore」生效
+# （与 md_cg/.npmignore 同一套机制，2026-09-15 实证修复）。
+#
+# 实证（修复前 dry-run）：docs/experiments/md-cg-gate-probe/_store/ 下 40+ 个
+# 运行时文件被打进发布产物——15+ 个 _audit.jsonl（操作留痕，单最大 133.8kB）、
+# 4 个 _index_log（索引日志，单最大 511.2kB）、_access.log、_index.json.lock，
+# 另有 docs/experiments 下 2 个 __pycache__/*.pyc。
+# 这些是探针运行时生成的凭据信封/审计留痕，与 md_cg 的 _keys.json 同级别，绝不入包。
+
+# 认知图运行时状态（本目录下任意层级）
+_keys.json
+_keys.*.json
+*_audit.jsonl
+_access.log
+_index.json
+_index.json.lock
+_index_log/
+_refindex.json
+
+# Python 字节码缓存（本目录下任意层级）
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+# ─────────────────────────────────────────────────────────────────────────────
+# 发版门禁收口（PUBLISH-GATE-CLOSE-20260920）：实验工作区与含本机/沙箱路径的文档 —— 绝不入包
+#
+# 同 md_cg/.npmignore：npm 在白名单目录内读本文件、不读 .gitignore。
+# 实验区（.gitignore 已整体忽略）与第三方沙箱路径文档不入 npm 分发面；
+# 文档本体仍在公开仓，仅不随包分发（第三方交付物按「原样保留」原则不改其内容）。
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 实验工作区（脚本 / result_*.json / _store 数据目录，均为可重跑再生产物）
+experiments/
+
+# ・第三方交付物（原样保留，不改其内容）
+eval/第三方验证报告_LoCoMo_灵枢_.md
+# ・以下两件原含本机路径被排除；2026-10-05 B6 已把其路径改写为中性占位
+#   （check_local_paths 追踪面零命中）——排除保留＝发布面不变更，如需入包另行裁决
+hive/真实库端到端实测_S1b与召回权衡_v0.1.md
+hive/真实库端到端实测_S7倒排候选层_v0.1.md

@@ -1,0 +1,681 @@
+"""
+condition_vm.py · 智能论字节码 VM（第六阶段 C1 · 原生编译地基）
+道德经助记符 → 指令；条件空间/信任 为 VM 内建状态（非外部运行时调用）。
+  道(DAO)=创建协议路径(条件空间栈压入)  德(DE)=信任累积  知足(ZHIZU)=信任达标跳转
+  自然(ZIRAN)=恢复默认条件空间  无为(WUWEI)=让出控制  止(ZHI)=停止
+  若…则…否则 = JUMP_IF_FALSE（条件跳转）
+零 Python 依赖运行时（VM 自足）——「完全使用智能论的分析方法和逻辑」的 VM 层。
+"""
+
+import math
+import time
+from enum import IntEnum
+
+
+class Opcode(IntEnum):
+    PUSH_CONST = 0      # 压字面量
+    LOAD_NAME = 1       # 符号表取值（以名举实·读）
+    STORE_NAME = 2      # 符号表存值（以名举实·写）
+    JUMP = 3            # 无条件跳转
+    JUMP_IF_FALSE = 4   # 栈顶假则跳（若…则…否则）
+    DAO = 5             # 道：创建协议路径（条件空间栈压入）
+    DE = 6              # 德：信任值累积
+    ZIRAN = 7           # 自然：恢复默认条件空间（弹栈到根）
+    WUWEI = 8           # 无为：让出控制（yield）
+    ZHI = 9             # 止：停止执行（halt）
+    ZHIZU = 10          # 知足：信任≥阈值跳转
+    CMP_EQ = 11         # 等于
+    CMP_GT = 12         # 大于
+    CMP_LT = 13         # 小于
+    ENTER_SHUYUE = 14   # 进入术曰块（作用域）
+    RETURN_STEP = 15    # 步骤返回（出作用域）
+    ADD = 16            # 加
+    SUB = 17            # 减
+    MUL = 18            # 乘
+    DIV = 19            # 除
+    CMP_NE = 20         # 不等于
+    CMP_LE = 21         # 不大于（≤）
+    CMP_GE = 22         # 不小于（≥）
+    CALL = 23           # 调用函数（定义 名（参数）：语句；调用栈帧）
+    RETURN = 24         # 返回调用者（恢复符号表与返回地址）
+
+    @classmethod
+    def names(cls):
+        return {m.name: m.value for m in cls}
+
+
+# =============================================================================
+# VM 内建名（name_checker.BUILTIN_SYMBOLS 的运行时投影）
+# =============================================================================
+# 背景（2026-09-14 修复缺陷②③）：name_checker 在**编译期**把
+# 信任值/条件空间/条件空间名 声明为合法符号（以名举实·静态检查），
+# 但 VM 从未绑定它们 —— 于是编译期放行、运行期 NameError
+# （"名实不符：'信任值' 未声明"）。本表补齐运行时投影，使「名」与「实」
+# 指向同一处存储：
+#   信任值   → trust_value 寄存器（读写）。德(DE) 改的正是该寄存器，
+#              故 德 与 信任值 自动同步（修复前二者互不通信）
+#   条件空间 → 当前条件空间名（读）；赋值=切换（见 STORE_NAME）
+#   空间名   → 其自身（字符串），使「若 条件空间 为 伴侣」成为真实运行期比较
+#   信任分量 → trust_parts 寄存器（默认 0.0）
+# 单一真源仍是 name_checker.BUILTIN_SYMBOLS；本表是其投影，
+# 由 test_vm_builtins 的一致性断言守住「两侧符号名必须相同」。
+BUILTIN_TRUST_VALUE = "信任值"
+BUILTIN_CONDITION_SPACE = "条件空间"
+BUILTIN_TRUST_THRESHOLD = "信任阈值"
+DEFAULT_TRUST_THRESHOLD = 0.7
+CONDITION_SPACE_NAMES = ("伴侣", "工作", "默认", "恢复默认", "default")
+TRUST_COMPONENT_NAMES = ("P_trust", "T_pred", "T_context", "E_weight", "情感权重")
+DEFAULT_CONDITION_SPACE = "默认"
+
+#: SEMANTICS.md §1 写面标「—」的只读内建名（N272）：写入 → 结构化拒。
+#: 与 name_checker.READONLY_BUILTIN_NAMES 同集——编译期/运行期同判。
+READONLY_BUILTIN_NAMES = frozenset(CONDITION_SPACE_NAMES) | {BUILTIN_TRUST_THRESHOLD}
+
+#: 内建名缺失哨兵（区分「内建值为 None」与「不是内建名」）
+_MISSING = object()
+
+# 生效条件：value 是 bool 或 int（任意精度——int 恒有限）时返回 True；是 float 且 math.isfinite(value) 为真时返回 True；字符串/None/复数以及 inf/-inf/nan 返回 False。对超出双精度范围的 int 也返回 True（不抛 OverflowError）。
+def is_finite_number(value):
+    """数值闸单点（issue #435）：运行期「必须是数值」= 可比较的**有限**数。
+
+    此前写闸只判 isinstance(x, (int, float))——float('inf')/float('nan')
+    正是 float ⇒ 放行，信任寄存器被永久毒化（NaN 破坏比较自反性、inf
+    恒超阈值）。编译期同判由 compiler._finite_operand 承担（双闸同口径）。
+
+    **全函数**（复核意见 1）：`math.isfinite(10**400)` 会抛 OverflowError
+    （int too large to convert to float）——任意精度 int 本身恒有限，
+    必须先按类型短路，判据才不把「合法大整数」变成裸异常。
+    """
+    if isinstance(value, int):          # bool 是 int 子类，同样恒有限
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    return False
+
+
+class VMHalt(Exception):
+    """止：正常停止（含 yield 让出——kind 区分）"""
+# 生效条件：kind 缺省为 "halt"，state 缺省为 None；state or {} 使 None/0/""/[] 等假值均回落为 {}，随后 super().__init__(f"VM {kind}")。
+    def __init__(self, kind="halt", state=None):
+        self.kind = kind
+        self.state = state or {}
+        super().__init__(f"VM {kind}")
+
+
+class VMResourceError(Exception):
+    """VM 资源越界（N149 加固）：结构化错误——区别于 VMHalt（止/无为=语言控制流）
+    与 RecursionError（步数上限·既有契约）。
+    kind: "wall"（超出墙钟预算）| "mul_scale"（MUL 结果规模越界，申请未发生）
+          | "memory"（单步分配失败 MemoryError 转结构化）
+          | "jump"（跳转/调用入口/返回地址越界——N239 地址校验单点 _jump）
+        | "call_depth"（CALL 帧深超 VM_MAX_CALL_DEPTH——issue #326-③）"""
+# 生效条件：kind 存入 self.kind，message 交 super().__init__。
+    def __init__(self, kind, message):
+        self.kind = kind
+        super().__init__(message)
+
+
+class VMBuiltinError(Exception):
+    """内建名写入契约违例（N270/N272）：结构化错误——与 Rust
+    `VmError::Error`（vm.rs STORE_NAME 分支与 run 初值归一）同判据。
+
+    kind: "type"（写类型不符：信任值/信任分量须数值、条件空间须字符串）
+          | "readonly"（SEMANTICS.md §1 写面「—」的只读内建名写入）。
+    修复前：条件空间写数值静默成空间名（cond_name=0.9）、信任值写字符串
+    裸 TypeError（末态 round 崩）、信任阈值/空间名写入落 symbols 静默遮蔽
+    内建读取——两 VM 皆漏。
+    单点收口：写闸在 STORE_NAME（编译期同判由 name_checker 保护面扩展），
+    初值闸在 reset——不另立第二份判据。
+    """
+# 生效条件：kind 存入 self.kind，message 交 super().__init__。
+    def __init__(self, kind, message):
+        self.kind = kind
+        super().__init__(message)
+
+
+# =============================================================================
+# N149 资源加固参数（单步代价/分配上限）：上限为加固参数——合法编译产物
+# （信任算术：小浮点/小整数/短名串）远触不到；恶意 .pbc 的「防线内慢单步 /
+# 天文数字申请」面由此结构性拒绝（申请在发生前被拦，非事后回收）。
+# =============================================================================
+#: MUL 整数结果位数上限（操作数位数之和；65536 位 ≈ 2 万位十进制数）
+VM_MAX_INT_BITS = 1 << 16
+#: MUL 序列重复元素数上限（str/list/tuple × int；16,777,216 元素）
+VM_MAX_SEQ_REPEAT = 1 << 24
+#: run 墙钟预算默认秒数（传 None/0 关闭——宿主自担）
+VM_DEFAULT_WALL_SECONDS = 10.0
+#: CALL 帧深上限（fail-closed；issue #326-③）。深递归下「每帧整份拷贝条件空间」
+#: 曾使峰值内存随深度**二次**增长（实测 10s 内 1.0–1.6 GB，两方独立复现）——本上限
+#: 把「深度」这一维钉死（越界即 VMResourceError("call_depth")），配合帧内改「存引用 +
+#: 存长度、返回时按长度截断 + 就地改写前写时复制」把总代价压回**线性**。合法产物远离该值。
+VM_MAX_CALL_DEPTH = 512
+
+
+# 生效条件：对 (a, b) 两个 int（含 bool）估 a.bit_length()+b.bit_length() 超 VM_MAX_INT_BITS、str/list/tuple × int 估 len(seq)*abs(int) 超 VM_MAX_SEQ_REPEAT 时抛 VMResourceError("mul_scale")（乘法申请不发生）；float 参与及其余组合不拦（结果有界或交由既有 TypeError）。
+def _check_mul_scale(a, b):
+    """N149：MUL 单步结果规模守卫——越界即拒（结构化错，乘法不执行）
+
+    只估规模不真乘：int 看操作数位数之和，序列×int 看元素数。
+    合法产物（信任算术/名称格式化）远触不到上限；恶意 .pbc 的
+    「一条 MUL 申请数 GiB」面在此结构性关闭。"""
+    if isinstance(a, int) and isinstance(b, int):
+        if a.bit_length() + b.bit_length() > VM_MAX_INT_BITS:
+            raise VMResourceError(
+                "mul_scale",
+                f"MUL 整数结果规模越界（{a.bit_length()}+{b.bit_length()} 位"
+                f" > 上限 {VM_MAX_INT_BITS} 位）——申请已被拒绝")
+    elif isinstance(a, str) and isinstance(b, int):
+        if len(a) * abs(b) > VM_MAX_SEQ_REPEAT:
+            raise VMResourceError(
+                "mul_scale",
+                f"MUL 字符串重复规模越界（len={len(a)}×{abs(b)}"
+                f" > 上限 {VM_MAX_SEQ_REPEAT} 元素）——申请已被拒绝")
+    elif isinstance(b, str) and isinstance(a, int):
+        if len(b) * abs(a) > VM_MAX_SEQ_REPEAT:
+            raise VMResourceError(
+                "mul_scale",
+                f"MUL 字符串重复规模越界（len={len(b)}×{abs(a)}"
+                f" > 上限 {VM_MAX_SEQ_REPEAT} 元素）——申请已被拒绝")
+    elif isinstance(a, (list, tuple)) and isinstance(b, int):
+        if len(a) * abs(b) > VM_MAX_SEQ_REPEAT:
+            raise VMResourceError(
+                "mul_scale",
+                f"MUL 序列重复规模越界（len={len(a)}×{abs(b)}"
+                f" > 上限 {VM_MAX_SEQ_REPEAT} 元素）——申请已被拒绝")
+    elif isinstance(b, (list, tuple)) and isinstance(a, int):
+        if len(b) * abs(a) > VM_MAX_SEQ_REPEAT:
+            raise VMResourceError(
+                "mul_scale",
+                f"MUL 序列重复规模越界（len={len(b)}×{abs(a)}"
+                f" > 上限 {VM_MAX_SEQ_REPEAT} 元素）——申请已被拒绝")
+
+
+class ConditionVM:
+    """智能论字节码 VM：ip + 值栈 + 符号表 + 条件空间栈 + 信任值寄存器"""
+
+    def __init__(self):
+        self.reset()
+
+# 生效条件：symbols 为假值（None/空 dict）时以空 dict 起步、condition_stack 为假值时以空 list 起步；symbols 中 BUILTIN_TRUST_VALUE 键缺失（pop 得 None）时 trust_value 取实参 trust，存在时取该键注入值；seed_trust 非数值或非有限（inf/nan）抛 VMBuiltinError("type")，seed_trust 缺失而 trust 非有限数同样抛；TRUST_COMPONENT_NAMES 中的键被 pop 为对应初值（仅有限数值），仅当 pop 出的 seed_space 非 None 时才调用 _switch_condition_space。
+    def reset(self, symbols=None, trust=0.0, condition_stack=None):
+        self.ip = 0
+        self.stack = []
+        self.symbols = dict(symbols or {})   # 名实对应（以名举实）
+        # 内建名归一（缺陷②③）：宿主/调用方若把内建名注入 symbols，
+        # 视为**初始化寄存器**而非普通符号——保证「信任值/条件空间」
+        # 只有一处存储，杜绝名实两套（这是缺陷②的根因）。
+        seed_trust = self.symbols.pop(BUILTIN_TRUST_VALUE, None)
+        seed_space = self.symbols.pop(BUILTIN_CONDITION_SPACE, None)
+        self.condition_stack = list(condition_stack or [])  # 条件空间栈
+        if seed_trust is not None:
+            # N270：注入初值契约与 Rust run（vm.rs:305-312）同判——修复前
+            # 字符串初值使 trust_value 成字符串、末态 round 时裸 TypeError。
+            if not isinstance(seed_trust, (int, float)):
+                raise VMBuiltinError(
+                    "type",
+                    f"名实不符：{BUILTIN_TRUST_VALUE} 初值需数值，得到 {seed_trust!r}")
+            # #435：非有限初值同样毒化寄存器（inf/nan 落 trust_value）
+            if not is_finite_number(seed_trust):
+                raise VMBuiltinError(
+                    "type",
+                    f"名实不符：{BUILTIN_TRUST_VALUE} 初值需有限数值"
+                    f"（非 inf/nan），得到 {seed_trust!r}")
+        if seed_trust is None and not is_finite_number(trust):
+            # #435：run(trust=inf/nan) 是同一注入面，fail-closed 同判
+            # （注入 symbols 时 trust 不参与取值，不在此判）
+            raise VMBuiltinError(
+                "type",
+                f"名实不符：{BUILTIN_TRUST_VALUE} 初值需有限数值"
+                f"（非 inf/nan），得到 {trust!r}")
+        self.trust_value = trust if seed_trust is None else seed_trust
+        # 信任分量寄存器（name_checker 声明的 P_trust/T_pred/T_context/
+        # E_weight/情感权重 的运行时投影；符号注入同样归一为初值——
+        # 非数值注入丢弃，对齐 Rust run 的 is_num 守卫，N270；
+        # #435：非有限注入同丢弃，不得落寄存器）
+        self.trust_parts = {n: 0.0 for n in TRUST_COMPONENT_NAMES}
+        for _n in TRUST_COMPONENT_NAMES:
+            if _n in self.symbols:
+                _v = self.symbols.pop(_n)
+                if is_finite_number(_v):
+                    self.trust_parts[_n] = _v
+        # 初值空间名：仅字符串才切换（对齐 Rust run 的 Value::Str 分支——
+        # 非字符串注入不切换，N270）
+        if isinstance(seed_space, str):
+            self._switch_condition_space(seed_space)
+        self.scope_depth = 0                 # 术曰作用域深度
+        self.trace = []                      # 执行轨迹（可解释性）
+        self.call_stack = []                 # 调用栈帧 [(返回ip, 保存的符号表)]
+        # N239：跳转地址上界（_jump 单点用）——run() 置为 len(code)；未绑定
+        # 代码的调用面（调试器单步 vm._exec）保持 None，此时只兜负值回绕。
+        self._code_len = None
+
+# 生效条件：code 自 ip=0 逐条执行至 ip 越界；进入循环前把 _code_len 置为 len(code)（N239：跳转地址上界，供 _jump 单点校验）；steps 超过 max_steps（默认 100000）抛 RecursionError；max_wall_seconds 为真值（默认 VM_DEFAULT_WALL_SECONDS=10.0）时起墙钟预算、单步开始前 time.monotonic() 超限即抛 VMResourceError("wall")，为假值（None/0）时关闭；单步分配失败（MemoryError）转抛 VMResourceError("memory")；MUL 结果规模越界在 _exec 内抛 VMResourceError("mul_scale")（申请不发生）；跳转/调用入口/返回地址越界在 _exec 内抛 VMResourceError("jump")（N239）；CALL 帧深超 VM_MAX_CALL_DEPTH 在 _exec 内抛 VMResourceError("call_depth")（issue #326-③，fail-closed）；catch_halt 为真（默认）时捕获 VMHalt 记 halt 并 break，为假时 VMHalt 直接上抛；trace 为假值时返回字典的 trace 字段为 None。
+    def run(self, code, trace=False, catch_halt=True, symbols=None,
+            trust=0.0, condition_stack=None, max_steps=100000,
+            max_wall_seconds=VM_DEFAULT_WALL_SECONDS):
+        """执行字节码；code = [(op, arg), ...]
+        symbols/trust/condition_stack：初始执行环境（C2 语义：符号表/信任/条件空间）
+        catch_halt=True：止(ZHI)/无为(WUWEI) 作为正常控制流信号捕获，
+        返回 {"halt": kind, ...}（VM 自足——停止/让出是语言语义非错误）
+        max_steps：步数上限防死循环（对齐白箱 VM-循环执行单元：超出报 RecursionError）
+        max_wall_seconds：墙钟预算防慢单步挂起（N149 加固：超出报 VMResourceError
+        "wall"；None/0 关闭）。步数不限单步代价——恶意 .pbc 的天文数字单步
+        （大数自乘/巨型序列重复）另由 _exec 的 MUL 规模守卫（"mul_scale"）与
+        MemoryError 结构化转换（"memory"）兜底；合法产物远触不到这些上限"""
+        self.reset(symbols, trust, condition_stack)
+        self._code_len = len(code)   # N239：跳转地址上界（_jump 单点）
+        halt = None
+        steps = 0
+        wall_deadline = (time.monotonic() + max_wall_seconds) \
+            if max_wall_seconds else None
+        while self.ip < len(code):
+            steps += 1
+            if steps > max_steps:
+                raise RecursionError(f"循环未终止（超出步数上限 {max_steps}）")
+            if wall_deadline is not None and time.monotonic() > wall_deadline:
+                raise VMResourceError(
+                    "wall", f"执行超出墙钟预算 {max_wall_seconds}s"
+                            f"（ip={self.ip}，已执行 {steps} 步）")
+            op, arg = code[self.ip]
+            self.trace.append((self.ip, op, arg))
+            self.ip += 1
+            try:
+                if catch_halt:
+                    try:
+                        self._exec(op, arg)
+                    except VMHalt as h:
+                        halt = h.kind
+                        break
+                else:
+                    self._exec(op, arg)
+            except MemoryError:
+                # N149：分配失败转结构化错（不再裸上抛）——保留原异常链供留痕
+                raise VMResourceError(
+                    "memory",
+                    f"内存申请被拒（ip={self.ip - 1} "
+                    f"op={getattr(op, 'name', op)}）——单步分配超限")
+        return {"trust": round(self.trust_value, 3),
+                "symbols": dict(self.symbols),
+                "condition_space": list(self.condition_stack),
+                # 内建可观测项（缺陷②③）：条件空间名 + 信任分量寄存器
+                "condition_space_name": self._condition_space_name(),
+                "trust_parts": dict(self.trust_parts),
+                "stack": list(self.stack),
+                "halt": halt,
+                "trace": self.trace if trace else None}
+
+# 生效条件：形参 v 同时满足 v is not None、v is not False、v != 0 时返回 True，否则返回 False（空串 ""、空列表 [] 等经 v != 0 判定仍为 True）。
+    def _truthy(self, v):
+        return v is not None and v is not False and v != 0
+
+# 生效条件：target 为 int（bool 不算）且落在 [0, self._code_len]（_code_len 为 None 时只校验非负）即返回 target；否则抛 VMResourceError("jump")。_code_len 由 run() 置为 len(code)、reset() 置 None。
+    def _jump(self, target):
+        """跳转地址校验**单点**（N239）：越界即拒——负值不得回绕、超界不得静默结束。
+
+        Python 的 `code[负索引]` 会把非法跳转**静默**解释成「从末尾倒数」：
+        手工 / `.pbc` 构造的 `JUMP -1` 于是跳到 `code[-1]` 执行，中间指令被
+        静默跳过（且自增后可能回到 0 成环）；`target > len(code)` 则让
+        `while self.ip < len(code)`（run）直接为假、程序静默结束。
+
+        上界取 **`<= len(code)`** 而非 `<`：`== len(code)` 是「跳到程序末尾」
+        的**既有语义**，编译器自身就产出该目标——知足标签与末尾 若/则 的
+        end 标签都 `_place` 在 `len(code)`（compiler.py:74-76、:137-139），
+        `test_defect_regression` ④a 亦钉死「知足达标 → 其后 止 被跳过
+        （halt=None）」。`> len(code)` 则不可能由编译器产出，属越界。
+
+        地址在**写入 self.ip 处**校验（调用点统一走本助手）——未发生的
+        跳转不改变任何既有程序行为；调试器路径（`_code_len is None`）只
+        兜住负值回绕。
+        """
+        n = self._code_len
+        if (isinstance(target, int) and not isinstance(target, bool)
+                and target >= 0 and (n is None or target <= n)):
+            return target
+        limit = "len(code)" if n is None else str(n)
+        raise VMResourceError(
+            "jump",
+            f"跳转目标越界：{target!r}（合法地址 0..{limit}）"
+            f"——负值不得回绕、超界不得静默结束")
+
+    # ---- 内建名（缺陷②③）：名与实指向同一处存储 ----
+# 生效条件：condition_stack 为空时返回 DEFAULT_CONDITION_SPACE；否则栈顶为 dict 时返回 top.get('name') or DEFAULT_CONDITION_SPACE（缺 'name' 键或该键值为假值均回落默认），栈顶非 dict 时返回 str(top)。
+    def _condition_space_name(self):
+        """当前条件空间名（栈空 → 默认）"""
+        if self.condition_stack:
+            top = self.condition_stack[-1]
+            if isinstance(top, dict):
+                return top.get("name") or DEFAULT_CONDITION_SPACE
+            return str(top)
+        return DEFAULT_CONDITION_SPACE
+
+# 生效条件：无入参；当 self.condition_stack 被任一调用帧**按引用**保存时，先把栈换成副本
+# （写时复制）再返回，否则不动。代价 O(调用栈深)——只在切换条件空间这类**就地改写**前调用
+# （issue #326-③：帧内不再整份拷贝条件空间，就地改写必须自己脱共享）。
+    def _cond_own(self):
+        """写时复制：栈对象可能被调用帧按引用保存，就地改写前先脱共享。"""
+        if any(f[3] is self.condition_stack for f in self.call_stack):
+            self.condition_stack = list(self.condition_stack)
+
+# 生效条件：name 为 '恢复默认' 或 DEFAULT_CONDITION_SPACE 时把 condition_stack 截到首元素、若仍有元素则把栈顶改为默认空间 frame；否则构造 {'name': name, 'trust_at_create': trust_value} 替换栈顶（栈空则压入）。
+    def _switch_condition_space(self, name):
+        """切换条件空间——使「条件空间切换」在 VM 上真正可执行
+
+        恢复默认/默认 → 弹栈到根并置名默认；否则替换栈顶（栈空则压入）。
+        """
+        if name in ("恢复默认", DEFAULT_CONDITION_SPACE):
+            self.condition_stack = self.condition_stack[:1]
+            self._cond_own()      # #326-③：就地改写前脱共享（此处为上一步的新列表，无实作代价）
+            if self.condition_stack:
+                self.condition_stack[-1] = {
+                    "name": DEFAULT_CONDITION_SPACE,
+                    "trust_at_create": self.trust_value}
+            return
+        frame = {"name": name, "trust_at_create": self.trust_value}
+        self._cond_own()              # #326-③：就地改写前脱共享（此处栈对象可能被调用帧引用）
+        if self.condition_stack:
+            self.condition_stack[-1] = frame
+        else:
+            self.condition_stack.append(frame)
+
+# 生效条件：name 等于 BUILTIN_TRUST_VALUE 返回 trust_value、等于 BUILTIN_CONDITION_SPACE 返回当前空间名、在 CONDITION_SPACE_NAMES 中返回 name 自身、等于 BUILTIN_TRUST_THRESHOLD 返回 DEFAULT_TRUST_THRESHOLD、在 self.trust_parts 中返回对应分量值，其余返回 _MISSING。
+    def _builtin_load(self, name):
+        """内建名取值；非内建名返回 _MISSING"""
+        if name == BUILTIN_TRUST_VALUE:
+            return self.trust_value
+        if name == BUILTIN_CONDITION_SPACE:
+            return self._condition_space_name()
+        if name in CONDITION_SPACE_NAMES:
+            return name          # 空间名 → 自身（供「条件空间 为 X」比较）
+        if name == BUILTIN_TRUST_THRESHOLD:
+            return DEFAULT_TRUST_THRESHOLD
+        if name in self.trust_parts:
+            return self.trust_parts[name]
+        return _MISSING
+
+    def _exec(self, op, arg):
+        if op == Opcode.PUSH_CONST:
+            self.stack.append(arg)
+        elif op == Opcode.LOAD_NAME:
+            if arg in self.symbols:              # 用户符号优先
+                self.stack.append(self.symbols[arg])
+            else:
+                # 内建名（信任值/条件空间/空间名/信任分量）——缺陷②③修复点
+                _v = self._builtin_load(arg)
+                if _v is _MISSING:
+                    raise NameError(f"名实不符：'{arg}' 未声明（以名举实）")
+                self.stack.append(_v)
+        elif op == Opcode.STORE_NAME:
+            _val = self.stack.pop()
+            # 写面契约**单点**（N270/N272，SEMANTICS.md §1）——两台 VM 同判，
+            # 不另立第二份判据：
+            #   信任值/信任分量：只能写数值（Rust vm.rs:412-418/430-436 同）
+            #   条件空间：只能写空间名（字符串）（Rust vm.rs:420-429 同）
+            #   信任阈值/伴侣/工作/默认/恢复默认/default：只读（写面「—」）
+            if arg == BUILTIN_TRUST_VALUE:       # 写信任值 → 寄存器
+                if not is_finite_number(_val):
+                    raise VMBuiltinError(
+                        "type",
+                        f"{BUILTIN_TRUST_VALUE} 只能写数值（且必须是有限数，"
+                        f"非 inf/nan），得到 {_val!r}")
+                self.trust_value = _val
+            elif arg == BUILTIN_CONDITION_SPACE: # 写条件空间 → 切换
+                if not isinstance(_val, str):
+                    raise VMBuiltinError(
+                        "type",
+                        f"{BUILTIN_CONDITION_SPACE} 只能写空间名（字符串），"
+                        f"得到 {_val!r}")
+                self._switch_condition_space(_val)
+            elif arg in self.trust_parts:        # 写信任分量
+                if not is_finite_number(_val):
+                    raise VMBuiltinError(
+                        "type", f"{arg} 只能写数值（且必须是有限数，"
+                                f"非 inf/nan），得到 {_val!r}")
+                self.trust_parts[arg] = _val
+            elif arg in READONLY_BUILTIN_NAMES:  # 只读内建名（写面「—」）
+                raise VMBuiltinError(
+                    "readonly",
+                    f"{arg} 是只读内建名，不可写入"
+                    f"（SEMANTICS.md §1 写面「—」）")
+            else:
+                self.symbols[arg] = _val
+        elif op == Opcode.JUMP:
+            self.ip = self._jump(arg)        # N239：地址校验单点
+        elif op == Opcode.JUMP_IF_FALSE:
+            if not self._truthy(self.stack.pop()):
+                self.ip = self._jump(arg)    # N239
+        elif op == Opcode.DAO:
+            # 道：创建协议路径 → 条件空间栈压入（对应灵枢条件路由）
+            self.condition_stack.append({"name": arg, "trust_at_create": self.trust_value})
+        elif op == Opcode.DE:
+            # 德：信任值累积（信任引擎内建）
+            # #435：编译期闸只管源码；手工构造/篡改的 .pbc 仍可携带 inf/nan，
+            # 故 DE 落寄存器前复核（与写闸同一 is_finite_number 判据）。
+            if not is_finite_number(arg):
+                raise VMBuiltinError(
+                    "type",
+                    f"德 的操作数必须是有限数值（非 inf/nan），得到 {arg!r}")
+            try:
+                _acc = self.trust_value + arg
+            except OverflowError:
+                # 复核意见 1：巨大 int 与 float 相加时 Python 抛 OverflowError
+                # （int too large to convert to float）——转结构化拒，不裸穿。
+                raise VMBuiltinError(
+                    "type",
+                    f"德 累积结果无法以双精度表示（{self.trust_value!r} + "
+                    f"{arg!r}）——fail-closed，寄存器未被毒化")
+            if not is_finite_number(_acc):
+                # 有限+有限仍可能溢出成 inf（如 1e308+1e308）
+                raise VMBuiltinError(
+                    "type",
+                    f"德 累积结果越出有限数范围（{_acc!r}）——"
+                    f"fail-closed，寄存器未被毒化")
+            self.trust_value = _acc
+        elif op == Opcode.ZIRAN:
+            # 自然：恢复默认条件空间（弹栈到根）
+            self.condition_stack = self.condition_stack[:1]
+        elif op == Opcode.WUWEI:
+            # 无为：让出控制（yield 暂停，非终止）
+            raise VMHalt("yield", self._state())
+        elif op == Opcode.ZHI:
+            raise VMHalt("halt", self._state())
+        elif op == Opcode.ZHIZU:
+            # 知足：信任≥阈值跳转（达标判定）
+            threshold, addr = arg
+            # #435：阈值非有限时比较恒假（nan）或恒真（inf），静默改变控制流
+            if not is_finite_number(threshold):
+                raise VMBuiltinError(
+                    "type",
+                    f"知足 的阈值必须是有限数值（非 inf/nan），"
+                    f"得到 {threshold!r}")
+            if self.trust_value >= threshold:
+                self.ip = self._jump(addr)   # N239
+        elif op == Opcode.CMP_EQ:
+            b, a = self.stack.pop(), self.stack.pop()
+            self.stack.append(a == b)
+        elif op == Opcode.CMP_GT:
+            b, a = self.stack.pop(), self.stack.pop()
+            self.stack.append(a > b)
+        elif op == Opcode.CMP_LT:
+            b, a = self.stack.pop(), self.stack.pop()
+            self.stack.append(a < b)
+        elif op == Opcode.CMP_NE:
+            b, a = self.stack.pop(), self.stack.pop()
+            self.stack.append(a != b)
+        elif op == Opcode.CMP_LE:
+            b, a = self.stack.pop(), self.stack.pop()
+            self.stack.append(a <= b)
+        elif op == Opcode.CMP_GE:
+            b, a = self.stack.pop(), self.stack.pop()
+            self.stack.append(a >= b)
+        elif op == Opcode.ADD:
+            b, a = self.stack.pop(), self.stack.pop()
+            self.stack.append(a + b)
+        elif op == Opcode.SUB:
+            b, a = self.stack.pop(), self.stack.pop()
+            self.stack.append(a - b)
+        elif op == Opcode.MUL:
+            b, a = self.stack.pop(), self.stack.pop()
+            _check_mul_scale(a, b)   # N149：规模越界即拒（申请不发生）
+            self.stack.append(a * b)
+        elif op == Opcode.DIV:
+            b, a = self.stack.pop(), self.stack.pop()
+            if b == 0:
+                raise ZeroDivisionError("除零错误")
+            self.stack.append(a / b)
+        elif op == Opcode.ENTER_SHUYUE:
+            self.scope_depth += 1
+        elif op == Opcode.RETURN_STEP:
+            self.scope_depth = max(0, self.scope_depth - 1)
+        elif op == Opcode.CALL:
+            # CALL (entry_ip, param_names)：栈顶 len(param_names) 个实参 → 参数绑定
+            entry_ip, param_names = arg
+            args = []
+            for _ in range(len(param_names)):
+                args.append(self.stack.pop())
+            args.reverse()
+            # 保存调用帧（返回地址 + 符号表 + 信任 + 条件空间）
+            # issue #326-③：条件空间**按引用**保存 + 记长度，返回时按长度截断以撤销
+            # 被调方的压栈（DAO）。原实现每帧 `list(self.condition_stack)` 整份拷贝，
+            # 而栈随深度线性增长 ⇒ 总拷贝量 O(depth²)、峰值内存随之**二次**增长
+            # （实测 10s 内 1.0–1.6 GB）。就地改写既有栈顶（_switch_condition_space）
+            # 之前另有写时复制（_cond_own）脱共享，故共享引用不会互相污染。
+            if len(self.call_stack) >= VM_MAX_CALL_DEPTH:
+                raise VMResourceError(
+                    "call_depth",
+                    f"CALL 帧深超出上限 {VM_MAX_CALL_DEPTH}（当前 {len(self.call_stack)}）"
+                    f"——深递归 × 每帧保存的调用帧内存上限已被拒绝（issue #326-③；"
+                    f"fail-closed：不静默截断、不 OOM 后回收）")
+            self.call_stack.append((self.ip, dict(self.symbols),
+                                    self.trust_value, self.condition_stack,
+                                    len(self.condition_stack)))
+            # 新作用域：继承全局 + 参数绑定（参数遮蔽同名全局）
+            self.symbols = dict(self.symbols)
+            for pname, pval in zip(param_names, args):
+                self.symbols[pname] = pval
+            self.ip = self._jump(entry_ip)   # N239：入口地址同为跳转目标
+        elif op == Opcode.RETURN:
+            # 返回值：栈顶保留；恢复调用帧（无帧则程序结束）
+            if self.call_stack:
+                (ret_ip, saved_symbols, saved_trust, saved_cond,
+                 saved_len) = self.call_stack.pop()
+                self.symbols = saved_symbols
+                self.trust_value = saved_trust
+                # #326-③：被调方可能在**同一对象**上压过栈（DAO）——先按保存的长度
+                # 截断把它撤销，再恢复引用（重绑定型变更由「恢复引用」本身撤销）。
+                if len(saved_cond) > saved_len:
+                    del saved_cond[saved_len:]
+                self.condition_stack = saved_cond
+                self.ip = self._jump(ret_ip)   # N239：返回地址同为跳转目标
+            else:
+                # 顶层 RETURN：停止执行（无调用者）
+                raise VMHalt("halt", self._state())
+        else:
+            raise ValueError(f"未知指令 {op}")
+
+# 生效条件：无必需形参，返回含 trust（round 3 位）、symbols、condition_space、condition_space_name、trust_parts、stack 的快照字典。
+    def _state(self):
+        return {"trust": round(self.trust_value, 3),
+                "symbols": dict(self.symbols),
+                "condition_space": list(self.condition_stack),
+                "condition_space_name": self._condition_space_name(),
+                "trust_parts": dict(self.trust_parts),
+                "stack": list(self.stack)}
+
+
+# =============================================================================
+# 汇编器：文本 → 字节码（标签支持）
+# =============================================================================
+
+# 生效条件：逐行 strip 处理 src——空行或以 '#' 开头的行跳过，以 ':' 结尾的行登记为标签（值=当前 code 长度），其余行按 parts[0] 助记符分派（PUSH_CONST、LOAD_NAME/STORE_NAME、JUMP、JUMP_IF_FALSE、DAO、DE、ZHIZU、ZIRAN/WUWEI/ZHI/ENTER_SHUYUE/RETURN_STEP、CMP_EQ/CMP_GT/CMP_LT），未知助记符抛 SyntaxError，最后回填 pending 标签（标签未定义亦抛 SyntaxError）并返回 code。
+def assemble(src):
+    """汇编文本 → [(op, arg), ...]
+    格式：指令 [参数] [@标签]；标签行 '名:'"""
+    code, labels, pending = [], {}, {}
+    for raw in src.strip().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.endswith(":"):          # 标签定义
+            labels[line[:-1].strip()] = len(code)
+            continue
+        parts = line.split()
+        mnem = parts[0]
+        args = parts[1:]
+        if mnem == "PUSH_CONST":
+            code.append((Opcode.PUSH_CONST, _num(args[0])))
+        elif mnem in ("LOAD_NAME", "STORE_NAME"):
+            code.append((getattr(Opcode, mnem), args[0]))
+        elif mnem in ("JUMP",):
+            pending[len(code)] = args[0]
+            code.append((Opcode.JUMP, 0))
+        elif mnem == "JUMP_IF_FALSE":
+            pending[len(code)] = args[0]
+            code.append((Opcode.JUMP_IF_FALSE, 0))
+        elif mnem == "DAO":
+            code.append((Opcode.DAO, " ".join(args)))
+        elif mnem == "DE":
+            # issue #435（第三处残留，本批补）：`float()` 接受 'inf'/'nan' ⇒ 会毒化信任寄存器。
+            #   `compiler.py:22` 的 `_finite_operand` 是**编译期**单点（带源码行号三参）；
+            #   本层是**字节码层**（`(mnem, args)` 无行号）⇒ 按「闸要放对层」只裸判 `math.isfinite`
+            #   （**标准库调用不是「复制判据」**；判据=自定义判定+错误消息，那仍在 `_finite_operand`）。
+            _de = float(args[0])
+            if not math.isfinite(_de):
+                raise SyntaxError(
+                    f"pbc {mnem} 的操作数必须有限数，得到 {args[0]!r}"
+                    f"（inf/nan 非有限数——fail-closed）")
+            code.append((Opcode.DE, _de))
+        elif mnem == "ZHIZU":
+            _zh = float(args[0])   # #435 第三处：同 DE，裸判 isfinite（理由见上方 DE 分支注释）
+            if not math.isfinite(_zh):
+                raise SyntaxError(
+                    f"pbc {mnem} 的操作数必须有限数，得到 {args[0]!r}"
+                    f"（inf/nan 非有限数——fail-closed）")
+            pending[len(code)] = args[1]
+            code.append((Opcode.ZHIZU, (_zh, 0)))
+        elif mnem in ("ZIRAN", "WUWEI", "ZHI", "ENTER_SHUYUE", "RETURN_STEP"):
+            code.append((getattr(Opcode, mnem), None))
+        elif mnem in ("CMP_EQ", "CMP_GT", "CMP_LT"):
+            code.append((getattr(Opcode, mnem), None))
+        else:
+            raise SyntaxError(f"未知助记符 '{mnem}'")
+    # 回填标签
+    for idx, label in pending.items():
+        if label not in labels:
+            raise SyntaxError(f"未定义标签 '{label}'")
+        op, arg = code[idx]
+        if op == Opcode.ZHIZU:
+            code[idx] = (op, (arg[0], labels[label]))
+        else:
+            code[idx] = (op, labels[label])
+    return code
+
+
+# 生效条件：s 含 '.' 时返回 float(s)，否则返回 int(s)。
+def _num(s):
+    return float(s) if "." in s else int(s)
+
+
+if __name__ == "__main__":
+    print("=== 智能论字节码 VM（C1 · 原生编译地基 · 零外部运行时）===\n")
+    src = """
+DAO 新信任路径
+DE 0.3
+ZHIZU 0.7 @L1
+PUSH_CONST 1
+STORE_NAME 甲
+@L1:
+DE 0.5
+ZHIZU 0.7 @L2
+@L2:
+ZHI
+"""
+    code = assemble(src)
+    print("① 汇编字节码：")
+    for i, (op, arg) in enumerate(code):
+        print(f"   {i:3d} {op.name:14s} {arg}")
+    vm = ConditionVM()
+    state = vm.run(code, trace=True)
+    print(f"\n② VM 执行结果: 信任={state['trust']} 符号={state['symbols']}")
+    ok = state["trust"] >= 0.7 and state["symbols"].get("甲") == 1
+    print(f"\n=== 判定 ===\n智能论 VM: "
+          f"{'✔ 道/德/知足/名实 内建执行（不依赖外部运行时）' if ok else '✘'}")

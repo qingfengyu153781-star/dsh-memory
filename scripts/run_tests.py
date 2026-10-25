@@ -1,0 +1,466 @@
+# -*- coding: utf-8 -*-
+"""run_tests.py · 全仓测试一键入口（固化 `python -m` 运行约定）。
+
+背景（2026-09-13 全面分析报告建议 #3）：md_cg 包内测试普遍使用**相对导入**，
+必须以模块方式从仓库根运行——`python -m md_cg.test_xxx`；直接
+`python md_cg/test_xxx.py` 会因相对导入 ImportError（59/61 踩坑实测）。
+本脚本把该约定固化为唯一入口，杜绝逐文件手敲与跑法漂移。
+
+测试面（与仓库实际保持同步）：
+  md_cg/      test_*.py → python -m md_cg.<name>
+  compiler/   tests/*.py（脚本式 assert+sys.exit）→ -m compiler.tests.<name>
+  swarm/      tests/*.py（脚本式 assert+sys.exit）→ -m swarm.tests.<name>
+  scripts/    test_*.py（脚本式，非包无 __init__）→ 直跑 python scripts/<name>.py
+  hive/       test_*.py（包内，脚本式）→ python -m hive.<name>
+  test/       逐文件裁决可收的测试（TEST_DIR_TESTS 具名清单）→ 直跑 python test/<name>.py
+
+用法（任意 cwd 均可，内部以仓库根为 subprocess cwd）：
+  python scripts/run_tests.py                  # 全量
+  python scripts/run_tests.py md_cg            # 只跑一组：md_cg | compiler | swarm | scripts | hive
+  python scripts/run_tests.py -k p44           # 按关键字过滤模块名
+  python scripts/run_tests.py --jobs 1         # 串行（默认并发 4）
+  python scripts/run_tests.py --list           # 只列出目标不执行
+
+退出码：全部通过 0，存在失败 1（可直接接 CI / 提交前门禁）。
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import concurrent.futures
+import os
+import subprocess
+import sys
+
+# ---------------------------------------------------------------- 入口自保证 UTF-8
+# 约束（工作纪律第 15 条）：本调用必须在**任何文件/库 I/O 之前**——utf8_boot.ensure_utf8
+# 在解释器未开 UTF-8 模式时以相同 argv 重启自身（-X utf8），早于它的任何 open/stdio
+# 读写都走 locale 编码（Windows 中文机 = cp936：裸 open 抛 UnicodeDecodeError、中文写
+# 落 GBK 字节）。本文件是被本仓测试与 CI 直接调用的全量入口，必须最先保证。仓库根入
+# sys.path 的形态照 hive/exec.py::_md_cg_import 的最小写法（助手在仓根）。
+# 被 import（本模块非 __main__）时助手只置子进程继承面、绝不重启/退出——F6：静默重启
+# 会吞掉调用方输入。
+_UTF8_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _UTF8_ROOT not in sys.path:
+    sys.path.insert(0, _UTF8_ROOT)
+from utf8_boot import ensure_utf8  # noqa: E402
+
+ensure_utf8(__file__)
+
+
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+#: `test/` 下**已逐文件裁决可收**的测试（A6，2026-10-05 使用者裁决「测试文件是
+#: 检验系统稳定性的支柱」）。准入判据＝有明确退出码约定 ∧ 零外部依赖 ∧ 快 ∧
+#: 裸 clone 可直接跑。**具名而非 glob**：`test/` 同时住着支撑模块、评测脚本与
+#: 待同步的套件，glob 会把未裁决件一并拖进收集面。**补收（批次99，2026-10-05）**：
+#:   · chaos_injection/run_all.py —— 原「实跑退 1」已修：FI-M04 的读码代理断言原钉
+#:     「sustain.py 的 `with self._lock:` 恰 4 处」，陈旧于 9db1bcb7 新增的 sleeps
+#:     记账面（该提交已同步主守卫 test_h4_sustain_snapshot G0 的 4→5，漏同步本副本）。
+#:     修法＝本副本改 **AST 语义判据**（五个记账面的 append 必须全在 `with self._lock:`
+#:     体内；**计数基线归 G0 单点**，副本不再钉数——就地补 5 只是复制漂移源）；
+#:     定点变异自证（去 sleeps 锁→红点名 `未在锁内的记账面=['sleeps']`、恢复→绿）。
+#:     现 18 case 全一致（含 2 个 EXPECTED_GAP 基线维持：FI-M01/FI-M07；FI-R08 于
+#:     2026-10-09 issue #81 结案转 pass）、EXIT 0、实跑 ~23s ⇒ 收。
+#:   · mock_mcp.py（stdio 模拟服务，非测试；跑起来等 stdin 会挂住套件）
+#:   · orchestrator_memory.py（自述「演示/参考脚本——selftest() 只 print 不 assert，
+#:     退出码恒 0，跑绿不代表功能验证」）
+#:   · locomo_independent_eval.py / locomo_jaccard_probe.py（第三方评测脚本：
+#:     硬编码测试机绝对路径（POSIX 形态，不写字面）+ 外部数据集
+#:     data/benchmarks/locomo-zh-500，print-only 无退出码判据）
+#:   · chaos_injection/{harness,mdcg_support,registry}.py（支撑模块，无退出码面）
+TEST_DIR_TESTS = ("hive_exec_test.py", "hive_wm_test.py",
+                  "chaos_injection/run_all.py")
+
+
+# 生效条件：以模块级常量 _REPO 为根，返回全量套件实际执行的测试文件路径列表（相对 _REPO 的正斜杠路径）——md_cg/test_*.py、compiler 与 swarm 下 tests/*.py（basename 以 "_" 开头者跳过）、scripts/test_*.py、hive/test_*.py，按组序拼接。
+def _discovered_files():
+    """全量套件实际执行的测试文件（判据面覆盖完备性核对的单一切面）。
+
+    「跑什么」的唯一真源：judgment_manifest 的覆盖守卫从这里取执行清单，
+    与判据面清单比对——两套清单各自维护必然漂移（issue #36 的根因形态）。
+    """
+    import glob
+    files = []
+    files += sorted(glob.glob(os.path.join(_REPO, "md_cg", "**", "test_*.py"), recursive=True))
+    for pkg in ("compiler", "swarm"):
+        for f in sorted(glob.glob(os.path.join(_REPO, pkg, "tests", "*.py"))):
+            if os.path.basename(f).startswith("_"):
+                continue
+            files.append(f)
+    files += sorted(glob.glob(os.path.join(_REPO, "scripts", "test_*.py")))
+    files += sorted(glob.glob(os.path.join(_REPO, "hive", "test_*.py")))
+    # test/（A6）：只收具名裁决清单（见 TEST_DIR_TESTS 注释——含不收件与理由）。
+    # 不设 os.path.isfile 过滤：目标被改名/删除时须**响亮 FAIL**，不得静默缩面。
+    files += [os.path.join(_REPO, "test", name) for name in TEST_DIR_TESTS]
+    return [os.path.relpath(f, _REPO).replace("\\", "/") for f in files]
+
+
+# 生效条件：独立递归盘点 _REPO/md_cg 下所有 test_*.py（basename 以 "_" 开头者跳过；`test_` 前缀天然不以 "_" 开头），返回文件数——供 --list 打印「已发现 / 磁盘递归」差额，与 _discovered_files() 的收集面互为独立核算（issue #185）。
+def _md_cg_disk_recursive_count():
+    """磁盘上 md_cg/ 递归可见的测试文件数（独立于 _discovered_files 的核算口径）。"""
+    n = 0
+    for _dp, _dn, fs in os.walk(os.path.join(_REPO, "md_cg")):
+        for fn in fs:
+            if fn.startswith("test_") and fn.endswith(".py"):
+                n += 1
+    return n
+
+
+# 生效条件：基于 _discovered_files() 的文件列表按目录前缀分派命令形态（md_cg/ 与 hive/ 是包 -m 优先、compiler|swarm/tests/ 双候选、scripts/ 非包只直跑），返回 (组名, 显示名, argv 候选列表) 列表。
+def _discover():
+    """返回 [(组名, 显示名, argv)]；argv 为候选列表（依次尝试直到成功启动）。"""
+    out = []
+    for rel in _discovered_files():
+        f = os.path.join(_REPO, rel)
+        parts = rel.split("/")
+        stem = os.path.splitext(parts[-1])[0]
+        if rel.startswith("md_cg/"):
+            # 模块名按**仓库根相对路径**推导（issue #185）：md_cg/sub/test_x.py →
+            # md_cg.sub.test_x；顶层 md_cg/test_x.py 仍是 md_cg.test_x（逐位不变）。
+            # 子目录测试不再被压成扁平 stem——那会与兄弟撞名并静默消失。
+            _mod = "md_cg." + rel[len("md_cg/"):-3].replace("/", ".")
+            out.append(("md_cg", _mod,
+                        [[sys.executable, "-X", "utf8", "-m", _mod]]))
+        elif rel.startswith(("compiler/", "swarm/")):
+            pkg = parts[0]
+            out.append((pkg, f"{pkg}.tests.{stem}",
+                        [[sys.executable, "-X", "utf8", "-m",
+                          f"{pkg}.tests.{stem}"],
+                         [sys.executable, "-X", "utf8", f]]))
+        elif rel.startswith("scripts/"):
+            # scripts/ 不是包（无 __init__.py）→ 只能直跑；脚本内自带 sys.path 注入
+            out.append(("scripts", f"scripts.{stem}",
+                        [[sys.executable, "-X", "utf8", f]]))
+        elif rel.startswith("test/"):
+            # test/（A6）同理非包；且顶层名与 stdlib 的 `test` 包冲突（实测
+            # Python 3.12 下 `-m test.x` 解析到 Lib\test\__init__.py）→ 只能直跑。
+            # 显示名保子路径：test/chaos_injection/run_all.py → test.chaos_injection.run_all
+            out.append(("test", "test." + rel[len("test/"):-3].replace("/", "."),
+                        [[sys.executable, "-X", "utf8", f]]))
+        else:
+            # hive/ 是包（有 __init__.py，与 md_cg 同形）→ -m 优先；测试内用
+            # importlib 直载 exec.py/wm.py，-m 下 __file__ 正常，直跑同样可用。
+            out.append(("hive", f"hive.{stem}",
+                        [[sys.executable, "-X", "utf8", "-m", f"hive.{stem}"],
+                         [sys.executable, "-X", "utf8", f]]))
+    return out
+
+
+# 生效条件：给定 name、候选命令列表 argvs、超时秒数 timeout（parallel=True 时向子进程
+# 加传 MDCG_RUN_TESTS_PARALLEL=1 的并行信号），逐个 subprocess.run（cwd 为模块级常量
+# _REPO，env 由 _child_env(parallel) 构造（os.environ 基底 + PYTHONUTF8=1 /
+# PYTHONIOENCODING=utf-8，并剔除 _SESSION_ENV_STRIP 中的会话类键），shell=False，
+# encoding="utf-8"/errors="replace"）：抛 TimeoutExpired 即返回 (name, False,
+# f"超时（>{timeout}s）")；若 returncode!=0 且 stderr 含 "No module named" 且
+# len(argvs)>1 则记下该 stderr 末 300 字符继续下一候选，否则返回 (name,
+# returncode==0, stdout+stderr 拼接后末 800 字符)；所有候选都命中回退条件时返回
+# (name, False, 最后记下的片段)；
+# 生效条件：给定 Popen 对象，尽力终止其**整个进程树**——Windows 走
+# taskkill /F /T（/T 是关键：孙进程一并杀），POSIX 走 os.killpg（因子进程
+# 已 start_new_session，其 pgid 即自身 pid）。任何异常都吞掉：杀不死也
+# 不能因此让本函数抛错把 job 带崩（失败语义由调用方的超时返回承担）。
+def _kill_tree(proc):
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=15)
+        else:
+            os.killpg(os.getpgid(proc.pid), 9)
+    except Exception:                       # noqa: BLE001
+        try:
+            proc.kill()
+        except Exception:                   # noqa: BLE001
+            pass
+
+
+def _run_one(name, argvs, timeout, parallel=False):
+    # parallel（2026-10-03 外部报告核验新增）：负载敏感的性能断言（见
+    # md_cg/test_index_crossprocess_reload ⑥）据此在并行下明示豁免、串行照测——
+    # 语义断言不受影响，覆盖不丢（对比 _SERIAL_ONLY 的整测试跳过——那个教训在集合注释里）。
+    env = _child_env(parallel)
+    last = ""
+    for argv in argvs:                    # -m 优先；No module named 时回退直跑
+        # issue #551：`subprocess.run(timeout=)` 只杀**直接子进程**，随后
+        # `communicate()` 仍要读到管道 EOF。若孙进程继承了 stdout/stderr
+        # （常驻 mcp_server / sustain 循环 / 未 detach 的 Popen —— 本仓 74 处
+        # Popen 不可能全都 detach），管道永不 EOF ⇒ 超时形同虚设，一个 job
+        # 能挂数小时（实测三次运行同时卡在同一阶段约 3 小时）。
+        # 判据：用 Popen 起**独立进程组**，超时后杀整组；且**第二次
+        # communicate() 也带 timeout**（杀完仍可能挂在管道上，不给它无限等）。
+        kw = {"cwd": _REPO, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE,
+              "text": True, "encoding": "utf-8", "errors": "replace",
+              "env": env, "shell": False}
+        if os.name == "nt":
+            kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kw["start_new_session"] = True
+        try:
+            _proc = subprocess.Popen(argv, **kw)
+        except OSError as e:
+            return name, False, "æ æ³æèµ·ï¼%s" % e, ""
+        try:
+            _out, _err = _proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_tree(_proc)
+            try:
+                _proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            return name, False, f"è¶æ¶ï¼>{timeout}sï¼å·²æè¿ç¨ç»ï¼", ""
+        r = subprocess.CompletedProcess(argv, _proc.returncode, _out, _err)
+        if not (r.returncode != 0 and "No module named" in (r.stderr or "")
+                and len(argvs) > 1):
+            tail = ((r.stdout or "") + (r.stderr or ""))[-800:]
+            # issue #284（量具失效）：**模块内 SKIP 不得冒充 PASS**。修前判据只有
+            # `rc == 0`，而守卫在缺依赖时「打印 SKIP + return 0」⇒ 汇总记 PASS、
+            # SKIP 行不进日志（`:368` 只在 not ok 时打印尾部）⇒ CI 假绿。本仓自己的
+            # 口径（`docs/eval/优化第三批_…_v1.0.md:530`）是「SKIP 一律配『计入通过数
+            # 0』且永不出 [PASS]」——这里补齐它在主入口上的未覆盖面。
+            # 判据：**rc==0 且 stdout/stderr 里有行首 SKIP 行** ⇒ 记 SKIP（带原因）；
+            # rc!=0 时一律真失败（**不掩盖真红**，见 K 组）。
+            if r.returncode == 0:
+                _reason = _module_skip_reason(r.stdout, r.stderr)
+                if _reason:
+                    return name, False, tail, _reason
+            return name, r.returncode == 0, tail, ""
+        last = (r.stderr or "")[-300:]
+    return name, False, last, ""
+
+
+#: 模块内 SKIP 的 canonical 行式（**行首**才算，防正文里出现「SKIP」被误判——issue #284 的
+#: K 组两条方向都钉在这里）：`SKIP  <名>：<原因>` / `SKIP: <原因>` / `[SKIP] <原因>`。
+_SKIP_LINE_RE = re.compile(r"^[ \t]*(?:\[SKIP\]|SKIP)[:：\s]", re.M)
+
+
+# 生效条件：stdout/stderr 任一非空且其中存在**行首** SKIP 行时，返回该行（截断 160 字符）作为跳过原因；否则返回 ""。不做 IO、不看环境变量。
+def _module_skip_reason(stdout, stderr):
+    """模块内 SKIP 的识别（issue #284）：命中返回原因文本，否则 ""。"""
+    text = (stdout or "") + chr(10) + (stderr or "")
+    m = _SKIP_LINE_RE.search(text)
+    if not m:
+        return ""
+    line = text[m.start():].splitlines()[0].strip()
+    return line[:160]
+
+
+# 生效条件：当模块级常量 _REPO 下 md_cg/whitebox_kb/wisdom/wisdom-book-cloud.db 存在、可读且 nodes 表有行时返回 None，否则返回依赖缺失/空壳说明字符串；
+def _dep_db():
+    p = os.path.join(_REPO, "md_cg", "whitebox_kb", "wisdom",
+                     "wisdom-book-cloud.db")
+    if not os.path.exists(p):
+        return ("依赖白箱库 whitebox_kb/wisdom/wisdom-book-cloud.db"
+                "（.gitignore 忽略，需本地生成）")
+    # **空壳不算就绪**（与 _dep_mdroot 同口径，2026-10-13）：兄弟测试一旦建过库
+    # 就留下 0 行的空 db，只判 exists 会把「本该 SKIP」的目标变成 FAIL，且失败
+    # 形态随机（取决于谁先跑）。判据 = nodes 表有行；读不动一律按未就绪。
+    try:
+        import sqlite3
+        c = sqlite3.connect("file:%s?mode=ro" % p.replace("\\", "/"), uri=True)
+        try:
+            n = c.execute("select count(*) from nodes").fetchone()[0]
+        finally:
+            c.close()
+    except Exception:                                    # noqa: BLE001
+        n = 0
+    if n > 0:
+        return None
+    return ("依赖白箱库 wisdom-book-cloud.db 为**空壳**（存在但 nodes 表 0 行）"
+            "——需本地生成；空壳多为兄弟测试残留，不算就绪")
+
+
+# 生效条件：当模块级常量 _REPO 下 _md_cg_wisdom_graph 为目录、且其下（递归）至少有一个 .md 文件时返回 None；目录缺失或为无 .md 的空壳目录时返回依赖缺失说明字符串；
+def _dep_mdroot():
+    p = os.path.join(_REPO, "_md_cg_wisdom_graph")
+    if not os.path.isdir(p):
+        return ("依赖 md 语料真源 _md_cg_wisdom_graph/（.gitignore 忽略，"
+                "组 D 需本地真源）")
+    for _dp, _dn, fs in os.walk(p):
+        if any(str(f).endswith(".md") for f in fs):
+            return None
+    # **空壳不算就绪**（2026-09-20 v14 缺陷 F）：兄弟测试一旦经
+    # `MdCGOS(root)`（内部 makedirs）走一遭，就在仓根留下空目录——只判
+    # `isdir` 会把「本该 SKIP」的目标变成 FAIL，且失败形态随机（取决于谁先跑）。
+    return ("依赖 md 语料真源 _md_cg_wisdom_graph/ 为**空壳**（目录在但无 .md）"
+            "——需本地生成；空壳多为兄弟测试残留，不算就绪")
+
+
+# 生效条件：_dep_db() 与 _dep_mdroot() 均返回 None 时返回 None，否则返回二者中首个非空说明（两依赖都需在位）；
+def _dep_db_and_mdroot():
+    """同时依赖白箱库与 md 语料的测试（如 P44 / P45 对拍）用组合探测。"""
+    return _dep_db() or _dep_mdroot()
+
+
+def _dep_numpy():
+    """csre 模块级硬依赖 numpy（issue #84 口径）——无它 G1 无法真跑。"""
+    try:
+        import numpy  # noqa: F401
+    except Exception:
+        return ("依赖 numpy（csre 模块级硬依赖）——按 issue #84 口径 SKIP"
+                "（等价于该守卫自身的 rc=2『有跳过』语义）")
+    return None
+
+
+def _dep_pil():
+    """图像守卫全程用 PIL(Pillow) 造/读 PNG（issue #84 口径）——无它该件起不来。"""
+    try:
+        from PIL import Image  # noqa: F401
+    except Exception:
+        return ("依赖 Pillow（PIL）——按 issue #84 口径 SKIP"
+                "（等价于该守卫自身的 rc=2『有跳过』语义）")
+    return None
+
+
+# 裸 clone 环境 SKIP 探测（2026-09-14 外部复核建议 #3）：
+# 依赖 gitignored 本地数据或特定平台的测试，依赖缺失时标 SKIP（附原因）
+# 不计入失败——避免裸 clone 用户第一眼看到虚假 FAIL（复核实测 83/87 根因）。
+#
+# 口径统一（2026-10-09）：依赖缺失的**跳过**在**本入口单点**裁决（本节即全量
+# 入口的 skip authority）——被测件自身仍保留 `rc=2`（「有跳过」语义，见
+# md_cg/test_imgskill.py、md_cg/test_csre_index_import_guard.py 的退出码契约）
+# 作直跑兜底，但 run_tests 的 PASS 判据是 `rc==0`，不会把 rc=2 误读为通过或失败。
+# 故此处**登记**依赖探测，而非把判据放宽为「rc∈{0,2} 即通过」——后者会把本仓
+# 大量用 rc=2 表「fail-closed 锚点漂移」的守卫（test_boundary_hit / test_c8_search_
+# rrf_gates / test_autonomy_admission 等，其原文明确「不得静默跳过」）一并放行。
+_SKIPS = {
+    "md_cg.test_p44_md_whitebox": _dep_db_and_mdroot,
+    "md_cg.test_md_access_parity": _dep_db_and_mdroot,
+    "md_cg.test_wisdom_md_store": _dep_mdroot,
+    # 同 `_dep_db` 口径（2026-10-13，issue #185 递归发现后暴露）：本件第 19 行
+    # 直读 `wisdom-book-cloud.db`（.gitignore 忽略，需本地生成），裸 clone 必红。
+    "md_cg.whitebox_kb.wisdom.test_navigate_self_bootstrap": _dep_db,
+    "md_cg.test_imgskill": _dep_pil,
+    "md_cg.test_csre_index_import_guard": _dep_numpy,
+    "md_cg.test_csre_correctness": _dep_numpy,
+    "md_cg.test_csre_session": _dep_numpy,
+    "md_cg.test_csre_mutations": _dep_numpy,
+    "swarm.tests.test_swarm_fault": (
+        lambda: None if os.name == "nt"
+        else "Windows 专用（powershell/taskkill）"),
+}
+
+# 仅串行（批次 20，issue #30①）：负载敏感的性能阈值断言在并行争抢下会
+# 假红（bench_swarm_scale 的吞吐>500/摊薄<3× 在 --jobs 4 实测随机失败）
+# ——并行跑自动 SKIP（附原因），串行（--jobs 1）正常执行。性能基准照旧
+# 有跑（串行全量含它），只是不与其它测试抢 CPU。
+_SERIAL_ONLY = {
+    "swarm.tests.bench_swarm_scale",
+    # 同形态（2026-09-25 全量实测）：加速比 > 2 宽松下限在 --jobs 4 争抢下
+    # 1.91× 假红（单跑 2.96×），与 bench_swarm_scale 同为负载敏感吞吐断言。
+    "swarm.tests.bench_swarm_parallel",
+    # 注（2026-09-30）：scripts.test_judgment_manifest **不**入本集合——它曾在并行下
+    # 不安全（弱化实验就地改写被追踪文件 hive/test_exec_tools.py），但收口走**结构面**
+    # （实验改在临时副本上做、守卫对仓内文件全程只读，见
+    # scripts/test_judgment_manifest.py 节 [2] 与 _materialize）。理由：本集合是调度侧
+    # **跳过**，加入即把 #36 覆盖守卫整条移出默认跑法（--jobs 4）的执行集——「守卫不再
+    # 运行」比偶发红更贵；且跳过符只作用于本层 run_tests，挡不住嵌套套件
+    # （md_cg/test_interop_judgment.py:202 内层 run_tests）与手跑并发的第二实例。
+}
+
+
+# 会话类 env 剔除名单（issue #196 / #198，2026-10-13）：宿主/部署侧注入会话 id
+# （DSH_SESSION_ID / MDCG_SESSION）时，md_cg/stg.py::_view_session 的 env 权威分支
+# 会把守卫夹具声明的会话改写成 env 值，timeline(session=夹具会话) 恒 0 条——
+# 同一条守卫在「有 env 的开发机」上红、在干净 CI 上绿，属**假红**（被测代码无过）。
+# 本处统一剔除，使守卫只看被测代码；env 权威本身是 #128 的刻意设计，不属本条。
+_SESSION_ENV_STRIP = ("MDCG_SESSION", "DSH_SESSION_ID", "DSH_SESSION")
+_STRIP_UPPER = frozenset(_k.upper() for _k in _SESSION_ENV_STRIP)
+
+
+# 生效条件：parallel 为真值时在返回的 env 中加 MDCG_RUN_TESTS_PARALLEL="1"；返回的 dict
+# 以 os.environ 为基底、覆盖 PYTHONUTF8="1" 与 PYTHONIOENCODING="utf-8"，并**逐键剔除**
+# 大小写不敏感命中 _STRIP_UPPER 的键（宿主会话 env 不得进入测试子进程）；不修改 os.environ。
+def _child_env(parallel=False):
+    """构造测试子进程 env：UTF-8 约定 + 剔除宿主会话类变量（见 _SESSION_ENV_STRIP）。"""
+    env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+    for _k in [k for k in env if k.upper() in _STRIP_UPPER]:
+        env.pop(_k, None)
+    if parallel:
+        env["MDCG_RUN_TESTS_PARALLEL"] = "1"
+    return env
+
+
+# 生效条件：解析命令行（位置参数 group 为 nargs="*"、default=None，-k 默认 ""，--jobs 默认 4，--timeout 默认 900，--list 为 store_true）后，若 args.group 里有不在 ("md_cg","compiler","swarm","scripts","hive") 中的组名则 ap.error 报错退出（args.group 为 None 或空列表时该检查不触发）；groups 取 set(args.group) 或（其为假值时）全部五组；targets 由 _discover() 按 groups 过滤且 args.k 为假值或出现在显示名中；args.list 为真时打印组名与显示名及总数并返回 0；否则先按 _SKIPS 探测跳过有原因的目标，再以 max(1, args.jobs) 个线程跑 _run_one(name, a, args.timeout)，无失败打印汇总返回 0，有失败打印失败名单返回 1；
+def main():
+    ap = argparse.ArgumentParser(description="灵枢全仓测试入口（python -m 约定）")
+    # 注：不用 argparse choices——部分 Python 版本对 nargs="*" 无值时
+    # 以空列表过 choices 校验会误报 invalid choice（bpo-27227 老行为）。
+    ap.add_argument("group", nargs="*", default=None,
+                    help="只跑指定组，可多选：md_cg compiler swarm scripts hive test"
+                         "（缺省全量）")
+    ap.add_argument("-k", default="", help="按关键字过滤模块名")
+    ap.add_argument("--jobs", type=int, default=4, help="并发数（默认 4）")
+    ap.add_argument("--timeout", type=int, default=900, help="单测超时秒数")
+    ap.add_argument("--list", action="store_true", help="只列出目标不执行")
+    args = ap.parse_args()
+
+    _known = ("md_cg", "compiler", "swarm", "scripts", "hive", "test")
+    _bad = [g for g in (args.group or ()) if g not in _known]
+    if _bad:
+        ap.error(f"invalid group: {', '.join(_bad)}（可选：{'/'.join(_known)}）")
+    groups = set(args.group or ()) or set(_known)
+    targets = [(g, n, a) for g, n, a in _discover()
+               if g in groups and (not args.k or args.k in n)]
+    if args.list:
+        for g, n, _a in targets:
+            print(f"{g:<9}{n}")
+        print(f"共 {len(targets)} 个")
+        # issue #185：让「已发现数」与「磁盘递归数」的差额可见——差额即被静默
+        # 丢弃的子目录测试数（修复后恒为 0；回退非递归 glob 时立刻 >0）。
+        _md_n = sum(1 for g, _n, _a in targets if g == "md_cg")
+        print(f"已发现 {_md_n} 个 / 磁盘递归 {_md_cg_disk_recursive_count()} 个"
+              f"（md_cg test_*.py）")
+        return 0
+
+    # SKIP 探测：依赖缺失/平台不符的测试不执行（外部复核建议 #3，裸 clone 友好）
+    skipped, runnable = [], []
+    for g, n, a in targets:
+        if n in _SERIAL_ONLY and max(1, args.jobs) > 1:
+            reason = "负载敏感（性能阈值断言），并行争抢会假红——仅串行执行"
+            skipped.append((n, reason))
+            print(f"SKIP  {n}  （{reason}）", flush=True)
+            continue
+        probe = _SKIPS.get(n)
+        reason = probe() if probe else None
+        if reason:
+            skipped.append((n, reason))
+            print(f"SKIP  {n}  （{reason}）", flush=True)
+        else:
+            runnable.append((g, n, a))
+
+    bad = []
+    mod_skips = []                     # 模块内跳过（issue #284）：**不计入通过数**
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, args.jobs)) as ex:
+        _par = max(1, args.jobs) > 1
+        futs = {ex.submit(_run_one, n, a, args.timeout, _par): (g, n)
+                for g, n, a in runnable}
+        for fu in concurrent.futures.as_completed(futs):
+            name, ok, tail, skip_reason = fu.result()
+            if skip_reason:
+                # 模块内 SKIP：出 SKIP 行（带原因）+ 计入跳过集，**绝不出 PASS**。
+                mod_skips.append((name, skip_reason))
+                print(f"SKIP  {name}  （{skip_reason}）", flush=True)
+                continue
+            print(("PASS  " if ok else "FAIL  ") + name, flush=True)
+            if not ok:
+                bad.append(name)
+                for ln in tail.splitlines()[-6:]:
+                    print("      " + ln, flush=True)
+
+    if mod_skips:
+        print("模块内跳过（**不计入通过数**，issue #284）：", flush=True)
+        for _n, _why in mod_skips:
+            print(f"  SKIP  {_n}  （{_why}）", flush=True)
+    print(f"\n===== SUMMARY {len(runnable) - len(bad) - len(mod_skips)}/{len(runnable)} 通过，"
+          f"{len(skipped) + len(mod_skips)} 跳过（依赖缺失/平台不符"
+          + (f"；其中模块内跳过 {len(mod_skips)} 条" if mod_skips else "")
+          + "） =====")
+    if bad:
+        print("失败：" + ", ".join(bad))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

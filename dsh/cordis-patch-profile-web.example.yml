@@ -1,0 +1,114 @@
+# zcode-web profile 实际生效的 dsh-memory config override（备份模板）
+#
+# ⚠️ 工程依赖（2026-09-04 dsh 端排查确认）：插件包内自带的 cordis.patch.yml
+# 只有裸 insert（id+name 无 config），完整 config 全靠 profile 层的
+# cordis.patch.yml override 补全。换 profile / 重装 profile / 升级插件时，
+# 必须确认本文件内容仍在 <profile>/cordis.patch.yml 中——否则插件以默认
+# 配置运行：mdcg.root 落到相对路径 data/mdcg（**记忆真源错位**）、
+# dbPath 落到 data/lingshu.db（cwd 错位→角色数据读不到）、
+# tools=brain（缺 wisdom_* 白箱工具族）、lifecycle 不启动。
+#
+# ⚠️ 记忆真源（2026-09-10 统一）：**灵枢记忆 = md_cg 认知图（md 文档）**，
+# 由下面的 `mdcg` 块配置。`dbPath`（AEIS SQLite）是**旧通道**：现在只作
+# AEIS 能力库（角色生成 / 白箱）的库文件 + 角色数据目录的来源，**不再存记忆**。
+# 旧 profile 若只有 dbPath、没有 mdcg 块，记忆会按默认 mdcg.root=data/mdcg
+# 写进插件进程 cwd 下的 data/mdcg —— 请把 mdcg 块补上。
+#
+# 本机生效值（2026-09-04 备份，2026-09-10 补 mdcg）：mdcg.root=data/mdcg /
+# dbPath=AEIS 主库 / tools=all / lifecycle=600s
+
+# 灵枢 dsh-memory 插件：注入密钥（密钥来自宿主进程环境变量，不入配置库）
+- id: furongjun1999-dsh-memory
+  config:
+    # ── 记忆唯一真源：md_cg 认知图（md 文档）──────────────────────────
+    # 记忆的写 / 读 / 裁决 / 留痕只有这一处；AEIS 不再存记忆。
+    mdcg:
+      enabled: true
+      # MDCG_ROOT：认知图根目录（root 下是 md 文档 + 索引）。
+      # 相对路径按**插件进程 cwd** 解析；cwd 不稳定时改成绝对路径。
+      root: 'data/mdcg'
+      actor: 'dsh-memory'      # MDCG_ACTOR：私有内容按 (tenant, actor) 派生 DEK
+      tenant: 'default'        # MDCG_TENANT：须与迁移脚本 --tenant 一致
+      clearance: 'private'     # MDCG_CLEARANCE：可读写密级上限
+      # ⚠️ actor / tenant 必须与 `python -m md_cg.migrate_aeis` /
+      #    `python -m md_cg.migrate_roleplay` 的 --actor / --tenant 一致，
+      #    否则读不到已迁移的节点。
+
+    # ── 旧通道：AEIS 能力库 + 角色数据目录（不再存记忆）────────────────
+    # dbPath = AEIS SQLite 库文件（经环境变量 AEIS_DB 传给 aeis.mcp.server）；
+    # 同时它所在目录被当作 roleDataDir（角色数据 <dir>/roleplay_data：
+    # _roles.json / transcripts）。roleDataDir 由 dbPath 推导，且 node/python
+    # 进程 cwd 不同会解析错位，故此项必须是**绝对路径**。
+    # ⚠️ 替换成你自己机器上的路径，不要照抄别人的。
+    dbPath: /path/to/AEIS/data/aeis_memory.db
+    # 全部工具（含记忆/认知/白箱 wisdom_* 工具族），供 Agent 直接调用
+    tools: all
+    env:
+      # ── 会话 / 智能体 归因维度（2026-09-26 新增，可选项但推荐接线）──────────
+      # 三维身份：地点 = 会话所属工作区目录名（如 --D-4_ai--）；
+      #           智能体 = harness（dsh / codebuddy / zcode）；会话 = session-<uuid>。
+      # 为何要配：md_cg/mcp_server.py 的 _declared_session 规定「env 权威」——
+      #   ① 设了 MDCG_SESSION（或 DSH_SESSION_ID）→ 本 MCP 连接的会话归属被钉死，
+      #      调用方在请求里声明的 session 一律忽略（客户端不得伪造归属）；
+      #   ② 没设 → 单进程多会话的载体（DSH web 一个 MCP 进程服务多个前端会话）
+      #      虽允许请求面声明，但须过 _normalize_session 的防编造校验：DSH 形态
+      #      （session-<uuid4>）须真实存在于 MDCG_DSH_SESSIONS_ROOT/<workspace>/ 下，
+      #      否则降级 anonymous（记忆照样落盘，只是归属不可追溯）。
+      # 本机接线（2026-09-26 实测生效）：由启动脚本按工作区解析当前会话目录名后注入
+      #   DSH_HOME=%USERPROFILE%\.dsh
+      #   set MDCG_DSH_SESSIONS_ROOT=%USERPROFILE%\.dsh\sessions
+      #   set MDCG_HARNESS=dsh
+      #   set MDCG_UNIT=agent
+      #   set MDCG_SESSION=session-<当前会话 uuid>
+      # 参见 dsh/dsh-web-start.bat 与 <profile>/cordis.patch.yml 的 env 段。
+      MDCG_DSH_SESSIONS_ROOT: '<DSH_HOME>/sessions'
+      MDCG_HARNESS: 'dsh'
+      MDCG_UNIT: 'agent'
+      BOCHA_API_KEY: !!js process.env.BOCHA_API_KEY
+      AEIS_DESIGNER_KEY: !!js process.env.AEIS_DESIGNER_KEY
+      # 角色扮演 LLM 续答密钥（插件桥 env 透传；优先从 .credentials.yaml 读取——
+      # 文件热加载，避免宿主进程环境变量快照导致的旧 key 问题；文件缺失才回退环境变量）
+      DEEPSEEK_API_KEY: !!js process.env.DEEPSEEK_API_KEY
+
+      # ── 认知图写入凭据：默认【关闭】，由你决定是否打开 ──────────────
+      # md_cg fail-closed：不配凭据 → 只读 guest（读/召回/时间线可用，
+      # 自动记忆 / 转录 / 角色落图全不落盘；插件启动会告警提醒）。
+      #
+      # 打开方式（取消注释其一）：
+      # ① 功能完整（推荐）：python -m md_cg.tokens issue --role designer \
+      #      --actor dsh-memory --clearance internal \
+      #      --ops-allow info,route,read,write,recent,goal,identity,whitebox,verify \
+      #      --layers-allow knowledge,contextual,structural,self,goals,unresolved,rejected
+      # MDCG_TOKEN: !!js process.env.MDCG_TOKEN
+      # ② 最小权限：--role recorder（自动记忆/转录/角色定义；无 whitebox/identity/
+      #    verify，且不能写 self 层）
+      # ③ 兼容旧部署（不推荐）：MDCG_LEGACY_ENV_AUTH: '1'
+      #    （要写 self 层再加 MDCG_CAN_ADMIN: '1'）
+      #
+      # 明文注入：setx MDCG_TOKEN "mdcg1.xxxxx" 后重启 DSH；或直接写明文。
+
+      # 自主生命周期（v1.15 主动性）：MCP 启动即开始自发循环（感知→好奇→缩小信息差→巩固）
+      AEIS_LIFECYCLE: '1'
+      AEIS_LIFECYCLE_INTERVAL: '600'
+    # 互维维护（Mutual Sustain Loop v1.1）：心跳10min + 守护A + 任务验证双通道。
+    # 2026-08-26 关闭：守护 A 每 10min 拉起 harness.guardian → main → ai_voice，
+    # 深层子进程无 windowsHide → 频繁闪蓝色控制台窗口；本场景不跑独立 harness
+    # 服务，守护无必要（白箱 provider 由 DSH 内灵枢桥提供，不依赖 guardian）。
+    mutual:
+      enabled: false
+      heartbeatMs: 600000
+
+# ─── 会话归因补充说明（2026-09-26，DSH 日志索引 v2）──────────────────
+# 经 dsh_log_index.py 摄取的日志节点（id 前缀 dsh-log-）：
+#   · frontmatter.session = 派生标识 sha256(createdAt+首条用户消息)[:16]
+#     —— 16 位十六进制摘要而非 session-<uuid>。这是**刻意设计**（会话 uuid
+#     每次重启必换，不可作身份锚；内容寻址标识跨重启稳定），勿当 bug 报。
+#   · frontmatter.dsh_session_uuid 保留原始 uuid 供溯源。
+#   · sensitivity=internal（日志不加密，使用者裁定）→ 跨会话共享档，
+#     任何过密级校验的会话均可检索（跨会话回看是日志检索的用途）。
+#   · layer=knowledge → 不会进入 autoRecall 自动注入池（recall 默认
+#     contextual 层）——日志冷真源只对显式查询有效，这是预期行为。
+#   · MDCG_READ_CACHE：读缓存缺省已开（readcache.py "1" 缺省，=0 显式关闭）。
+#     DSH 端部署实测（2026-09-27）：14135 节点库冷态首查全池装配 50–60s
+#     （每节点 ~3.3ms 读盘），装配完成后热查询 162ms。建议启动脚本在
+#     起 dsh 前先跑一次预热查询，把全池装配挪到启动期（用户查询免首查卡顿）。

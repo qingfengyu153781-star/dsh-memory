@@ -1,0 +1,1120 @@
+# -*- coding: utf-8 -*-
+"""md 认知图 · 文件系统原语（原子写 / 跨进程锁 / append-only 日志）
+
+纯标准库（D-005）。三个原语都直接对应竞品踩过的坑：
+
+1. 原子写：临时名必须唯一。deja-vu 的 atomicfile 记录了固定临时名的后果——
+   两个写者共享同一临时文件，第二个截断第一个还在写的内容，第一个把半截文件
+   rename 到位（18049 次读里 180 次读到不可解析的记录）。
+2. Windows rename：另一个进程持有打开句柄时 os.replace 会被拒绝。deja-vu 在
+   windows CI 上实测「四个并发写者有三个被拒」，解法是短重试。
+3. 跨进程锁：threading.Lock 只管本进程；灵枢是多进程共享库，必须用 OS 级锁。
+"""
+import os
+import sys
+import time
+import uuid
+import errno
+import json
+import tempfile
+import threading
+
+IS_WIN = sys.platform == "win32"
+if IS_WIN:
+    import msvcrt
+else:
+    import fcntl
+
+_RENAME_TRIES = 20
+_RENAME_WAIT = 0.005
+
+
+# 生效条件：tmp 与 path 给定后循环至多 _RENAME_TRIES 次调用 os.replace(tmp, path)，成功即返回；仅捕获 PermissionError，非最后一次则 time.sleep(_RENAME_WAIT) 重试，最后一次仍 PermissionError 则抛出。
+def _publish(tmp: str, path: str):
+    """把临时文件 rename 到位，Windows 上短重试。"""
+    for i in range(_RENAME_TRIES):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if i == _RENAME_TRIES - 1:
+                raise
+            time.sleep(_RENAME_WAIT)
+
+
+# 生效条件：行为与 _publish 完全一致（直接委派并返回其结果）——公开名，供包内
+# 各「tmp + os.replace」原子写点位统一改走带 Windows 短重试的实现。
+def publish(tmp: str, path: str):
+    """`os.replace` 的公开安全版：目标被 Defender/索引器短暂持锁时短重试。
+
+    2026-09-25 全量回归实测：裸 `os.replace` 在 Windows 上随机抛
+    `PermissionError: [WinError 5]`（retr_s7 的 _postings_meta.json 改名中招，
+    失败者随机分布）——md_cg 内原子写一律经本函数，不再各写各的裸 replace。
+    """
+    return _publish(tmp, path)
+
+
+# 生效条件：path 与 data 给定时取 path 所在目录 d 建目录，用 tempfile.mkstemp 在 d 内建临时文件按 encoding 写入 data，durable 为真才 flush+os.fsync（假值不 fsync），再经 _publish(tmp, path) 替换；任一步失败时 finally 里若 tmp 仍非 None 且 os.path.exists(tmp) 为真则 os.remove（OSError 忽略）。
+def atomic_write(path: str, data: str, encoding: str = "utf-8", durable: bool = False):
+    """整文件替换。临时文件与目标同目录（保证同一文件系统，rename 才原子），
+    临时名唯一（并发写者不共享），失败即清理而不是留在可能刚写满的磁盘上。
+
+    durable=False（默认）：不做 fsync。
+      崩溃一致性由「临时文件 + rename」保证——读者要么看到旧内容、要么看到
+      新内容，永远看不到半截文件；fsync 多保证的只是"断电后新内容不丢"。
+      实测每次 fsync 让写入从 ~2000 节点/秒掉到 17 节点/秒（3048 节点迁移
+      要 3 分钟），而节点 .md 丢失的代价只是丢那一个节点，且索引可重建。
+      deja-vu 的 atomicfile 同样只做 Close + Rename，不 fsync。
+    durable=True：留给确实需要断电存活的调用方。
+    """
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".tmp-", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding, newline="\n") as f:
+            f.write(data)
+            if durable:
+                f.flush()
+                os.fsync(f.fileno())
+        _publish(tmp, path)
+        tmp = None
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+# 生效条件：os.path.isdir(d) 为假时直接返回；否则对 d 下名字以 "." 开头且含 ".tmp-" 的条目，当 now - os.path.getmtime(p) > older_than 时 os.remove(p)（OSError 忽略），其余条目不动。
+def sweep_stale_temps(d: str, older_than: float = 3600):
+    """清理被杀死的进程留下的唯一命名临时文件（它们不会被下一个写者复用清掉）。"""
+    if not os.path.isdir(d):
+        return
+    now = time.time()
+    for name in os.listdir(d):
+        if ".tmp-" not in name or not name.startswith("."):
+            continue
+        p = os.path.join(d, name)
+        try:
+            if now - os.path.getmtime(p) > older_than:
+                os.remove(p)
+        except OSError:
+            pass
+
+
+# 生效条件：path 加 ".lock" 后缀作为锁文件，进入时按 timeout 秒内以 poll 间隔轮询获取 OS 级排它锁（IS_WIN 用 msvcrt.locking 锁首字节，否则 fcntl.flock），超时仍未获锁时 strict 为真抛 TimeoutError、否则返回自身放行。
+class FileLock:
+    """跨进程排它锁（OS 级）。
+
+    Windows 用 msvcrt.locking 锁首字节，Unix 用 fcntl.flock。两者语义不同
+    （前者是强制字节范围锁、后者是建议性文件锁），但对「同一把锁文件、所有
+    写者都主动获取」这个用法是等价的。
+
+    超时后放弃并放行（best-effort）：写被拒绝的代价大于一次竞态——这与
+    deja-vu 对 usage 日志锁的取舍一致（"a racing write beats a lost injection"）。
+
+    strict=True 反转该取舍：超时抛 TimeoutError 而非放行。适用于**不能丢的写**
+    （审核队列 inbox/decisions、裁决记录）——锁竞争失败时显式报错让调用方重试，
+    好过静默放行后退化为无锁并发（丢一条提案/裁决比让写入者等一下代价大）。
+    """
+
+# 生效条件：path 加 ".lock" 后缀存入 self.path，timeout、poll、strict 原样保存，并置 self._f = None、self.acquired = False。
+    def __init__(self, path: str, timeout: float = 10.0, poll: float = 0.01,
+                 strict: bool = False):
+        self.path = path + ".lock"
+        self.timeout = timeout
+        self.poll = poll
+        self.strict = strict
+        self._f = None
+        self.acquired = False
+
+# 生效条件：先按 self.path 建父目录并 open(self.path, "a+b")，再在 self.timeout 到期前每 self.poll 秒尝试加锁（IS_WIN 用 msvcrt.locking(LK_NBLCK)，否则 fcntl.flock(LOCK_EX|LOCK_NB)）；成功即置 self.acquired=True 并返回 self；OSError 的 errno 不在 (EACCES, EAGAIN, EDEADLK) 时直接 raise，超时后 self.strict 为真抛 TimeoutError、否则返回 self 放行。
+    def __enter__(self):
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)) or ".", exist_ok=True)
+        self._f = open(self.path, "a+b")
+        deadline = time.time() + self.timeout
+        while True:
+            try:
+                if IS_WIN:
+                    self._f.seek(0)
+                    msvcrt.locking(self._f.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(self._f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.acquired = True
+                return self
+            except OSError as e:
+                if e.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise
+                if time.time() > deadline:
+                    if self.strict:
+                        raise TimeoutError(
+                            f"FileLock 超时未获锁（strict）：{self.path}")
+                    return self          # 放行，不阻断写路径
+                time.sleep(self.poll)
+
+# 生效条件：self.acquired 为真时按 IS_WIN 用 msvcrt.locking(LK_UNLCK) 或 fcntl.flock(LOCK_UN) 解锁（OSError 被吞掉）；finally 中只要 self._f 为真就 close，随后 self._f=None、self.acquired=False。
+    def __exit__(self, *exc):
+        try:
+            if self.acquired:
+                if IS_WIN:
+                    self._f.seek(0)
+                    msvcrt.locking(self._f.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(self._f.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            if self._f:
+                self._f.close()
+            self._f = None
+            self.acquired = False
+
+
+# 生效条件：作为 `with` 的空上下文——进入返回自身、退出返回 False（不吞异常）。
+class _NullContext:
+    """空上下文（无 root 的纯内存实例：无需跨进程互斥）。"""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+#: 本进程内**已持有**的跨进程锁（key -> 重入深度）。为什么需要：写面有两个天然的
+#: 嵌套关系——`writepipe.execute`（整条链：判存在/保护闸/落盘/可见性）与它内部的
+#: `MdCGOS.add`（同一 node_id）、以及 `remember_gated` 与它内部的 `add`。OS 级文件锁
+#: 在同一进程内对同一文件**第二次**获取会自我阻塞（Windows msvcrt 锁同一字节范围、
+#: POSIX flock 换 fd 亦互斥）⇒ 必须按「同线程重入」记账，否则修复本身变成死锁。
+#: 只按线程记账（threading.local）：跨线程仍各自排队，跨进程永远走 OS 锁。
+_LOCK_TLS = threading.local()
+
+# 生效条件：返回本线程的 key->深度字典（首次访问时创建），不触盘、不加锁。
+def _held_locks():
+    d = getattr(_LOCK_TLS, "held", None)
+    if d is None:
+        d = {}
+        _LOCK_TLS.held = d
+    return d
+
+# 生效条件：作为 `with` 使用——同线程已持有同 key 时只加深度并返回自身（不重复获取 OS 锁）；
+# 否则按 path 建 FileLock(timeout, strict=True) 并进入，成功后记深度 1；FileLock 抛错时
+# 不记账（失败不留下「已持有」的假象），异常原样上抛。退出时深度递减，归零才真正释放。
+class _ReentrantFileLock:
+    """`FileLock` 的同线程重入包装（跨进程互斥语义完全由内层 FileLock 提供）。"""
+
+    def __init__(self, path: str, timeout: float):
+        self.path = path
+        self.key = os.path.normcase(os.path.abspath(path))
+        self.timeout = timeout
+        self._inner = None
+
+    def __enter__(self):
+        held = _held_locks()
+        if held.get(self.key):
+            held[self.key] += 1
+            return self
+        inner = FileLock(self.path, timeout=self.timeout, strict=True)
+        inner.__enter__()
+        self._inner = inner
+        held[self.key] = 1
+        return self
+
+    def __exit__(self, *exc):
+        held = _held_locks()
+        depth = held.get(self.key, 0)
+        if depth > 1:
+            held[self.key] = depth - 1
+            return False
+        held.pop(self.key, None)
+        if self._inner is not None:
+            inner, self._inner = self._inner, None
+            return inner.__exit__(*exc)
+        return False
+
+# 生效条件：cg 具备非空 root 时返回以 `<root>/_node_locks/<node_id>` 为锁文件（FileLock 自动补 `.lock`）的跨进程排它锁（timeout 秒内未获锁抛 TimeoutError，strict 语义：「不能丢的写」宁可显式失败也不无锁放行；同线程重入按深度计数）；root 为假值返回不做任何事的空上下文；node_id 含路径分隔符/`..`/`:` 等不安全字符时改用其 sha256 前 32 位作锁名——同一 id 在任何进程里都映射到同一把锁，但绝不把调用方可控串拼进路径。
+def node_write_lock(cg, node_id, timeout: float = 30.0):
+    """同一 `node_id` 的写入跨进程串行化（issue #322）。
+
+    **不得用进程内锁冒充**：多智能体共享同一 root 时，写者可能是不同进程；
+    threading.Lock 对它们零作用。本函数一律走 `FileLock`（OS 级字节范围锁）。
+
+    锁粒度按 **node_id**：不同 id 的写入互不阻塞（写面瓶颈 S2/S4），而同一 id
+    的「判存在 → 保护闸 → 落盘 → 索引可见（flush）」必须在同一临界区内完成——
+    否则两个写者都判「不存在」，后写整份覆盖前写，两边都回执 committed:true
+    （#322 的静默丢正文）；anchor/knowledge 同 id 并发时两份文件并存，保护闸
+    在两侧都判不到对方（#322 的绕过 anchor）。
+    """
+    root = getattr(cg, "root", None)
+    if not root:
+        return _NullContext()
+    # 非字符串/空 id 一律由 add 的既有白名单 fail-closed 拒绝（它们根本走不到
+    # 落盘），此处不为它们造锁文件——空锁名还会把目录本身当文件打开。
+    if not isinstance(node_id, str) or not node_id:
+        return _NullContext()
+    name = node_id
+    if ("/" in name or "\\" in name or ".." in name or ":" in name):
+        import hashlib
+        name = "sha256_" + hashlib.sha256(
+            name.encode("utf-8", "replace")).hexdigest()[:32]
+    return _ReentrantFileLock(os.path.join(root, "_node_locks", name),
+                              timeout)
+
+
+def merge_rmw_lock(cg, timeout: float = 30.0):
+    """MERGE/CONVERGE 目标「读 → 聚合 → 整份覆写」的跨进程锁（issue #348-B）。
+
+    按**根**一把：`forgetting.reinforce` 与 `writelimit.converge_into` 的目标
+    由近重复判定选出、可能不同，但读改写窗口只有一处语义（目标正文 + merge_count），
+    根级锁让所有聚合落点共用同一临界区，避免「按目标加锁」在选目标阶段就漏掉
+    竞态。锁文件 `_merge_rmw.lock` 在 `sleep.FORBIDDEN_SUFFIXES` 内，不进版本库。
+
+    `strict=True`：锁竞争超时显式失败（调用方/重试层可见），绝不退化为无锁并发
+    ——后者正是本缺陷的形态（后写者用旧正文整份覆盖前者刚追加的聚合行）。
+    """
+    root = getattr(cg, "root", None)
+    if not root:
+        return _NullContext()
+    return _ReentrantFileLock(os.path.join(root, "_merge_rmw"), timeout)
+
+
+# 生效条件：os.path.getsize(path) 为 0 时返回 False；否则二进制打开 path 并从 size-1 处读 1 字节，返回 f.read(1) != b"\n"；getsize/open/seek/read 抛 OSError 时返回 False。
+def ends_mid_line(path: str) -> bool:
+    """行式日志的最后一字节是否不是换行——即上一个写者被杀死留下的半截记录。
+    追加者若不先补一个换行，新记录会粘在这行上，两条都解析不出来。"""
+    try:
+        size = os.path.getsize(path)
+        if size == 0:
+            return False
+        with open(path, "rb") as f:
+            f.seek(size - 1)
+            return f.read(1) != b"\n"
+    except OSError:
+        return False
+
+
+# 生效条件：record 序列化为 json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"；若 ends_mid_line(path) 为真则在行首再补一个 "\n"；
+# 随后建父目录并以 O_CREAT|O_WRONLY|O_APPEND、权限 0o600 打开 path 写入该行 UTF-8 字节后关闭；成功返回 True；
+# **durable=True 时整段「追加」收进 FileLock(path, strict=True) 临界区**（issue #549：审计账本等不可丢的写面）；
+# os.makedirs/os.open/os.write 抛 OSError（磁盘满/只读介质/权限拒绝/路径过长）时**兜住并返回 False**
+# （best-effort 契约：簿记写入失败不得升级为业务路径失败，issue #326-④）；KeyboardInterrupt/SystemExit 是
+# BaseException、不在兜住面内，照常上抛。
+# 参数关系（两批改动正交，合并保留）：strict=「失败是否上抛」(#326-④) · durable=「是否进临界区」(#549)。
+#: 写失败累计计数 + **有界**样本（issue #326-④ B 面）。
+#: 为什么在源头记账：`append_jsonl` 的失败契约是**返回值**（不上抛）——若无本地捕获的
+#: 调用点只是忽略返回值，失败就**静默**了（本仓 121 个调用点属此类）。把失败信号收成
+#: 本模块的**单点可观测项**后，「静默」在结构上不再可能（运维/守卫读 APPEND_FAILURES
+#: 与 _APPEND_FAIL_SAMPLES 即可；口径同 crypto._note_audit_write_failure 的 N126）。
+APPEND_FAILURES = 0            # 累计**写失败次数**（非按路径去重）
+_APPEND_FAIL_SAMPLES = []      # 有界样本：(path, 异常类型名, 截断文本)
+_APPEND_FAIL_SAMPLE_CAP = 8
+_APPEND_FAIL_WARN_CAP = 8      # stderr 告警同样有界（防刷屏）
+
+
+# 生效条件：path/exc 给定时把 APPEND_FAILURES 累加 1、在样本未满 _APPEND_FAIL_SAMPLE_CAP 时
+# 追加一条 (path, 类型名, 文本[:120])、并在累计不超 _APPEND_FAIL_WARN_CAP 时向 stderr 写一行
+# 告警；**无条件返回 False**（供 append_jsonl 直接 `return`）。不抛任何异常。
+def _note_append_failure(path, exc):
+    """登记一次 append_jsonl 写失败 + 有界告警（容忍 ≠ 静默）。"""
+    global APPEND_FAILURES
+    APPEND_FAILURES += 1
+    if len(_APPEND_FAIL_SAMPLES) < _APPEND_FAIL_SAMPLE_CAP:
+        _APPEND_FAIL_SAMPLES.append((str(path), type(exc).__name__, str(exc)[:120]))
+    if APPEND_FAILURES <= _APPEND_FAIL_WARN_CAP:
+        sys.stderr.write(
+            "[fsutil] append_jsonl 写失败（best-effort 已容忍，返回 False）%s：%s: %s"
+            "——进程内累计 %d 次；已登记 fsutil.APPEND_FAILURES / "
+            "_APPEND_FAIL_SAMPLES 供审计读取。排查方向：磁盘满 / 只读介质 / "
+            "权限拒绝 / 路径过长。\n"
+            % (path, type(exc).__name__, str(exc)[:120], APPEND_FAILURES))
+    return False
+
+
+def append_jsonl(path: str, record: dict, strict: bool = False,
+                 durable: bool = False) -> bool:
+    """向 append-only 日志追加一条记录（best-effort 语义）：成功 True、写失败 False。
+
+    注意 O_APPEND 的原子性是**平台相关**的：POSIX 保证「定位到末尾 + 写入」是
+    一个原子操作，Windows CRT 的 _O_APPEND 则是 lseek(END) + write 两步，并发下
+    会偶发交错丢记录（实测 6 进程 × 40 条，每轮丢 ~1 条）。
+
+    因此本函数只用于**丢一条无所谓**的簿记（访问计数）。任何不能丢的东西
+    （比如索引增量）必须用 ShardedLog——每个写者独占一个分片，不共享写入点。
+
+    失败契约（issue #326-④）：本文档自陈「丢一条无所谓」，原实现却只有
+    try/finally——os.makedirs/os.open/os.write 的 OSError（磁盘满、只读介质、
+    权限拒绝、路径过长）会**击穿**调用方，把**簿记写入失败升级为业务路径失败**。
+    现按本文档兜住 OSError 并返回 False；**只**兜 OSError——KeyboardInterrupt /
+    SystemExit 是 BaseException，Type/ValueError（如 record 不可 JSON 序列化）
+    是编程错误，一概照常上抛，不把「写失败」与「用错」混为一谈。
+
+    strict（issue #426-C，2026-10-17 U06 槽内回触 U05 面）：默认 False ⇒ **既有 129 处
+    调用点行为逐位不变**（含不可写路径下「返回 False 且不抛」的旧语义）。
+    `strict=True` 供**不能丢**的队列写入（inbox / decisions）使用：失败时**先记账**
+    （_note_append_failure，保证「不静默」）**再上抛 OSError**，让调用方无法把
+    「没落盘」当成功回执发出去。**不新增第四种失败编码**：上抛的异常由工具面按仓内
+    既有三种编码（业务失败 isError=false+JSON / 异常 isError=true+JSON / read 缺失
+    null）中的「异常」形态呈现，不自创形态。
+
+    因此**缺省**（`durable=False`）仍只用于**丢一条无所谓**的簿记（访问计数）；
+    任何不能丢的东西（索引增量）**首选** ShardedLog——每个写者独占一个分片，
+    不共享写入点，物理上无从冲突。
+
+    issue #549（2026-10-14）：但**审计账本**（`MdCGOS._audit` 的 `_audit.jsonl`）
+    此前也走本函数缺省路径，实测 6 进程 × 20 条在多写者下静默丢
+    **29.2% / 36.7% / 39.2%**（三轮），且 `add` 仍返回成功、worker 零报错 ——
+    而该账本被 `admission` 等消费做状态推断，缺行使审计追溯出现
+    **无法察觉的空洞**（「发生过」与「没发生过」不可区分）。
+    审计账本的写点分散且要参与轮转，改 ShardedLog 需动读面与轮转器；
+    故此处提供 **`durable=True`**：把「判半截行 + 追加」整段收进
+    `FileLock(strict=True)` 临界区（该锁的既有语义即「不能丢的写」），
+    以最小改动关掉静默丢行。
+
+    `durable=True` 的代价是**锁定串行化**（并发写审计会排队）。
+    按既有价值序（`FileLock` 注释：写被拒绝的代价大于一次竞态，而**不能丢的写**
+    宁可让写入者等一下）——审计账本属「不能丢」，故取 strict 语义：
+    锁竞争超时**显式抛错**给调用方，而不是静默退化为无锁并发再丢行。
+    """
+    line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    try:
+        os.makedirs(d, exist_ok=True)
+        if durable:
+            # issue #549：整段临界区——判半截行与追加必须原子（否则两个写者可同时
+            # 判定「上一行完整」而各自直接追加，交错仍会丢）。
+            # 注：不加 ".lock" 后缀的第二把锁——FileLock 内部即以 path + ".lock" 命名，
+            # 与本文件其他写点（inbox/decisions）同构。
+            # 失败契约与下方共用：临界区内抛 OSError 同样落到 _note_append_failure；
+            # `strict=True` 时同一条腿再上抛（两参数正交，见上方契约注释）。
+            with FileLock(path, strict=True):
+                if ends_mid_line(path):
+                    line = "\n" + line
+                fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+                try:
+                    os.write(fd, line.encode("utf-8"))
+                finally:
+                    os.close(fd)
+            return True
+        if ends_mid_line(path):
+            line = "\n" + line
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+    except OSError as e:
+        _note = _note_append_failure(path, e)
+        if strict:
+            raise                      # strict：失败必须让调用方看见（先记账，再上抛）
+        return _note
+    try:
+        os.write(fd, line.encode("utf-8"))
+        return True
+    except OSError as e:
+        _note = _note_append_failure(path, e)
+        if strict:
+            raise                      # strict：同上（记账在 _note_append_failure 内完成）
+        return _note
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+# issue #546：审计/台账面的**独立写入点**（每进程一个分片）+ 读面合并。
+#
+# 为什么不是给 append_jsonl 加锁：它的 docstring 已规定「本函数只用于**丢一条
+# 无所谓**的簿记；任何不能丢的东西必须用 ShardedLog——每个写者独占一个分片，
+# **不共享写入点**」。所以病在「调用面选错了函数」，不在「这个函数缺锁」。
+#
+# 实测（6 写者 × 400 行）：共享单文件丢 538 行（22.4%）且全部报成功；
+# 每写者独立文件丢 0 行（0.0%）。唯一变量就是写入点是否共享。
+def ledger_shard_path(base: str, pid=None) -> str:
+    """单写者的分片路径：<base 去掉扩展名>.<pid><扩展名>。"""
+    root, ext = os.path.splitext(base)
+    if not ext:
+        ext = ".jsonl"
+    return "%s.%d%s" % (root, os.getpid() if pid is None else int(pid), ext)
+
+
+# 生效条件：base 为台账基准路径；把记录追加到**本进程独占的分片**，复用 append_jsonl
+# 的既有失败契约（best-effort 返回 bool；strict 由调用方决定）。与 append_jsonl 同族：
+# **调用方必须消费返回值**（E11 钉子同时覆盖两者，issue #546）。
+def append_jsonl_ledger(base: str, record: dict, strict: bool = False) -> bool:
+    """追加到本进程独占分片（issue #546）。"""
+    return append_jsonl(ledger_shard_path(base), record, strict=strict)
+
+
+# 生效条件：base 为台账基准路径；读面**同时**读旧单文件 base 与全部分片
+# <stem>.<pid><ext>（旧单文件 + 新分片共存时历史不断代）。返回按**时间序**拼接的记录
+# 列表（旧单文件在最前——它是旧版本写的、必早于任何分片；分片按 pid **数值**升序）；
+# 单文件/单分片的读失败不阻断其它（各自 try）。
+#
+# issue #556 修两处错（病象：旧库升级后 `self_state.refresh(strict=True)` 恒
+# `chain_broken`；非 strict 时版本号倒退、两条 version=2）：
+#   ① **旧单文件被读两次** —— 旧匹配条件 `<stem>.` 前缀 + `.jsonl` 后缀把 `<stem>.jsonl`
+#      自己也算了进去（它同时满足两者）。改为「前缀之后必须是纯数字 pid」，base 自身
+#      因而不命中。
+#   ② **分片按文件名字典序** —— `_self_state.10000.jsonl` 排在 `_self_state.9999.jsonl`
+#      之前，于是「最新一条」取错。改为解析 pid 后**按数值**排序。
+#   两处都只在「旧单文件与分片共存」或「pid 跨位数」时显形，全新单进程库看不出来。
+def read_jsonl_ledger(base: str) -> list:
+    """读旧单文件 + 全部分片（issue #546 的读面合并；#556 修重复读与排序）。"""
+    out = []
+    try:
+        out.extend(read_jsonl(base))
+    except OSError:
+        pass
+    root, ext = os.path.splitext(base)
+    if not ext:
+        ext = ".jsonl"
+    d = os.path.dirname(os.path.abspath(base)) or "."
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return out
+    prefix = os.path.basename(root) + "."
+    shards = []
+    for name in names:
+        if not (name.startswith(prefix) and name.endswith(ext)):
+            continue
+        mid = name[len(prefix):len(name) - len(ext)]
+        if not mid.isdigit():          # #556 ①：排除旧单文件与任何非 <pid> 形态
+            continue
+        shards.append((int(mid), name))
+    shards.sort()                       # #556 ②：按 pid 数值升序，非字典序
+    for _pid, name in shards:
+        try:
+            out.extend(read_jsonl(os.path.join(d, name)))
+        except OSError:
+            continue
+    return out
+
+
+# 生效条件：os.path.exists(path) 为假时生成器直接结束不产出；否则逐行 strip，空行跳过，json.loads 成功则 yield 该对象，抛 ValueError 的行跳过，其余异常不捕获。
+def read_jsonl(path: str):
+    """读 append-only 日志，跳过被截断/粘连的坏行（不因自身簿记而失败）。"""
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except ValueError:
+                continue
+
+
+# 生效条件：文件不存在返回 ([], None)；从 offset 读到 EOF，但只解析最后一个换行之前的完整记录；完整坏行跳过，未完成尾行留待后续重读。返回记录与已消费的完整行字节水位，不以读前或读后的 stat size 代替。
+def read_jsonl_tail(path: str, offset: int):
+    """Incremental JSONL records and the last committed newline offset.
+
+    A writer may still be completing JSON/UTF-8 when this reader reaches EOF.
+    Advancing beyond that suffix permanently loses the eventual record in the
+    four inbox/decisions caches. Keep the cursor at its starting line boundary.
+    Complete corrupt lines still advance the cursor; append_jsonl's crash
+    resynchronization newline therefore cannot block later valid records.
+
+    A complete append that races with the initial stat is consumed exactly
+    once: the returned cursor is measured from bytes actually read. A JSON
+    object without its terminating newline is pending, even if parseable.
+    """
+    if not os.path.exists(path):
+        return [], None
+    recs = []
+    with open(path, "rb") as f:
+        f.seek(offset)
+        data = f.read()
+    # Only complete lines are committed. A concurrent writer may still be in
+    # the middle of JSON or a UTF-8 code point: retain that suffix for the next
+    # read, rather than permanently advancing the consumer beyond it.
+    committed = data.rfind(b"\n") + 1
+    for b in data[:committed].split(b"\n"):
+        line = b.decode("utf-8", "replace").strip()
+        if not line:
+            continue
+        try:
+            recs.append(json.loads(line))
+        except ValueError:
+            continue
+    return recs, offset + committed
+
+
+_COUNT_CACHE = {}          # abspath -> (bytes_scanned, mtime_ns, lines)
+
+
+# ---------- N225（2026-09-29）：非对象记录行的可观测记账 ----------
+#
+# 分片日志的读面必须**容忍**非对象行（`null` / `[]` / `123` / `"abc"` 都是
+# 合法 JSON，`read_jsonl` 按「JSON 合法性」收行 ⇒ 它们会进调用方的记录
+# 列表），否则排序键 `r.get("_t", 0)` 抛 AttributeError，索引装载 / compact
+# 整链断裂（实测：MdCG 构造失败、常驻服务起不来）。但**容忍 ≠ 静默**：
+# 跳过必须留下机器可读的痕迹——否则「日志里混进了坏行」与「记录本就不
+# 存在」不可区分，索引静默少几条，运维与守卫都看不见。故此处是跳过面的
+# 唯一记账点：模块级累计计数 + 有界样本 + stderr 汇总告警（每条分片一行，
+# 不逐行刷屏）。
+#
+# N225 补强（2026-09-29，深度 2 同族面）：同一记账面再收两类**dict 行内**的坏型
+# （N225 v1.0 报告 §0「已知缺口」点名的深度 2 复发面，此前不在任何断言面内）：
+#   ① 载荷坏型：分片记录 `e` 非 dict 且非 None——判据在重放面（mdcg 的两条重放
+#      路径同一实现），经 note_bad_payload_rows 记账；
+#   ② 排序键坏型：`_t` / `_s` 非数值（或 NaN）——read_all 的排序键健壮化与记账
+#      必须同时发生，经 note_bad_sortkey_rows 记账。
+# 三类**合计**进 NONOBJECT_ROW_SKIPS（这就是「同一记账面」的字面口径），各子面
+# 另留独立计数与样本，运维据此区分「行根本不是对象」/「行是对象而载荷坏了」/
+# 「行的排序键坏了」——三者排查方向不同。kind 名：非对象行 / 载荷坏型 / 排序键坏型。
+NONOBJECT_ROW_SKIPS = 0        # 累计跳过的坏记录行数（三类合计，进程内）
+NONOBJECT_ROW_SAMPLES = []     # 非对象行样本：(分片路径, 行号, JSON 类型名)
+BAD_PAYLOAD_ROW_SKIPS = 0      # 载荷坏型子面：(e 非 dict 且非 None) 条数
+BAD_PAYLOAD_ROW_SAMPLES = []   # 载荷坏型样本：(来源标签, 记录 id, 载荷类型名)
+BAD_SORTKEY_ROW_SKIPS = 0      # 排序键坏型子面：(_t/_s 非数值或 NaN) 条数
+BAD_SORTKEY_ROW_SAMPLES = []   # 排序键坏型样本：(分片路径, 行号, (t 类型名, s 类型名))
+_NONOBJECT_SAMPLE_CAP = 32     # 样本上限：记账要有界，不随坏行线性涨
+
+
+# 生效条件：skips 为 (分片路径, 行号, 值) 三元组序列且非空时，把条数累加进 NONOBJECT_ROW_SKIPS、按 _NONOBJECT_SAMPLE_CAP 上限补样本，并向 sys.stderr 写一行汇总告警（含分片名、本次条数、首条行号与类型名、累计条数）；skips 为空序列或假值时立即返回、不写任何输出。
+def note_nonobject_rows(skips):
+    """登记一批被跳过的非对象记录行 + stderr 告警（N225 可观测面）。"""
+    if not skips:
+        return
+    global NONOBJECT_ROW_SKIPS
+    NONOBJECT_ROW_SKIPS += len(skips)
+    for item in skips:
+        if len(NONOBJECT_ROW_SAMPLES) >= _NONOBJECT_SAMPLE_CAP:
+            break
+        NONOBJECT_ROW_SAMPLES.append((item[0], item[1],
+                                      type(item[2]).__name__))
+    path, lineno, value = skips[0]
+    sys.stderr.write(
+        "[fsutil] ShardedLog.read_all 跳过 %d 条非对象记录行（分片 %s，"
+        "首条 行%d 类型=%s）——坏行不进索引重放；本次后进程内累计 %d 条。"
+        "排查方向：该分片被非本协议写入方污染，或发生过截断 / 粘连。\n"
+        % (len(skips), os.path.basename(path), lineno,
+           type(value).__name__, NONOBJECT_ROW_SKIPS))
+
+
+# 生效条件：无入参，返回二元组 (累计坏行条数, 非对象行样本元组副本)——累计数为三类合计（非对象行 + 载荷坏型 + 排序键坏型），样本元素为 (分片路径, 行号, JSON 类型名) 且只含非对象行一类，副本只读、调用方改动不影响记账面。
+def nonobject_row_stats():
+    """读坏行记账合计（只读）：(累计条数, 非对象行样本元组)。
+
+    累计数是**同一记账面**的合计（三类 kind 都计入）；按 kind 的分项见
+    bad_payload_row_stats / bad_sortkey_row_stats。
+    """
+    return NONOBJECT_ROW_SKIPS, tuple(NONOBJECT_ROW_SAMPLES)
+
+
+# 生效条件：skips 为 (来源标签, 记录 id, 载荷值) 三元组序列且非空时，把 len(skips) 同时累加进 NONOBJECT_ROW_SKIPS（同一记账面）与 BAD_PAYLOAD_ROW_SKIPS（子面），按 _NONOBJECT_SAMPLE_CAP 上限补 BAD_PAYLOAD_ROW_SAMPLES（元素为 (来源标签, str(记录 id), 载荷类型名)），并向 sys.stderr 写一行载荷坏型汇总告警（含来源基名、本次条数、首条 id 与类型名、进程内累计条数）；skips 为空序列或假值时立即返回——不写输出、不动任何计数。
+def note_bad_payload_rows(skips):
+    """登记一批被跳过的**载荷坏型**记录（`e` 非 dict 且非 None）+ stderr 告警。
+
+    与 note_nonobject_rows 同一个记账面（合计进 NONOBJECT_ROW_SKIPS），但样本
+    与告警文案分开：运维据此区分「行本身不是对象」与「行是对象而载荷坏了」。
+    记录**不落进索引**由调用方（重放路径）负责，本函数只记账。计数只在这里加，
+    调用方不得另立计数器（`_count_buckets` 那条下游不做类型检查，正是靠这里
+    把坏载荷挡在 `nodes` 之外）。
+    """
+    if not skips:
+        return
+    global NONOBJECT_ROW_SKIPS, BAD_PAYLOAD_ROW_SKIPS
+    NONOBJECT_ROW_SKIPS += len(skips)
+    BAD_PAYLOAD_ROW_SKIPS += len(skips)
+    for item in skips:
+        if len(BAD_PAYLOAD_ROW_SAMPLES) >= _NONOBJECT_SAMPLE_CAP:
+            break
+        BAD_PAYLOAD_ROW_SAMPLES.append((item[0], str(item[1]),
+                                        type(item[2]).__name__))
+    source, nid, value = skips[0]
+    sys.stderr.write(
+        "[fsutil] 分片重放跳过 %d 条载荷坏型记录（e 非 dict 且非 None，来源 %s，"
+        "首条 id=%s 载荷类型=%s）——坏载荷不进索引节点；本次后进程内累计 %d 条"
+        "（含非对象行）。排查方向：该分片被按别的协议写入，或载荷被外部改写。\n"
+        % (len(skips), os.path.basename(str(source)), nid,
+           type(value).__name__, NONOBJECT_ROW_SKIPS))
+
+
+# 生效条件：无入参，返回二元组 (载荷坏型累计条数, 样本元组副本)——样本元素为 (来源标签, 记录 id, 载荷类型名)，副本只读、调用方改动不影响记账面。
+def bad_payload_row_stats():
+    """读载荷坏型子面（只读）：(累计条数, 样本元组)。"""
+    return BAD_PAYLOAD_ROW_SKIPS, tuple(BAD_PAYLOAD_ROW_SAMPLES)
+
+
+# 生效条件：skips 为 (分片路径, 行号, (t 值, s 值)) 三元组序列且非空时，把 len(skips) 同时累加进 NONOBJECT_ROW_SKIPS（同一记账面）与 BAD_SORTKEY_ROW_SKIPS（子面），按 _NONOBJECT_SAMPLE_CAP 上限补 BAD_SORTKEY_ROW_SAMPLES（元素为 (分片路径, 行号, (t 类型名, s 类型名))），并向 sys.stderr 写一行排序键坏型汇总告警（含分片基名、本次条数、首条行号与两个类型名、进程内累计条数）；skips 为空序列或假值时立即返回——不写输出、不动任何计数。
+def note_bad_sortkey_rows(skips):
+    """登记一批**排序键坏型**记录（`_t` / `_s` 非数值或 NaN）+ stderr 告警。
+
+    与 note_nonobject_rows 同一记账面。**记录本身不丢**（仍是 dict，照常回放，
+    只在排序键上按「缺键取 0」的既有口径归一）——故本函数只记账、不改记录：
+    丢掉一条合法 dict 记录是比重排它更糟的事。
+    """
+    if not skips:
+        return
+    global NONOBJECT_ROW_SKIPS, BAD_SORTKEY_ROW_SKIPS
+    NONOBJECT_ROW_SKIPS += len(skips)
+    BAD_SORTKEY_ROW_SKIPS += len(skips)
+    for item in skips:
+        if len(BAD_SORTKEY_ROW_SAMPLES) >= _NONOBJECT_SAMPLE_CAP:
+            break
+        raw = item[2]
+        BAD_SORTKEY_ROW_SAMPLES.append(
+            (item[0], item[1], (type(raw[0]).__name__, type(raw[1]).__name__)))
+    path, lineno, raw = skips[0]
+    sys.stderr.write(
+        "[fsutil] ShardedLog.read_all 排序键坏型 %d 条（分片 %s，首条 行%d "
+        "_t=%s _s=%s）——坏型槽记 0 参与排序（记录不丢）；本次后进程内累计 %d 条"
+        "（含非对象行）。排查方向：该分片被非本协议写入方污染。\n"
+        % (len(skips), os.path.basename(path), lineno,
+           type(raw[0]).__name__, type(raw[1]).__name__, NONOBJECT_ROW_SKIPS))
+
+
+# 生效条件：无入参，返回二元组 (排序键坏型累计条数, 样本元组副本)——样本元素为 (分片路径, 行号, (t 类型名, s 类型名))，副本只读、调用方改动不影响记账面。
+def bad_sortkey_row_stats():
+    """读排序键坏型子面（只读）：(累计条数, 样本元组)。"""
+    return BAD_SORTKEY_ROW_SKIPS, tuple(BAD_SORTKEY_ROW_SAMPLES)
+
+
+# 生效条件：无入参，把三类累计条数（NONOBJECT_ROW_SKIPS / BAD_PAYLOAD_ROW_SKIPS / BAD_SORTKEY_ROW_SKIPS）全置 0 并把三个样本列表原地清空（del [:]，不换对象）；守卫与运维建立观测基线时用，生产读路径不调用。
+def reset_nonobject_row_stats():
+    """清空整个坏行记账面（含两类子面；守卫 / 运维的观测基线用）。"""
+    global NONOBJECT_ROW_SKIPS, BAD_PAYLOAD_ROW_SKIPS, BAD_SORTKEY_ROW_SKIPS
+    NONOBJECT_ROW_SKIPS = 0
+    BAD_PAYLOAD_ROW_SKIPS = 0
+    BAD_SORTKEY_ROW_SKIPS = 0
+    del NONOBJECT_ROW_SAMPLES[:]
+    del BAD_PAYLOAD_ROW_SAMPLES[:]
+    del BAD_SORTKEY_ROW_SAMPLES[:]
+
+
+# ---------- C-3（FI-M02 / N134，2026-09-29）：读失败的**瞬时/终态单点判别**与记账 ----------
+#
+# 缺陷（N134，docs/eval/缺陷挖掘_自主迭代_v16.md:86）：`MdCG._read` 把 OSError
+# （含**瞬态**失败：独占句柄 / 资源剥夺）与「文件不存在 / 越界」一律归成
+# `(None, None)`，readcache 又把任何返回值——包括 `(None, None)`——一律当正常值
+# 写入缓存 ⇒ 一次瞬态 OS 失败被固化成「该节点从检索面永久消失，直到进程重启或
+# 该 path 再写盘」（cache 条目字面 `(gen, (None, None))`）；而 `cg.get` 直读不走
+# 缓存照常可读 ⇒「get 能读、search 搜不到」撕裂（P1 fail-closed 缺席 + T4 静默损伤）。
+#
+# 修法要点：**判别只此一处**——读路径在唯一捕获 OSError 的点上调用本函数拿到
+# 「瞬时 / 终态」标签，缓存层按标签决定接纳与否，**不再自行回看异常类型**
+# （否则就是判据的第二份副本；本仓 N133 与 `_ccg_line` 的教训都是「副本自称同源」）。
+#   · 终态（READ_FAIL_ABSENT）：`FileNotFoundError`——`atomic_write` 是
+#     tmp + os.replace（见 `_publish`：读者只可能看到旧值或新值，不会看到
+#     「写一半的缺文件」），故 ENOENT 是**真缺**，可照旧入缓存（不构成重读风暴）。
+#     越界（`_node_disk_path` 抛 ValueError）与「有节点但无密钥」同属终态，
+#     且不经本函数——两条既有语义逐位不变。
+#   · 瞬时（READ_FAIL_TRANSIENT）：其余 OSError——Windows 上独占句柄
+#     （WinError 32 共享冲突）、权限剥夺、同名目录顶位、磁盘瞬时故障。
+#     **判据方向是 fail-closed 的**：判不准（非 FileNotFoundError 的一切）
+#     一律归「瞬时」——宁可多读一次，不可把可读节点判死。
+#
+# ③「不得静默」：与 N225 三类坏行记账同风格——模块级累计计数 + 有界样本 +
+# stderr 汇总告警；计数面经 `transient_read_stats()` 可被守卫/运维读取。
+READ_FAIL_ABSENT = "absent"          # 终态：真缺 / 越界 / 无密钥 → 可入缓存
+READ_FAIL_TRANSIENT = "transient"    # 瞬时：可重试 → **不得**以「新鲜」身份固化
+
+TRANSIENT_READ_FAILURES = 0          # 累计瞬时读失败次数（进程内）
+TRANSIENT_READ_SAMPLES = []          # 样本：(节点 path, 异常类型名, errno)
+_TRANSIENT_READ_SAMPLE_CAP = 32      # 样本上限：记账要有界，不随失败次数线性涨
+# stderr 告警上限：热路径（全池检索每查询逐条读）防刷屏；**计数面恒完整**，
+# 上限只压告警行数，不减信息可观测性（守卫读的是计数与样本，不是 stderr）。
+_TRANSIENT_READ_WARN_CAP = 32
+
+
+# 生效条件：exc 为读节点文件时捕获的异常对象；是 FileNotFoundError（含其子类）返回 READ_FAIL_ABSENT（终态：真缺，可入缓存），否则返回 READ_FAIL_TRANSIENT（瞬时：可重试，不得入缓存）；非 OSError 入参同样按瞬时返回（判不准即保守，绝不判死节点）。
+def classify_read_failure(exc) -> str:
+    """**单点**判别：读失败是瞬时的还是终态的（唯一真源，缓存层不得再猜一遍）。
+
+    调用面恒为读路径捕获 OSError 的那一处（`MdCG._note_read_oserror`）。
+    """
+    if isinstance(exc, FileNotFoundError):
+        return READ_FAIL_ABSENT
+    return READ_FAIL_TRANSIENT
+
+
+# 生效条件：path 为节点文件路径（任意值，str() 后取基名入样本）、exc 为捕获到的异常；无条件把 TRANSIENT_READ_FAILURES 累加 1、按 _TRANSIENT_READ_SAMPLE_CAP 上限补样本，并在累计次数不超过 _TRANSIENT_READ_WARN_CAP 时向 sys.stderr 写一行汇总告警；返回是否写了告警行（bool）。
+def note_transient_read_failure(path, exc) -> bool:
+    """登记一次**瞬时读失败** + stderr 告警（C-3 可观测面，N225 同风格）。
+
+    只记账，**不改任何调用方的控制流**——读不到仍是读不到，只是不再静默。
+    """
+    global TRANSIENT_READ_FAILURES
+    TRANSIENT_READ_FAILURES += 1
+    if len(TRANSIENT_READ_SAMPLES) < _TRANSIENT_READ_SAMPLE_CAP:
+        TRANSIENT_READ_SAMPLES.append(
+            (str(path), type(exc).__name__, getattr(exc, "errno", None)))
+    if TRANSIENT_READ_FAILURES > _TRANSIENT_READ_WARN_CAP:
+        return False
+    sys.stderr.write(
+        "[fsutil] 节点读失败（瞬时，可重试）%s：%s errno=%s——本次不计入检索面，"
+        "且**不当作「不存在」固化**（C-3：负结果不入读缓存）；进程内累计 %d 次。"
+        "排查方向：独占句柄（Windows 共享冲突）/ 权限剥夺 / 同名目录顶位 / "
+        "磁盘瞬时故障。\n"
+        % (os.path.basename(str(path)), type(exc).__name__,
+           getattr(exc, "errno", None), TRANSIENT_READ_FAILURES))
+    return True
+
+
+# 生效条件：无入参，返回二元组 (累计瞬时读失败次数, 样本元组副本)——样本元素为 (节点 path, 异常类型名, errno)，副本只读、调用方改动不影响记账面。
+def transient_read_stats():
+    """读瞬时读失败记账（只读）：(累计次数, 样本元组)。"""
+    return TRANSIENT_READ_FAILURES, tuple(TRANSIENT_READ_SAMPLES)
+
+
+# 生效条件：无入参，把 TRANSIENT_READ_FAILURES 置 0 并原地清空 TRANSIENT_READ_SAMPLES（del [:]，不换对象）；守卫/运维建立观测基线时用，生产读路径不调用。
+def reset_transient_read_stats():
+    """清空瞬时读失败记账面（守卫 / 运维的观测基线用）。"""
+    global TRANSIENT_READ_FAILURES
+    TRANSIENT_READ_FAILURES = 0
+    del TRANSIENT_READ_SAMPLES[:]
+
+
+# 生效条件：os.stat(os.path.abspath(path or "")) 抛 OSError 时返回 0；缓存命中且已扫字节数与 mtime_ns 均与 stat 一致时直接返回缓存计数；若缓存已扫字节 < 当前 size 且 mtime_ns 不同则从该偏移起按 chunk 分块累计 b"\n" 个数并加上缓存值；读文件抛 OSError 时返回 total or 0（已累计值为假则返回 0）。
+def count_jsonl(path: str, chunk: int = 1 << 20) -> int:
+    """数 append-only 日志的行数——**流式计数、不物化**（内存 O(1)）。
+
+    存在的唯一理由：`len(list(read_jsonl(p)))` 是**危险的默认写法**。它把整份
+    日志解析成对象列表，日志一长就是灾难——本机实测（2026-09-16）：审计日志
+    4.3 GB，一次 health/盘点调用解析速率 ~1 MB/s、RSS 涨到 5 GB+ 仍在涨、
+    数十分钟不返回；调用方超时重试又在别的进程里再排一次队，最终把整条 MCP
+    通道堵死（一个只读的「体检」把服务打死，代价与收益完全不成比例）。
+    这里只数字节里的换行：不解析、不驻留，速度只受磁盘限制；进程内按
+    (已扫字节数, mtime) 缓存，文件只增长时只扫新增字节（O(增量)）。
+
+    语义边界（诚实声明）：数的是**换行符**，不是 JSON 记录——
+      ① 完整写入的日志（`append_jsonl` 每条尾带 `\\n`）换行数 == 记录数，与
+         `len(list(read_jsonl(p)))` 逐位相等（test_health_scale ⑦ 守卫）；
+      ② 末尾**未终止的半截行**不计入（下界，最多差 1 行；见 append_jsonl 的
+         ends_mid_line 修补分支——并发交错被杀的进程会留下这种尾巴）；
+      ③ 非法 JSON 行计入行数而 `read_jsonl` 会跳过——健康度是量级指标，不做
+         逐行校验，逐行解析正是上面那场事故的根因。
+    """
+    key = os.path.abspath(path or "")
+    try:
+        st = os.stat(key)
+    except OSError:
+        return 0
+    start, total = 0, 0
+    prev = _COUNT_CACHE.get(key)
+    if prev:
+        p_scan, p_mtime, p_count = prev
+        if p_scan == st.st_size and p_mtime == st.st_mtime_ns:
+            return p_count                      # 完全未变：零 IO
+        if p_scan < st.st_size and p_mtime != st.st_mtime_ns:
+            start, total = p_scan, p_count      # 只增长：扫增量
+    scanned, lines = start, 0
+    try:
+        with open(key, "rb") as f:
+            if start:
+                f.seek(start)
+            while True:
+                buf = f.read(chunk)
+                if not buf:
+                    break
+                scanned += len(buf)
+                lines += buf.count(b"\n")
+    except OSError:
+        return total or 0
+    total += lines
+    _COUNT_CACHE[key] = (scanned, st.st_mtime_ns, total)
+    return total
+
+
+# ---------- B4（2026-09-30）：分片目录缺失自愈（容忍 ≠ 静默；失败结构化） ----------
+#
+# 病灶：`ShardedLog` 只在 `__init__` 里建目录，`append` 首次 `open(self.path, "a")`
+# 前不复查。**长驻进程**（生产形态 `MdCGSecure(root, principal, autoflush=1)`——
+# `MdCG.flush` 每批写完全部 `close()` 分片句柄，故下次 append 必经重开）持有过
+# `ShardedLog` 实例之后目录被删（外部清理脚本 / 误删 / 备份还原），此后每次
+# append 都在 open 处抛 `FileNotFoundError [Errno 2]`，**且永不恢复**：目录三次
+# 都不重建、`close()` 抛同异常、`_index.json` 从未落成，而正文 .md 已在盘上
+# （`MdCG.add` → `_write_node` 先写盘）——索引静默落后于盘面。不自愈的必要条件
+# 是「本进程已持有 ShardedLog 实例」：`MdCG.flush` 只在该属性为 None 时建实例
+# （`mdcg.py` 内 `ShardedLog(...)` 构造点全仓唯一），全新短命进程做同一操作时
+# `__init__` 的 makedirs 生效、目录会被重建
+# （2026-09-30 沙箱实测两侧，见 `test_b4_shard_dir_selfheal.py` 头注）。
+#
+# 收口口径（本块是**唯一**实现；第二处调用点一律委托 `ensure_shard_dir`）：
+#   ① 判据 = 「分片目录不存在就重建」——`isdir` 快路径 → `makedirs(exist_ok=True)`
+#      → 失败抛结构化错误；`__init__`（首建）与 `append`（打开前）都走它。
+#   ② **容忍 ≠ 静默**（本仓 N225 已确立的判据）：重建必须可观测——模块级累计
+#      计数 + 有界样本 + stderr 汇总告警（与 `note_nonobject_rows` 同一风格：
+#      计数只在这里加，调用方不得另立计数器）。**首建不记账**（`where="init"`：
+#      建库时目录本就不存在，那是正常路径，不是「被删后自愈」的病态事件——
+#      计入会让计数面变成噪声、真事件被淹没）。
+#   ③ 重建**失败**（父只读 / 权限不足 / 有文件占着该路径）：抛 `ShardDirError`
+#      —— 可机读 `code` + 可操作 `hint`，不让裸 `FileNotFoundError` 冒到 MCP
+#      出口（出口只渲染 `f"{type(exc).__name__}: {exc}"` + `getattr(exc,
+#      "hint")`，裸异常在那里既无 code 也无 hint）。失败**同样记账 + 告警**：
+#      异常可能被上层兜底吞掉（`MdCG.close` 的 `except (OSError, ValueError)`），
+#      痕迹不得只存在于异常里。
+#   ④ `read_all` 既有语义**一字不改**：directory 不是目录 → 返回 `[]`（那是读面
+#      的降级契约，与本块写面自愈无关）。
+SHARD_DIR_REBUILDS = 0          # 累计「目录缺失→重建成功」次数（进程内）
+SHARD_DIR_REBUILD_SAMPLES = []  # 重建样本：(目录绝对路径, 调用点标签)
+SHARD_DIR_HEAL_FAILURES = 0     # 累计「目录缺失且重建失败」次数（进程内）
+SHARD_DIR_HEAL_FAILURE_SAMPLES = []   # 失败样本：(目录绝对路径, 调用点, 异常类型名)
+_SHARD_DIR_SAMPLE_CAP = 8       # 样本上限：记账有界，不随事件线性涨
+
+# 结构化失败的稳定 code（进 message 首字段 ⇒ MCP 出口的 error 串里可机读；
+# 出口不改形状，与 AccessDenied 的 hint 同口径只透 `hint`）。
+SHARD_DIR_ERR_CODE = "E_SHARD_DIR_UNREBUILDABLE"
+
+
+# 生效条件：msg 为必填字符串（经 super().__init__ 原样成为 str(e)），code / hint / path 任选（缺省 None）；构造出的是 OSError 子类实例，三者分别存入 self.code / self.hint / self.path，不校验取值、不读盘、不抛异常。
+class ShardDirError(OSError):
+    """分片目录缺失且无法重建——结构化失败（可机读 code + 可操作 hint）。
+
+    为什么继承 `OSError`（而不是 RuntimeError）：既有调用面按 `except OSError`
+    收敛 I/O 失败（`MdCG.close` 的兜底、各处 `except (OSError, ValueError)`），
+    换基类会让这些既有的降级/兜底面行为漂移；本类要补的是**信息**（code /
+    hint），不是新的异常族。`.hint` 与 `security.AccessDenied` 同口径——MCP
+    出口的 `getattr(exc, "hint")` 会把它渲染进工具错误结果。
+    """
+
+# 生效条件：msg 为必填字符串（经 super().__init__ 原样成为 str(e)），code / hint / path 任选（缺省 None）；随后把三者分别存入 self.code / self.hint / self.path，不校验取值、不读盘。
+    def __init__(self, msg: str, code: str = None, hint: str = None,
+                 path: str = None):
+        super().__init__(msg)
+        self.code = code
+        self.hint = hint
+        self.path = path
+
+
+# 生效条件：where 非 "init" 时把 SHARD_DIR_REBUILDS 累加 1、按 _SHARD_DIR_SAMPLE_CAP 上限补 (目录绝对路径, where) 样本，并向 sys.stderr 写一行含目录名/调用点/累计次数与排查方向的重建告警；where == "init" 时立即返回（首建是正常路径，不记账不告警）；stderr 写失败被吞掉（告警面不得反向破坏写路径），计数与样本不受影响。
+def note_shard_dir_rebuild(directory, where: str = "append"):
+    """登记一次分片目录重建（成功）+ stderr 告警（B4 可观测面）。"""
+    if where == "init":
+        return
+    global SHARD_DIR_REBUILDS
+    SHARD_DIR_REBUILDS += 1
+    if len(SHARD_DIR_REBUILD_SAMPLES) < _SHARD_DIR_SAMPLE_CAP:
+        SHARD_DIR_REBUILD_SAMPLES.append((os.path.abspath(directory), where))
+    try:
+        sys.stderr.write(
+            "[fsutil] ShardedLog 分片目录缺失，已重建（目录 %s，调用点 %s）——"
+            "本进程持有的分片实例不自愈；本次后进程内累计重建 %d 次。"
+            "排查方向：库根 _index_log/ 被外部清理/还原删掉，或库根被换过；"
+            "正文 .md 未受影响，索引缺口由重放/全库扫描补齐。\n"
+            % (os.path.basename(os.path.abspath(directory)), where,
+               SHARD_DIR_REBUILDS))
+    except Exception:                     # noqa: BLE001 —— 告警面不反向破坏写路径
+        pass
+
+
+# 生效条件：无条件把 SHARD_DIR_HEAL_FAILURES 累加 1、按 _SHARD_DIR_SAMPLE_CAP 上限补 (目录绝对路径, where, 异常类型名) 样本，并向 sys.stderr 写一行含失败原因类型与 hint 指向的告警；exc 为 None 时原因类型按 "NoneType" 渲染；stderr 写失败被吞掉（计数与样本不受影响），本函数不抛异常（真正的失败由调用方抛 ShardDirError）。
+def note_shard_dir_heal_failure(directory, where, exc=None):
+    """登记一次「目录缺失且重建失败」+ stderr 告警（B4 可观测面）。"""
+    global SHARD_DIR_HEAL_FAILURES
+    SHARD_DIR_HEAL_FAILURES += 1
+    if len(SHARD_DIR_HEAL_FAILURE_SAMPLES) < _SHARD_DIR_SAMPLE_CAP:
+        SHARD_DIR_HEAL_FAILURE_SAMPLES.append(
+            (os.path.abspath(directory), where,
+             type(exc).__name__ if exc is not None else "NoneType"))
+    try:
+        sys.stderr.write(
+            "[fsutil] ShardedLog 分片目录缺失且**重建失败**（目录 %s，调用点 %s，"
+            "原因 %s: %s）——抛 %s(code=%s)，不降级为裸 FileNotFoundError；"
+            "本次后进程内累计失败 %d 次。\n"
+            % (os.path.basename(os.path.abspath(directory)), where,
+               type(exc).__name__ if exc is not None else "NoneType", exc,
+               ShardDirError.__name__, SHARD_DIR_ERR_CODE,
+               SHARD_DIR_HEAL_FAILURES))
+    except Exception:                     # noqa: BLE001 —— 告警面不反向破坏写路径
+        pass
+
+
+# 生效条件：无入参，返回四元组 (重建累计次数, 重建样本元组, 失败累计次数, 失败样本元组)——样本元素分别为 (目录绝对路径, 调用点标签) 与 (目录绝对路径, 调用点标签, 异常类型名)；元组为副本，调用方改动不影响记账面。
+def shard_dir_stats():
+    """读分片目录自愈记账（只读）：(重建数, 重建样本, 失败数, 失败样本)。"""
+    return (SHARD_DIR_REBUILDS, tuple(SHARD_DIR_REBUILD_SAMPLES),
+            SHARD_DIR_HEAL_FAILURES, tuple(SHARD_DIR_HEAL_FAILURE_SAMPLES))
+
+
+# 生效条件：无入参、无返回值；把 SHARD_DIR_REBUILDS / SHARD_DIR_HEAL_FAILURES 归零并清空两个样本列表（守卫与运维读面前的重置点），只动本进程计数面、不触盘面。
+def reset_shard_dir_stats():
+    """清零分片目录自愈记账（守卫/运维用；只影响本进程计数面）。"""
+    global SHARD_DIR_REBUILDS, SHARD_DIR_HEAL_FAILURES
+    SHARD_DIR_REBUILDS = 0
+    SHARD_DIR_HEAL_FAILURES = 0
+    del SHARD_DIR_REBUILD_SAMPLES[:]
+    del SHARD_DIR_HEAL_FAILURE_SAMPLES[:]
+
+
+# 生效条件：directory 为分片目录路径时，os.path.isdir(directory) 为真立即返回 False（零动作、零记账）；为假则 os.makedirs(directory, exist_ok=True)——成功时经 note_shard_dir_rebuild 按 where 记账（"init" 不记）+ stderr 告警并返回 True；makedirs 抛 OSError（权限不足 / 有文件占着该路径 / 路径不可达）时先 note_shard_dir_heal_failure 记账 + 告警，再抛 ShardDirError（code=SHARD_DIR_ERR_CODE、message 首字段为 [code]、hint 含目录与三步处置、path=directory），cause 链（raise ... from）保留原异常；本函数是分片目录存在性的唯一实现点。
+def ensure_shard_dir(directory: str, where: str = "append") -> bool:
+    """`ShardedLog` 分片目录的**唯一**存在性保证点（B4）。
+
+    返回 True 表示本次**建了目录**（缺失→重建），False 表示目录本来就在。
+    where 只影响记账口径（"init" = `ShardedLog.__init__` 首建，正常路径不记；
+    "append" = 打开分片前的病态自愈面，记账 + 告警）。
+    """
+    if os.path.isdir(directory):
+        return False
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError as exc:
+        note_shard_dir_heal_failure(directory, where, exc)
+        raise ShardDirError(
+            "[%s] 分片目录不存在且重建失败：%s（底层 %s: %s）"
+            % (SHARD_DIR_ERR_CODE, directory, type(exc).__name__, exc),
+            code=SHARD_DIR_ERR_CODE,
+            hint=("分片目录 %s 不存在且无法重建（父目录不可写 / 权限不足 / 有文件"
+                  "占着该路径）。处置：①确认库根可写（Windows：去掉只读属性或"
+                  "改用有写权限的账号；POSIX：chmod/所有权）；②查是否有进程或"
+                  "杀毒软件把该目录删掉或占住；③索引日志是派生面——正文 .md 未"
+                  "受影响，修好权限后重开进程即可由重放 / 全库扫描恢复索引，"
+                  "无需重写节点。" % directory),
+            path=directory) from exc
+    note_shard_dir_rebuild(directory, where)
+    return True
+
+
+# 生效条件：directory 经 abspath 存入 self.dir 后经 ensure_shard_dir(self.dir, "init") 保证目录存在（首建不记账；失败抛 ShardDirError 而非裸 OSError），实例分片文件名由 os.getpid() 与 uuid.uuid4().hex[:8] 拼成 "{pid}-{hex8}.log"，append 时各写者只写自己这一分片，从而不共享写入点。
+class ShardedLog:
+    """每写者独占一个分片的 append-only 日志——不能丢记录时用它。
+
+    单文件 append 要靠 O_APPEND 的原子性，而那在 Windows 上不成立。分片则连
+    「共享写入点」都没有：进程 A 写 A 的文件，进程 B 写 B 的文件，物理上无从冲突。
+    代价是读取要合并 N 个分片，靠记录里的单调序号 (t, seq) 恢复全局写入顺序。
+    """
+
+# 生效条件：directory 经 abspath 存入 self.dir 并经 ensure_shard_dir(self.dir, "init") 保证存在（唯一实现点；首建不记账，失败抛 ShardDirError），self.path 为 self.dir 下 "{os.getpid()}-{uuid.uuid4().hex[:8]}.log"，并置 self._seq = 0、self._fh = None。
+    def __init__(self, directory: str):
+        self.dir = os.path.abspath(directory)
+        # B4：建目录单点收口到 ensure_shard_dir（不再各写各的 makedirs）——
+        # where="init" 是首建（正常路径，不记账）；重建失败的记账 + 告警与
+        # 结构化错误由该单点负责（原来这里是裸 OSError 直冒调用方）。
+        ensure_shard_dir(self.dir, "init")
+        self.path = os.path.join(
+            self.dir, f"{os.getpid()}-{uuid.uuid4().hex[:8]}.log")
+        self._seq = 0
+        self._fh = None
+
+# 生效条件：self._seq 先自增 1，record 被 dict(record, _t=time.time(), _s=self._seq) 复制；self._fh 为 None 时先经 ensure_shard_dir(self.dir, "append") 复查并（缺失即）重建分片目录——重建成功记账 + stderr 告警、失败抛 ShardDirError——再以 "a"、encoding="utf-8"、newline="\n" 打开 self.path（路径照常，不换分片名），随后写入 json.dumps(ensure_ascii=False, separators=(",", ":")) + "\n" 并 flush。
+    def append(self, record: dict):
+        self._seq += 1
+        record = dict(record, _t=time.time(), _s=self._seq)
+        if self._fh is None:
+            # B4（2026-09-30）：**每次重开分片前**复查目录。病灶：目录在进程
+            # 存活期间被删后，原实现在这里 `open` 抛 FileNotFoundError 且此后
+            # 永不恢复（实测三连抛、目录三次都不重建、close 抛同异常）。缺失
+            # 即重建，路径照常仍是 self.path（同一分片名，只补回目录这一层）。
+            # 边界（诚实声明）：本条只在**句柄为 None 的重开点**复查——已持有
+            # 打开句柄期间目录被删不在本守卫面内（Windows 上被打开的文件无法
+            # 删除，生产写点 `MdCG.flush` 每批写完即 close ⇒ 必经此重开点）。
+            ensure_shard_dir(self.dir, "append")
+            self._fh = open(self.path, "a", encoding="utf-8", newline="\n")
+        self._fh.write(json.dumps(record, ensure_ascii=False,
+                                  separators=(",", ":")) + "\n")
+        self._fh.flush()
+
+# 生效条件：幂等；self._fh 为真值时 flush 并关闭句柄、再把 self._fh 置 None，为 None 时直接返回不报错；
+    def close(self):
+        if self._fh:
+            self._fh.close()
+            self._fh = None
+
+    @staticmethod
+# 生效条件：directory 是目录时，按 sorted(os.listdir(directory)) 顺序对每个以 ".log" 结尾的文件读取汇总（单分片 PermissionError 时以 5ms×8 短重试等 Windows delete-pending 窗口过去、窗口后 FileNotFoundError 视为已被 compact 并入快照清走而跳过、重试耗尽照常 raise），逐行只收 dict 记录——非对象行（null/[]/123/"abc" 等合法 JSON）跳过并经 note_nonobject_rows 记账 + stderr 告警（不得静默）；随后按排序键 (_norm(r.get("_t", 0)), _norm(r.get("_s", 0))) 排序，其中 _norm 只把「数值（int/float，含 bool）且非 NaN」原样透传、其余槽（str/list/dict/None/NaN）一律记 0——坏型槽经 note_bad_sortkey_rows 记账 + stderr 告警（不得静默），记录本身不丢；合法记录（_t/_s 均数值，缺键按默认值 0）的排序键逐位等于旧键 (r.get("_t", 0), r.get("_s", 0))，故其相对次序与改前逐位一致；directory 不是目录时直接返回 []。
+    def read_all(directory: str):
+        """按全局写入顺序回放所有分片。
+
+        N170（2026-09-27）：并发 compact 的 delete-pending 窗口容忍。他进程
+        close→compact_index 的 ShardedLog.clear（mdcg.py:1137，锁内「先并快照
+        再删分片」）与本读方的 listdir→open 交错时，Windows 上 open 命中
+        「已 remove、名未消」的 delete-pending 态 → PermissionError [Errno 13]
+        （test_review_conformance【9】4 decide worker 同根并发实测复现：
+        worker 在 MdCGOS.__init__ 崩溃、stdout 空，父进程 json.loads("")
+        二次崩成 JSONDecodeError）。短重试等窗口过去：窗口过后文件要么可读、
+        要么已真删。已真删（FileNotFoundError）跳过是**安全**的——clear 的
+        契约是分片记录先并入快照再删（mdcg.py:1136-1137 顺序），本读方的
+        快照基底的陈旧读界与既有「他进程未 flush 写入不可见」边界同格，
+        由 _index_signature 指纹机制在下次重载收敛；重试耗尽的 PermissionError
+        照常上抛，真权限问题不掩盖。
+
+        N225（2026-09-29）：**非对象行容忍 + 可观测**。`read_jsonl` 按 JSON
+        合法性收行，`null` / `[]` / `123` / `"abc"` 都会原样产出；直接进
+        `recs` 会让下面的 `r.get("_t", 0)` 抛 AttributeError（实测：MdCG
+        构造 + compact_index 双崩）。此处逐行分流：dict 进回放列表，非对象行
+        进记账面（note_nonobject_rows → 模块级计数 + 样本 + stderr 告警）。
+        分流必须在本层做——`read_jsonl` 的通用契约（其它消费面）不在本次
+        范围，不得改。整片读成功才记账：半途重试不重复计数。
+
+        N225 补强（2026-09-29，**排序键健壮化**）：行是 dict 不等于键可排序
+        ——`_t` / `_s` 被外部写成 `"abc"` / `[]` / `null` 时，旧键
+        `(r.get("_t", 0), r.get("_s", 0))` 在 sort 里抛 TypeError
+        （`'<' not supported between instances of 'str' and 'float'`），
+        而 except 面只有 ValueError/OSError ⇒ 与 N225 原始缺陷同一条断链，
+        只是深度 2（N225 v1.0 报告 §0 已点名的缺口）。现按**单槽归一**处理：
+        数值（int/float，含 bool）原样，其余槽记 0——与「缺键取 0」同一口径，
+        不新造第二套默认值。归一化真的发生时（归一结果 ≠ 原值对）进
+        note_bad_sortkey_rows 记账（**容忍 ≠ 静默**，记录不丢）。
+        次序不变性：合法记录的排序键逐位等于旧键 ⇒ 同一稳定排序算法在同一
+        输入序列上产出同一次序，故相对次序与改前逐位一致（守卫 F2 用真实
+        分片记录与旧键 oracle 逐条对照）。
+        """
+        if not os.path.isdir(directory):
+            return []
+
+        # 生效条件：v 为 int/float（含 bool）且 v == v（非 NaN）时原样返回 v，其余取值（str/list/dict/None/NaN）一律返回 0——排序键单槽归一，NaN 必须排除（`nan == nan` 为假、与任何数比较恒假：它不抛但让次序不确定）。
+        def _norm(v):
+            return v if (isinstance(v, (int, float)) and v == v) else 0
+
+        recs = []
+        for fn in sorted(os.listdir(directory)):
+            if not fn.endswith(".log"):
+                continue
+            p = os.path.join(directory, fn)
+            for _attempt in range(8):
+                try:
+                    batch, skips, badkeys = [], [], []
+                    for lineno, rec in enumerate(read_jsonl(p), 1):
+                        if not isinstance(rec, dict):
+                            skips.append((p, lineno, rec))
+                            continue
+                        batch.append(rec)
+                        raw = (rec.get("_t", 0), rec.get("_s", 0))
+                        if (_norm(raw[0]), _norm(raw[1])) != raw:
+                            badkeys.append((p, lineno, raw))
+                    recs.extend(batch)
+                    note_nonobject_rows(skips)
+                    note_bad_sortkey_rows(badkeys)
+                    break
+                except FileNotFoundError:
+                    break          # 已被 compact 清走（记录已并入快照）
+                except PermissionError:
+                    if _attempt == 7:
+                        raise
+                    time.sleep(0.005)
+        recs.sort(key=lambda r: (_norm(r.get("_t", 0)), _norm(r.get("_s", 0))))
+        return recs
+
+    @staticmethod
+# 生效条件：directory 是目录时，遍历 os.listdir(directory)，对以 ".log" 结尾且不满足「keep 为真值且 os.path.abspath(p) == keep」的条目调用 os.remove（keep 为 None/空串等假值时该排除条件恒不成立，所有 ".log" 条目都会被删），删除时的 OSError 被忽略；directory 不是目录时直接返回。
+    def clear(directory: str, keep: str = None):
+        """合并进快照后清理分片。keep 用于保留当前进程正在写的那个。"""
+        if not os.path.isdir(directory):
+            return
+        for fn in os.listdir(directory):
+            p = os.path.join(directory, fn)
+            if not fn.endswith(".log") or (keep and os.path.abspath(p) == keep):
+                continue
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+#: issue #443：审计/台账记录单条的**总字节上限**（调用方可控字段可无限长 ⇒ 1:1 写入放大）。
+#: 与 state_events._MAX_FIELD_BYTES（8192/字段）不同：这里的落点是「整条记录」，
+#: 故按序列化后的总字节判；取 65536 B（单条簿记不该接近一页文本）。
+_MAX_RECORD_BYTES = 65536
+
+
+# 生效条件：rec 可 json 序列化时按其 UTF-8 字节数判：<= _MAX_RECORD_BYTES 返回 True；
+# 超限或序列化失败返回 False（调用方据此**跳过写入**，不抛——本函数的调用点全是
+# best-effort 审计路径，抛错会被上层 except 吞掉从而变静默）。
+def bounded_record(rec) -> bool:
+    """issue #443：单条台账记录的总字节闸（返回可否写入）。"""
+    try:
+        raw = json.dumps(rec, ensure_ascii=False, default=str).encode('utf-8')
+    except Exception:                              # noqa: BLE001
+        return False
+    return len(raw) <= _MAX_RECORD_BYTES

@@ -1,0 +1,179 @@
+node_modules/
+/lib/
+*.tsbuildinfo
+
+# CodeBuddy 本地配置与计划（不入库）；rules/ 例外：宿主纪律注入面（RULE.mdc 渲染落点），
+# 必须入库分发——否则 clone 后宿主无规则可注入，「入口写好了 AI 却不知道」即此断点（2026-09-23）
+/.codebuddy/*
+!/.codebuddy/rules/
+
+# AGENTS.md 本地使用（CodeBuddy 会话起始注入，不共享）
+/AGENTS.md
+
+# md_cg 运行时数据（含 _keys.json 密钥，绝不入库）
+/data/mdcg/
+
+# md_cg / 蜂巢在**仓根**直接落下的运行时件（2026-10-17 实测：以仓根为库根跑
+# mdcg/hive 时，`_keys.json`（含 KEK 包裹的 DEK 信封）、`_children.json`（orch
+# 子代理清单）、`_heartbeat.jsonl`（心跳台账）、`_keys.json.lock` 会落在根目录）。
+# 第 9 条：凭据载体绝不入库；这些件此前**只靠「收尾时逐文件 add」的纪律在挡**，
+# 而 `git add -A` 会整包带上——与 `/.zcode/` 同型的隐患，故按路径显式忽略。
+# 只忽略**仓根**这四件（带前导 `/`）：子目录里的同名件若是夹具/语料则不受影响。
+/_keys.json
+/_keys.json.lock
+/_children.json
+/_heartbeat.jsonl
+
+# 同类的两个**目录**（2026-10-17 实测）：`/~`（tilde 未展开时按字面建出的目录，内含
+# `.mdcg/`）与 `/hippocampus/`（记忆侧运行态，内含 `inbox.index.json`）。二者都是
+# 运行时产物、不是仓库内容，同样只忽略仓根（带前导 `/`）。
+/~
+/hippocampus/
+
+# 自举循环运行态数据（持续增长的日志/队列/草稿；仅本地留存，不入库）
+/data/bootstrap/
+
+# 历史遗留参考文件（防 git add -A 误提交，issue#8 修复时曾污染 360 文件）
+/awesome*
+/wf_*.yml
+/dsh-bridge_*
+/build-site.mjs
+/check-submission.mjs
+/site_locales.mjs
+/scripts_lib_entries.mjs
+
+# llm-adapter-poc：AI 实验工作区（非公开内容，仅本地保留）
+# 约 12k 实验产物文件 + venv + 本地大 db；与插件源码/发布产物无关
+llm-adapter-poc/
+
+# md_cg 运行时数据与产物（可重跑 migrate 再生，不入库）
+/_md_cg_p*/
+/_md_cg_membench/
+/_md_cg_eval_*/
+/wisdom-book-cloud-new.db
+/md_cg/__pycache__/
+/scripts/__pycache__/
+
+# 白箱自举/图谱迁移的运行时产物（可由脚本重跑再生，不入库）
+/_md_cg_wisdom_graph/
+/data/verify_cache.json
+/data/vision/
+
+# 他项目遗留参考文件与旧打包产物（非本仓库内容，防 git add -A 误提交）
+/dsh-bridge-readme.md
+/generate-readme.mjs
+/lingshu_entry.yml
+/*.tgz
+
+# 白箱知识库（md_cg/whitebox_kb）：真源为 *.py 与 *.md；
+# 下列为编译产物 / 可再生索引 / SQLite 运行态，不入库
+/md_cg/whitebox_kb/**/__pycache__/
+*.pyc
+*.pyo
+/md_cg/whitebox_kb/**/*.npz
+/md_cg/whitebox_kb/**/*.db
+/md_cg/whitebox_kb/**/*.db-shm
+/md_cg/whitebox_kb/**/*.db-wal
+/md_cg/whitebox_kb/**/neural_index.json
+/md_cg/whitebox_kb/knowledge/_ccg_dump.json
+/md_cg/whitebox_kb/knowledge/_index.json
+/md_cg/whitebox_kb/data/
+
+# 灵枢运行时 sqlite（db/shm/wal；运行时产物，不入库）
+/data/lingshu.db
+/data/lingshu.db-shm
+/data/lingshu.db-wal
+# 灵枢路径配置（本地绝对路径，不入公开仓）
+/data/paths.json
+
+# 公开基准数据集本地派生副本（大 JSON，不入库；对外发布的成品见 data/benchmarks/）
+/data/external/
+# IDE 本地配置（不共享）
+/.vscode/
+# 白箱链条热度为运行时计数日志（可重跑再生），不入库
+/md_cg/whitebox_kb/wisdom/audit_log/chain_heat.json
+
+# Rust 评测器（mdcg-eval）构建产物（cargo build --release 可再生；
+# 且 .d/.fingerprint 含本地绝对路径，绝不入公开仓）
+/rust/target/
+# Rust 评测一次性 dump 与结果输出（可重跑再生）
+/rust/loco_*
+
+# md_cg 下的评测灌库（可由 data/benchmarks/ 重灌再生；根目录规则 /_md_cg_eval_*/
+# 因路径锚定不覆盖 md_cg/ 子目录实例）与 mdcg 审计日志（运行时追加，不入库）
+/md_cg/_md_cg_eval_*/
+/md_cg/_audit.jsonl
+/md_cg/knowledge/
+
+# md_cg 密钥签发产物（tokens issue 落盘；密钥绝不入库）
+/md_cg/_keys.json
+
+# 蜂群 rust 运行时构建产物（cargo build 可再生；fingerprint 含本地绝对路径）
+/swarm/rust_runtime/target/
+
+# 蜂巢并发引擎运行时（jobs 任务目录为运行态数据；target 为 cargo 构建产物，
+# 且 .d/.fingerprint 含本地绝对路径——均不入公开仓）
+/hive/jobs/
+/hive/target/
+# 蜂巢工作记忆仓（任务产物版本化运行态；wm-repo 为 git 仓本体，不入公开仓）
+/hive/wm-repo/
+/hive/plans/naming_gov/specs/
+# 蜂巢 serve 本地环境配置（引用系统变量/个人数据文件路径，不入公开仓）
+/hive/config.local.json
+# 蜂巢互验**迭代交割面**（hive/interop/iter-*）：每轮投放/认领的中间产物目录
+# （request / proposals / replay / 回执副本），随轮次线性增长——v14 报告 I：
+# 2159 文件 / 8.7MB 入库且未忽略，属「迭代中间产物进仓」。协议**真源**仍是
+# 顶层台账与索引（_receipts_ledger.tsv / _dispatch_ledger.tsv /
+# _offers_index.md / note-*.md），据其可从对应 commit 重放再生交割面，
+# 故迭代目录不入库、仅本地留存。
+/hive/interop/iter-*/
+
+# 收据（receipt 机制，scripts/receipt.py）：**关于某次运行的证据**，属运行期产物 ⇒ **不入库**。
+# 理由：入库会（a）陈化、（b）被误当「现在绿」—— 正是 C4 docstring 里写的 (a) 之弊。
+# 保留 receipts/.gitkeep（空目录占位；该目录已在 scripts/workspace_index.py::DIR_ROLES 登记）。
+/receipts/*.json
+!/receipts/.gitkeep
+
+# 实验工作区（docs/experiments）：实验脚本 / result_*.json / _store 数据目录
+# 均为本地实验产物，不入库（_store 含 _index.json 与 *.lock，可由同目录
+# run_*.py 重跑再生；实验结论沉淀在 docs/ 的评测报告 md 中）
+docs/experiments/
+.env
+
+# 认知图投影判据体的执行面夹具（A2，2026-10-05 使用者裁决）：package.json gate 链 /
+# .github/workflows/discipline-check.yml / scripts/verify_linux.sh / pre-commit 钩子用
+# `discipline_nodes.py --init --write --cg-root .tmp/discipline-cg` 在仓内建一个**最小
+# 认知图库**（只有 structural/ 层，18 条 discipline 投影节点由真源现算），再把该路径显式
+# 交给 verify_discipline 执行投影判据体。它是可再生的运行态产物（真源不变即逐字节可重放，
+# 且 nid/created_at 带时刻），不入库。
+/.tmp/
+
+# 图像 Skill 的运行时审计台账（`md_cg/imgskill.py`）：落**调用方显式给的沙箱根**内，
+# 即 `<根>/.imgskill/audit.jsonl`。正常调用的根是临时目录、本不入库；但若有人把根指到
+# 仓内目录，台账就会落进工作区（编排侧复核时自己踩过一次：`--root docs/images`）。
+# 显式忽略，免被误 add。契约见 docs/eval/图像Skill_接口契约_设计_v0.1.md §十二。
+.imgskill/
+
+# ZCode 桌面端自动同步的本地忽略文件（工具维护，非仓库内容）；nul 为
+# Git Bash 下 `> nul` 重定向误建的意外产物，均不入库
+.zcodeignore
+nul
+
+# ZCode 端本地工作区（A8，2026-10-05 使用者裁决）：会话计划 / 探针 / 复核草稿 /
+# 工作流定义与运行记录 / 提交信息模板——本机工具产物，且正文含本机路径字面量，
+# 不入库。此前只有「收尾时逐文件显式 add」的纪律在挡（`git add -A` 会整包带上）。
+# 覆盖面自 `.zcode/` 顶收起：其下 `workflow-drafts/` 与 `workflow-runs/` 各自的
+# 内嵌 .gitignore（`*`）继续生效（更靠近路径者优先级更高，本规则只是补顶层）。
+/.zcode/
+
+# 运行时产物（测试/本地跑出的审计与索引缓存）——不得进包、不得进仓
+md_cg/_*.jsonl
+md_cg/_*.lock
+md_cg/_access.log
+md_cg/_index.json
+md_cg/_node_locks/
+md_cg/_keys.json
+scripts/*.bak-*
+
+# UI 安装器在本机生成的备份（含个性化改动，只用于回退，不进仓库）
+.lingshu-ui-backup-*/

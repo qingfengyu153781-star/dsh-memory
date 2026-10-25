@@ -1,0 +1,25 @@
+name: cogmap-check
+
+# 触发面（2026-10-23 修）：本检查是 main 分支保护的**必需检查**，
+# 此前按 paths 过滤 ⇒ 不触碰所列路径的 PR 永不触发 ⇒ 必需检查「从未出现」
+# ⇒ GitHub 判 mergeState=BLOCKED，只能管理员绕过（已复现 PR #577 / #593 / #661）。
+# 同一缺陷在本仓**三处**必需检查上存在：discipline-check / cogmap-check / publish-artifact-check。
+# 现一律删除 paths 过滤：**必需检查必须总跑**。判据内容一字未改，只是让它真的跑。
+on:
+  push:
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  cogmap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: 认知图文档与源码真源一致性（README COGMAP + 映射表 FUNCMAP：工具/op/链接/锚点/FUNC_DESC/分支数自检）
+        run: python scripts/cogmap_sync.py check
+      - name: 全库文档相对链接巡检（按文档目录解析，防文件移位后断链复发）
+        run: python scripts/link_check.py

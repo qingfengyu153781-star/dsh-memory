@@ -1,0 +1,547 @@
+# -*- coding: utf-8 -*-
+"""datapath.py · 灵枢数据根解析（记忆写入路径可配置）
+
+与 node 侧 `src/lib/datapath.ts` **同口径**——两侧读同一份
+`<用户级状态根>/paths.json`（旧 `<插件仓>/data/paths.json` 兼容读）。
+
+解析优先级（高 → 低）：
+  1. 环境变量 `MDCG_DATA_ROOT`（数据根）／ `MDCG_ROOT`（认知图根）
+  2. 用户可编辑的路径文件 `paths.json` 的 "data_root" / "root"
+     （位置：`<用户级状态根>/paths.json`；旧 `<插件仓>/data/paths.json` 兼容读）
+  3. 默认：`<用户级状态根>/data`（**插件包目录之外**，与进程 cwd 解耦）
+
+为什么默认**不**锚定「插件仓自身 data/」（issue #18 相邻问题，数据丢失级）：
+  DSH 插件按 hoisted 布局装在 `<profile>/node_modules/<pkg>`，`pnpm` 更新该包会
+  **整个替换包目录**——运行时数据落在包内时，每次更新成功即连目录一起删掉
+  （实机实证：`data/` 54 文件 → 0，46 条记忆节点靠人工备份回填）；`paths.json`
+  同址，用户配置一并丢失。故默认数据根与配置文件一律落**用户级状态根**
+  （见 state_root()），与包目录彻底解耦。
+
+为什么默认不锚定 `data/mdcg` 相对路径：
+  相对路径随进程 cwd 漂移——node 侧插件与 python 侧脚本 cwd 不同
+  （历史事故：DSH 进程 cwd 在私有库目录时，记忆真源落到 `[私有库]/data/mdcg`，
+  与插件仓内的 `data/` 分裂成两处）。
+
+设计边界：
+  - 本模块只决定「**新写入去哪**」。唯一的搬运是 `migrate_legacy_data()`：
+    默认数据根生效且旧包内位置仍有内容时，一次性**复制**（不删除、不覆盖）
+    到用户级位置——见该函数注释。
+  - 纯标准库、无包内相对导入——可被 `sys.path` 以顶层模块方式加载，
+    绕开 `md_cg/__init__.py` 的重依赖。
+
+用法：
+  from datapath import data_root, mdcg_root, state_dir   # scripts/ 内
+  python md_cg/datapath.py                 # 打印当前解析结果
+  python md_cg/datapath.py --set-root D:/x/data   # 写入 paths.json（用户可改）
+  python md_cg/datapath.py --migrate-legacy       # 把旧包内数据复制到用户级根
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+
+ENV_DATA_ROOT = "MDCG_DATA_ROOT"
+ENV_MDCG_ROOT = "MDCG_ROOT"
+ENV_STATE_ROOT = "MDCG_STATE_ROOT"
+#: 辅助存储根（密钥/令牌/信任/理论/心跳）——与「记忆真源」**有意分离**：
+#: 身份与信任面不随认知图迁移（换库不该换身份），故默认仍是历史的 `~/.mdcg`。
+ENV_AUX_ROOT = "MDCG_AUX_ROOT"
+DEFAULT_AUX_DIRNAME = ".mdcg"
+
+
+#: Windows 保留设备名全集（末段直判用；比对前统一 .upper()，故此处全大写）：
+#: DOS 设备名 CON/PRN/AUX/NUL、控制台伪设备 CONIN$/CONOUT$、COM1-9/LPT1-9，
+#: 以及 Windows 承认的上标数字变体 COM¹²³/LPT¹²³（上标 0 与 4-9 不是保留名）。
+#: **CLOCK$ 刻意不收**（issue #354 [P2-16] 报本清单漏 CLOCK$，本端复核后判定不成立）：
+#: 本机三重实测——ntdll.RtlIsDosDeviceName_U("CLOCK$")==0（CON/PRN/AUX/NUL/CONIN$/
+#: CONOUT$/COM1/LPT1 均非 0）、GetFullPathNameW 不把「<目录>\clock$」吞成 \\.\ 形态、
+#: os.makedirs/CreateDirectoryW 建得成且可写可读——判为**不保留**（与 docs/eval/发布11
+#: 已记「实测 com0/lpt0/com10/lpt10/clock$ 不保留」同一口径）。收进来会让 fail-closed 的
+#: _abs_host_path 误拒合法目录名（aux/data 根末段正好叫 clock$ 时启动即 return 2），
+#: 故**宁缺不假拒**；读数与红绿两态见守卫 md_cg/test_issue354_p2_datapath_clock。
+_RESERVED_DEVICE_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+    + [f"COM{i}" for i in range(1, 10)]
+    + [f"LPT{i}" for i in range(1, 10)]
+    + ["COM\u00b9", "COM\u00b2", "COM\u00b3",
+       "LPT\u00b9", "LPT\u00b2", "LPT\u00b3"])
+
+
+# 生效条件：纯字符串判定（不触盘、无平台分支——平台闸在调用处 _abs_host_path）；
+# 传入 path 归一（"/" → "\"）后去尾随反斜杠取末段，末段按首个 "." 截断取 stem、
+# 再去尾随空格，stem.upper() 命中 _RESERVED_DEVICE_NAMES 即返回 True，否则 False。
+# 末段直判不依赖 OS/Python 版本的 GetFullPathNameW 吞并行为——较新 Windows 构建
+# 不再把「目录\aux」吞成 \\.\aux（issue #57），前缀判据随之失效，本函数是稳定判据。
+def _reserved_device_tail(path: str) -> bool:
+    seg = path.replace("/", "\\").rstrip("\\").split("\\")[-1]
+    stem = seg.split(".", 1)[0].rstrip(" ")
+    return stem.upper() in _RESERVED_DEVICE_NAMES
+
+
+#: UTF-8 严格解码失败时标准库/Node 都会产出的**替换符**（#426-F）。路径里出现它
+#: 几乎必然是「编码失真」而不是用户真想要一个 U+FFFD 目录：插件侧 `readFileSync(pf,
+#: 'utf8')` 对 GBK/ANSI 保存的 paths.json **不抛**，把非法字节替换成它，`JSON.parse`
+#: 仍成功 ⇒ 插件拿乱码串当记忆根注入 `MDCG_ROOT`，新写入分叉进乱码空库（原库从插件
+#: 面消失）。Python 侧对**同一文件**是严格解码（`_read_user_paths` 的 utf-8-sig ⇒
+#: PathsConfigError），两侧口径就此分叉。故本模块在**所有根解析的归一单点**上把
+#: 「含 U+FFFD」判为误配 fail-closed——两侧同口径：要么取到真路径，要么响亮失败。
+_REPLACEMENT_CHAR = "\ufffd"
+
+
+# 生效条件：p 按仓库既有口径 expanduser+abspath 归一；归一结果含 U+FFFD 替换符
+# （编码失真哨兵，#426-F）时**无条件**抛 ValueError（任何平台——该字符不是任何
+# 正常配置的产物，fail-closed 优于把新写入分叉进乱码库）；平台为 Windows（os.name=="nt"）
+# 且命中两因之一时抛 ValueError——① 归一结果以设备命名空间前缀（"\\\\.\\"）开头：
+# 保留设备名末段（aux/con/nul/prn/com1-9/lpt1-9 等）被 GetFullPathNameW 吞成设备
+# 路径（例 D:\sandbox\aux → \\.\aux）；② 归一结果末段直判为保留设备名
+# （_reserved_device_tail）：较新 Windows 构建不再吞并（issue #57），旧前缀判据
+# 失效，末段直判不依赖 OS 行为——两因并置互为兜底。后果同：目录语义静默丢失，
+# 密钥/令牌/数据覆盖键随之静默失联；非 Windows 平台该形态是合法目录名字面量，
+# 不判定。归一是纯字符串操作不触盘，路径无需存在即可复现。env_key 传覆盖键名
+# （env 变量名或 paths.json 键），仅用于错误消息定位误配来源；为空时消息以
+# 「该路径」指代。
+# issue #385（PR 来源）：波浪线展开在 python 侧的**唯一实现**。此前的 os.path.expanduser
+# 是平台相关的——POSIX 会走 pwd.getpwnam 把 ~user 查成 /home/user，而 ntpath 只在用户名
+# 等于当前用户时展开 ⇒ 同一份 env 在两端落点不同；而 node 侧
+# src/lib/datapath.ts::expandHome 早已是自实现 ⇒ **两侧口径分叉**（正是该 issue 本身）。
+# 现两侧同名同判据：~ / ~/x / ~\x 展开；~user 与其余原样（方案 a——两侧无共同的
+# 「查账号库」语义，宁同留字面量）。
+# 收敛代价（如实）：POSIX 上 MDCG_ROOT=~someone/mem 从「展开成 /home/someone/mem」
+# 变成「原样 ~someone/mem」，需用户写全路径。
+# 源码面断言：md_cg/test_datapath_tilde_home.py（扫 md_cg/ 与 scripts/ 的 .py，第二处
+# 同判据即报红）。
+def _expand_home(p: str) -> str:
+    """波浪线展开——本判据在 python 侧的唯一实现（与 node 侧 expandHome 同口径）。"""
+    if p == "~":
+        return os.path.expanduser("~")
+    if p.startswith("~/") or p.startswith("~\\"):
+        return os.path.expanduser("~") + os.sep + p[2:]
+    return p
+
+
+def _abs_host_path(p: str, env_key: str = "") -> str:
+    r = os.path.abspath(_expand_home(p))          # #385：与 node 侧 expandHome 同口径
+    if _REPLACEMENT_CHAR in r:
+        who = env_key or "该路径"
+        raise ValueError(
+            f"{who} 归一后含 U+FFFD 替换符（{r!r}）——这是**编码失真**的痕迹，"
+            "不是合法目录名：paths.json 若以 GBK/ANSI 保存（PowerShell 5 的 "
+            "Set-Content 不带 -Encoding、cmd 的 echo >、旧编辑器另存为 ANSI），"
+            "宽松 UTF-8 解码会把非法字节替换成该字符，于是「记忆真源」变成一个"
+            "乱码目录，新写入分叉进空库、原库从插件面消失（#426-F）。请把该文件"
+            "改存为 UTF-8（含 BOM 亦可），或删掉它回到用户级默认数据根；"
+            "本侧与 Python 侧同一口径：**要么取到真路径，要么响亮失败**。")
+    if os.name == "nt" and (r.startswith("\\\\.\\")
+                            or _reserved_device_tail(r)):
+        who = env_key or "该路径"
+        raise ValueError(
+            f"{who} 归一后末段是 Windows 保留设备名（{r!r}）：GetFullPathNameW "
+            "可能把整个目录吞成设备路径（\\\\.\\aux 形态，目录语义静默丢失）；"
+            "较新 Windows 构建即便不吞并，保留设备名末段也一律按误配拒绝——"
+            "本守卫末段直判不依赖 OS 吞并行为（issue #57）。请把 "
+            f"{who} 改指向末段不含保留设备名的普通目录。")
+    return r
+
+
+# 生效条件：无入参，恒返回本文件 __file__ 绝对路径上溯两级得到的插件仓根目录。
+def plugin_root() -> str:
+    """插件仓根目录（本文件位于 <root>/md_cg/datapath.py）。"""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+# 生效条件：无入参；ENV_STATE_ROOT 环境变量为非空真值时经 _abs_host_path 归一返回（Windows 上归一为设备命名空间形态——保留设备名末段——时抛 ValueError），为空串/未设时若 DSH_HOME 为非空真值则返回其 abspath 下 ".dsh-memory"，两者皆无则返回 ~/.dsh/.dsh-memory 的 abspath。
+def state_root() -> str:
+    """用户级状态根（**插件包目录之外**）：路径配置与默认数据根的落点。
+
+    `DSH_HOME` **未必**由宿主注入（本仓 `dsh/dsh-web-start.bat` 自行 set），
+    故家目录兜底；`~/.dsh` 是本插件既有约定（node 侧调试日志同址）。
+    """
+    env = os.environ.get(ENV_STATE_ROOT)
+    if env:
+        return _abs_host_path(env, ENV_STATE_ROOT)
+    dsh_home = os.environ.get("DSH_HOME")
+    if dsh_home:
+        return os.path.join(os.path.abspath(dsh_home), ".dsh-memory")
+    return os.path.join(os.path.expanduser("~"), ".dsh", ".dsh-memory")
+
+
+# 生效条件：无入参，恒返回 plugin_root() 下 "data" 的拼接路径（旧版落点，更新时被整目录替换，只作兼容读与迁移源）。
+def legacy_data_root() -> str:
+    """旧版落点（插件包内 `data/`）——更新时会被整个替换。"""
+    return os.path.join(plugin_root(), "data")
+
+
+# 生效条件：无入参，恒返回 legacy_data_root() 下 "paths.json" 的拼接路径。
+def legacy_paths_file() -> str:
+    """旧版路径配置文件位置（包内，兼容读）。"""
+    return os.path.join(legacy_data_root(), "paths.json")
+
+
+# 生效条件：两个路径参数经 normpath+normcase 规范化后相等时返回 True，否则 False（Windows 大小写不敏感）。
+def _same_path(a: str, b: str) -> bool:
+    return (os.path.normcase(os.path.normpath(a)) ==
+            os.path.normcase(os.path.normpath(b)))
+
+
+# 生效条件：无入参；<state_root()>/paths.json 存在（isfile）时返回之，不存在而 legacy_paths_file() 存在时返回旧件，两者皆不存在时返回新位置路径（首次写入时创建），不受 data_root() 取值影响。
+def paths_file() -> str:
+    """用户可编辑的路径配置文件——用户级优先，旧包内位置兼容读。
+
+    新位置：`<用户级状态根>/paths.json`（随包更新不丢）。
+    旧位置：`<插件仓>/data/paths.json`（旧版约定，仅当新位置不存在时读它，
+    已存在新件则新件说了算——不做自动复制，避免旧件后续编辑静默失效）。
+    """
+    current = os.path.join(state_root(), "paths.json")
+    if os.path.isfile(current):
+        return current
+    legacy = legacy_paths_file()
+    return legacy if os.path.isfile(legacy) else current
+
+
+# 生效条件：无入参；paths_file() 的所在目录与 state_root() 同路径时返回 "user"，否则返回 "legacy"（兼容读旧包内位置）。
+def paths_file_source() -> str:
+    """生效中的 paths.json 位置来源：`user` / `legacy`。"""
+    return "user" if _same_path(os.path.dirname(paths_file()),
+                                state_root()) else "legacy"
+
+
+class PathsConfigError(RuntimeError):
+    """paths.json 存在但无法解析 / 顶层不是对象（#352-D，2026-10-15）。
+
+    **为什么响亮失败而不是告警后回落**（本仓先例 #161「打包面静默坏包 ⇒ 改为
+    响亮失败」，Lead 本轮指定按同一精神处置）：这个文件决定「记忆真源在哪」。
+    改前 `_user_paths()` 把「文件不存在」与「文件存在但坏了」混成同一个 `{}`，
+    于是坏配置下 `mdcg_root()` **无声回落到默认库**——用户看到的是「原有记忆
+    从检索面消失」，而新写入分叉进另一个库（插件侧仍按 config 走，两边就此
+    分成两个库）。这比「启动失败」更难发现、更难收拾，故取 fail-closed。
+
+    恢复路径（错误消息里写全）：修好该文件，或删掉它回到用户级默认数据根。
+    """
+
+
+# 生效条件：无入参；返回 (配置 dict, 状态串)——paths_file() 不存在时 ({}, "missing")；读取或 JSON 解析抛异常、或顶层非 dict 时 ({}, "bad")；否则 (dict, "ok")；不抛；
+def _read_user_paths():
+    """paths.json 的三态读取（**唯一读取点**：missing / ok / bad 三分，不再混成 {}）。"""
+    pf = paths_file()
+    if not os.path.isfile(pf):
+        return {}, "missing"
+    try:
+        # utf-8-sig：记事本 / PowerShell 5 的 `Set-Content -Encoding UTF8` 会写出
+        # UTF-8 BOM，`encoding="utf-8"` 下 json.load 直接拒收（#352-D 的两种常见
+        # 写坏方式之一；另一种是照抄资源管理器路径写成 `"root": "D:\memory"`，
+        # `\m` 非法转义 —— 那是真·语法错，只能响亮失败）。
+        with open(pf, encoding="utf-8-sig") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return {}, "bad"
+    if not isinstance(d, dict):
+        # 合法 JSON、错形状（`[]` / `123` / `"x"`）：同样会让配置位静默失效，
+        # 同一个口径处理（响亮失败），不按「解析成功」放行。
+        return {}, "bad"
+    return d, "ok"
+
+
+# 生效条件：无入参；_read_user_paths() 状态为 "ok"/"missing" 时返回配置 dict（missing 即 {}）；状态为 "bad" 时 strict 取真（默认）抛 PathsConfigError、取假返回 {}（只给必须降级的读面用，如 set_user_root 的自查）；
+def _user_paths(strict: bool = True) -> dict:
+    d, st = _read_user_paths()
+    if st == "bad":
+        if strict:
+            raise PathsConfigError(_paths_config_message())
+        return {}
+    return d
+
+
+# 生效条件：无入参；返回一段含 paths_file() 绝对路径、原始异常不可知但处置建议完整的错误消息（供 PathsConfigError 与 CLI 面共用，不另写第二份文案）；
+def _paths_config_message() -> str:
+    pf = paths_file()
+    return ("%s 无法解析（或顶层不是 JSON 对象）——**未回落默认库**：记忆真源"
+            "由该文件决定，静默回落会让原有记忆从检索面消失、新写入分叉到另一个"
+            "库（#352-D）。请修正该文件（Windows 上常见两种写坏：记事本 / "
+            "PowerShell 5 存成 UTF-8 BOM；路径里的反斜杠未转义，应写 \\\\ 或改用 /），"
+            "或删掉它回到用户级默认数据根后重试。" % pf)
+
+
+# 生效条件：无入参，恒返回 state_root() 下 "data" 的拼接路径（插件包目录之外，更新不触碰）。
+def default_data_root() -> str:
+    """默认数据根 = 用户级状态根下 data/。"""
+    return os.path.join(state_root(), "data")
+
+
+# 生效条件：p 为目录且其下无任何条目时返回 True，p 不存在/是文件/OSError 时返回 False。
+def _is_empty_dir(p: str) -> bool:
+    try:
+        return os.path.isdir(p) and not os.listdir(p)
+    except OSError:
+        return False
+
+
+# 生效条件：无入参；data_root() 与 default_data_root() 不同路径时返回 {ran:False, reason:"数据根为显式配置（env/paths.json），不迁移", from, to, copied:0, failed:[]}；相同则继续——legacy_data_root() 非目录时返回 reason="旧位置不存在（多为更新时已随包目录被替换）"，其下无条目（除 paths.json 外）时返回 reason="旧位置无数据"，否则把其余顶层条目逐个复制到 default_data_root() 下（目标条目已存在且非空目录则跳过；只复制不删除、不覆盖；单个条目异常记入 failed 不抛），返回 ran=(copied>0)、copied、failed 与失败时的 reason（"目标不可写" 或 "新位置已有数据，未覆盖"）。
+def migrate_legacy_data() -> dict:
+    """一次性迁移：把旧版包内 `data/` 的数据面复制到用户级默认数据根。
+
+    触发条件（三条同时满足，缺一不动）：
+      ① 数据根未被显式配置（env `MDCG_DATA_ROOT` / paths.json 的 "data_root"
+         都未设，即 data_root() 恰为默认值）——显式配置是用户的决定；
+      ② 旧位置存在；③ 目标顶层条目不存在或为空目录（不覆盖、不合并）。
+
+    `paths.json` 不复制（配置走 paths_file() 兼容读，复制会制造两说）。
+    任何异常逐项吞掉并记入 `failed`——迁移是增益，不该成为启动失败源。
+
+    边界（如实）：pnpm 更新是**先替换包目录再启动新代码**，旧数据在升级瞬间即
+    已消失，本函数只能接手「旧位置那时仍在」的情形；已在升级中丢掉的数据无法
+    由此恢复——发布说明须提示 0.4.8 及更早用户升级前备份包内 `data/`。
+    """
+    frm = legacy_data_root()
+    to = default_data_root()
+    out = {"ran": False, "reason": "", "from": frm, "to": to,
+           "copied": 0, "failed": []}
+    if not _same_path(data_root(), to):
+        out["reason"] = "数据根为显式配置（env/paths.json），不迁移"
+        return out
+    if not os.path.isdir(frm):
+        out["reason"] = "旧位置不存在（多为更新时已随包目录被替换）"
+        return out
+    try:
+        names = [n for n in os.listdir(frm) if n != "paths.json"]
+    except OSError:
+        out["reason"] = "旧位置不可读"
+        return out
+    if not names:
+        out["reason"] = "旧位置无数据"
+        return out
+    for name in names:
+        src = os.path.join(frm, name)
+        dst = os.path.join(to, name)
+        # 新位置已有实质内容 → 跳过（宁可少搬，不可覆盖）
+        if os.path.exists(dst) and not _is_empty_dir(dst):
+            continue
+        try:
+            os.makedirs(to, exist_ok=True)
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
+            out["copied"] += 1
+        except Exception:                  # noqa: BLE001 —— 迁移不得成为启动失败源
+            out["failed"].append(name)
+    out["ran"] = out["copied"] > 0
+    if not out["ran"]:
+        out["reason"] = ("目标不可写" if out["failed"]
+                         else "新位置已有数据，未覆盖")
+    return out
+
+
+# 生效条件：无入参；ENV_DATA_ROOT 环境变量为非空真值时经 _abs_host_path 归一返回（Windows 保留设备名末段抛 ValueError，下同），为空串/未设时若 paths.json 的 "data_root" 为真值则按其是否为绝对路径决定直接归一还是拼 plugin_root() 后归一，该键缺失或为假值时回落 default_data_root()。
+def data_root() -> str:
+    """数据根（记忆/账本/运行态的父目录）。"""
+    env = os.environ.get(ENV_DATA_ROOT)
+    if env:
+        return _abs_host_path(env, ENV_DATA_ROOT)
+    cfg = _user_paths().get("data_root")
+    if cfg:
+        return _abs_host_path(cfg, "paths.json 的 data_root") \
+            if os.path.isabs(cfg) else \
+            _abs_host_path(os.path.join(plugin_root(), cfg),
+                           "paths.json 的 data_root")
+    return default_data_root()
+
+
+# 生效条件：无入参；ENV_MDCG_ROOT 环境变量为非空真值时经 _abs_host_path 归一返回（Windows 保留设备名末段抛 ValueError，下同），为空串/未设时若 paths.json 的 "root" 为真值则按其是否为绝对路径决定直接归一还是拼 plugin_root() 后归一，该键缺失或为假值时返回 data_root() 下 "mdcg" 的拼接路径。
+def mdcg_root() -> str:
+    """认知图（记忆唯一真源）根目录。"""
+    env = os.environ.get(ENV_MDCG_ROOT)
+    if env:
+        return _abs_host_path(env, ENV_MDCG_ROOT)
+    cfg = _user_paths().get("root")
+    if cfg:
+        return _abs_host_path(cfg, "paths.json 的 root") \
+            if os.path.isabs(cfg) else \
+            _abs_host_path(os.path.join(plugin_root(), cfg),
+                           "paths.json 的 root")
+    return os.path.join(data_root(), "mdcg")
+
+
+# 生效条件：无入参；ENV_DATA_ROOT 或 ENV_MDCG_ROOT 任一为非空真值时返回 True；否则 paths_file() 的 JSON 顶层为 dict 且其 "root" 为非空真值时返回 True；其余（无文件/无该键/假值）返回 False；**文件存在但解析失败（顶层非 dict 亦然）时抛 PathsConfigError**（#352-D：与 mdcg_root()/data_root() 同一口径——坏配置不静默当「未配置」，否则三级回落链会悄悄换一个库）。**不看目录是否存在**——存在性判据留给调用方。
+def mdcg_root_configured() -> bool:
+    """认知图根是否**被显式配置**（env `MDCG_DATA_ROOT`/`MDCG_ROOT`，或 paths.json 的 "root"）。
+
+    为什么需要它（2026-10-10 设计者裁定「15 a」/ dsh-memory #85 的落地面）：
+    `mdcg_root()` 是**恒有返回值**的回落链（未配置时给默认 `data_root()/mdcg`），
+    单看它的返回值分不出「用户配了」与「走默认」。`security.check_path_root` 的
+    三级回落链要在「连库根也无」时才取工作区，故须一个显式的「配置位」判据——
+    即本函数。**只看显式配置**：默认目录是否存在由调用方另判（`os.path.isdir`），
+    因为「默认库已装记忆」与「默认库位空着」在 check_path_root 里处置不同。
+    """
+    if (os.environ.get(ENV_DATA_ROOT) or "").strip() \
+            or (os.environ.get(ENV_MDCG_ROOT) or "").strip():
+        return True
+    return bool(str(_user_paths().get("root") or "").strip())
+
+
+# 生效条件：parts 非空时路径为 data_root() 与各 part 的 join，parts 为空时路径即 data_root()；create 为真值（默认 True）时对该路径 makedirs(exist_ok=True)，create 为假值时只返回路径不建目录。
+def state_dir(*parts: str, create: bool = True) -> str:
+    """运行态子目录（日志/队列/草稿…），默认挂在数据根下。"""
+    p = os.path.join(data_root(), *parts) if parts else data_root()
+    if create:
+        os.makedirs(p, exist_ok=True)
+    return p
+
+
+# 生效条件：无入参；ENV_AUX_ROOT 为非空真值时经 _abs_host_path 归一返回（Windows 保留设备名末段抛 ValueError），否则返回 ~/.mdcg 的拼接路径（历史默认，逐字不变）。
+def aux_root() -> str:
+    """辅助存储根（密钥/令牌/信任/理论/心跳）所在目录。
+
+    历史默认 `~/.mdcg`，**逐字保留**（改默认会让存量密钥/令牌失联：私有内容
+    会解不开、已签令牌会失效）。设 `MDCG_AUX_ROOT` 可把这些面整体搬到别处
+    ——沙箱/多用户/与记忆真源同处的场景需要它。
+
+    与 `mdcg_root()`（记忆真源）分离是**有意设计**：身份与信任不随认知图迁移。
+    代价是两者可能分居两处，故 `mdcg.mcp_server` 启动时把两者一起打日志
+    （不许静默分裂）；本函数即该分裂面的唯一解析入口。
+    """
+    env = (os.environ.get(ENV_AUX_ROOT) or "").strip()
+    if env:
+        return _abs_host_path(env, ENV_AUX_ROOT)
+    return os.path.join(os.path.expanduser("~"), DEFAULT_AUX_DIRNAME)
+
+
+# 生效条件：parts 非空时返回 aux_root() 与各 part 的 join，parts 为空时即 aux_root()；create 为真值时 makedirs(exist_ok=True)，create 为假值时只返回路径。
+def aux_path(*parts: str, create: bool = False) -> str:
+    """辅助存储根下的路径（可选建目录）。"""
+    p = os.path.join(aux_root(), *parts) if parts else aux_root()
+    if create:
+        os.makedirs(p, exist_ok=True)
+    return p
+
+
+# 生效条件：name 依次拼成 data_root()/name、plugin_root()/name、dirname(plugin_root())/[私有归档根]/_archive/ctp-aeis-data/name 三个候选，仅保留其中 os.path.isfile 为真的项并按此顺序返回列表。
+def archive_root() -> str | None:
+    """私有侧归档根（公开仓不含私有库名）：本机配置提供，未配置则没有该候选。
+
+    取值顺序：环境变量 MDCG_ARCHIVE_ROOT -> 插件仓同级的 .mdcg_archive_root 文件内容。
+    """
+    value = os.environ.get("MDCG_ARCHIVE_ROOT", "").strip()
+    if value:
+        return value
+    marker = os.path.join(os.path.dirname(plugin_root()), ".mdcg_archive_root")
+    if os.path.isfile(marker):
+        try:
+            with open(marker, "r", encoding="utf-8") as fh:
+                text = fh.read().strip()
+        except OSError:
+            return None
+        return text or None
+    return None
+
+
+# 生效条件：给定 name 时按 data_root()/name、plugin_root()/name 顺序拼接候选，仅当 archive_root() 不为 None 才追加其下 _archive/ctp-aeis-data/name，最终只返回其中 os.path.isfile 为真的路径（其余被过滤掉），故全都不满足时返回空列表。
+def legacy_candidates(name: str) -> list:
+    """历史位置候选（只读兼容：三仓分离前的校验缓存等）。
+
+    仅用于「读旧件」，顺序：数据根 → 插件仓根 → 归档区。
+    """
+    out = [os.path.join(data_root(), name),
+           os.path.join(plugin_root(), name)]
+    archive = archive_root()
+    if archive is not None:
+        out.append(os.path.join(archive, "_archive", "ctp-aeis-data", name))
+    return [p for p in out if os.path.isfile(p)]
+
+
+# 生效条件：name 对应的 legacy_candidates(name) 列表非空时返回其首个元素，为空列表时返回 None。
+def find_existing(name: str) -> str | None:
+    """在数据根/插件仓/归档区中找已存在的同名文件，找不到返回 None。"""
+    hits = legacy_candidates(name)
+    return hits[0] if hits else None
+
+
+# 生效条件：无入参；恒返回含 plugin_root/state_root/data_root/mdcg_root/default_data_root/is_default/source/paths_file/paths_file_source/legacy_data_root/legacy_data_exists/data_root_exists/mdcg_root_exists 的字典，其中 source 按 ENV_DATA_ROOT 非空取 "env:MDCG_DATA_ROOT" → 否则 ENV_MDCG_ROOT 非空取 "env:MDCG_MDCG_ROOT" → 否则 _user_paths() 为非空 dict 取 "paths.json(用户级)" 或 "paths.json(兼容读旧包内位置)"（按 paths_file_source()）→ 否则取 "default(用户级状态根 data/)"。
+def describe() -> dict:
+    """当前解析结果的完整快照（供心跳/日志留痕）。"""
+    dr = data_root()
+    mr = mdcg_root()
+    pf_src = paths_file_source()
+    return {
+        "plugin_root": plugin_root(),
+        "state_root": state_root(),
+        "data_root": dr,
+        "mdcg_root": mr,
+        "default_data_root": default_data_root(),
+        "is_default": _same_path(dr, default_data_root()),
+        "source": ("env:" + ENV_DATA_ROOT if os.environ.get(ENV_DATA_ROOT)
+                   else ("env:" + ENV_MDCG_ROOT if os.environ.get(ENV_MDCG_ROOT)
+                         else (("paths.json(用户级)" if pf_src == "user"
+                                else "paths.json(兼容读旧包内位置)")
+                               if _user_paths()
+                               else "default(用户级状态根 data/)"))),
+        "paths_file": paths_file(),
+        "paths_file_source": pf_src,
+        "legacy_data_root": legacy_data_root(),
+        "legacy_data_exists": os.path.isdir(legacy_data_root()),
+        "data_root_exists": os.path.isdir(dr),
+        "mdcg_root_exists": os.path.isdir(mr),
+    }
+
+
+# 生效条件：path 为传入字符串（写入前反斜杠替换为 "/"），key 默认 "data_root"（传入时写入该键名）；先确保 <state_root()> 存在，读取 _read_user_paths()——状态 "ok"/"missing" 时按既有键补 "_comment" 后以 fsutil.atomic_write **原子**覆写 <state_root()>/paths.json 并返回该路径；状态 "bad"（文件在但解析不出）时抛 PathsConfigError **拒绝写**（不把其余键冲掉——改前 _user_paths() 返回 {}，写回时把用户其余配置一并抹掉）；
+def set_user_root(path: str, key: str = "data_root") -> str:
+    """把用户选择的路径写入**用户级** paths.json（不存在则创建）。返回文件路径。
+
+    永远写新位置（不写旧包内那件）——旧位置会随包更新被删除，写进去等于
+    用户设置迟早丢失；旧件的既有取值经 _read_user_paths() 带入新件，不丢配置。
+
+    #352-D 两处收口：① 读到**坏文件**时拒绝写并响亮报错（改前会静默把其余键
+    冲掉，用户顺手丢配置）；② 落盘改走 `fsutil.atomic_write`（改前 `open("w")`
+    非原子，崩溃会留下截断件——而截断件正是下一条「解析失败」的来源）。
+    """
+    pf = os.path.join(state_root(), "paths.json")
+    os.makedirs(os.path.dirname(pf), exist_ok=True)
+    d, st = _read_user_paths()
+    if st == "bad":
+        raise PathsConfigError(
+            _paths_config_message()
+            + "\n[set_user_root] 拒绝写入并把其余键原样留着——请先修正或删除"
+              "该文件，再重设路径。")
+    d.setdefault("_comment",
+                 "灵枢记忆写入路径（用户可改）。删掉本文件即回落到用户级默认数据根"
+                 "（~/.dsh/.dsh-memory/data）。")
+    d[key] = path.replace("\\", "/")
+    from . import fsutil                       # 延迟导入：fsutil 是叶子模块，避免
+    fsutil.atomic_write(pf, json.dumps(d, ensure_ascii=False, indent=2))
+    return pf
+
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    ap = argparse.ArgumentParser(description="灵枢数据根解析与设置")
+    ap.add_argument("--set-root", metavar="PATH",
+                    help="把数据根写入 <用户级状态根>/paths.json（用户可改）")
+    ap.add_argument("--set-mdcg-root", metavar="PATH",
+                    help="把认知图根写入 <用户级状态根>/paths.json")
+    ap.add_argument("--migrate-legacy", action="store_true",
+                    help="把旧版包内 data/ 的数据面复制到用户级默认数据根"
+                         "（只复制不删除；默认数据根被显式配置时不动作）")
+    a = ap.parse_args()
+    # main 级入口承接受理：覆盖键末段为 Windows 保留设备名时 _abs_host_path 抛
+    # ValueError——CLI 面给一行清晰呈现（含原始消息），不留裸 traceback。
+    try:
+        if a.set_root:
+            print("written:", set_user_root(a.set_root, "data_root"))
+        if a.set_mdcg_root:
+            print("written:", set_user_root(a.set_mdcg_root, "root"))
+        if a.migrate_legacy:
+            print("migrate:", json.dumps(migrate_legacy_data(),
+                                         ensure_ascii=False))
+        print(json.dumps(describe(), ensure_ascii=False, indent=2))
+    except ValueError as ve:
+        sys.stderr.write(f"[datapath] {ve}\n拒绝输出：请先改正上述覆盖键/配置。\n")
+        sys.exit(2)
+    except PathsConfigError as pe:
+        # #352-D：坏 paths.json 响亮失败——给一行清晰呈现（含完整恢复路径），
+        # 不留裸 traceback；退出码 2 与「root 不可读」同档（配置面错误）。
+        sys.stderr.write(f"[datapath] {pe}\n")
+        sys.exit(2)

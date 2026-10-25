@@ -1,0 +1,12 @@
+{
+ "kind": "unit-review",
+ "iter_id": "t1-compiler6-dual-dual",
+ "round": 5,
+ "candidate_commit": "f3e0608",
+ "branch": "task/t1-compiler6-dual-dual",
+ "unit_job": "h1789695899364_1640b7",
+ "verdict": "ACCEPT",
+ "package_n": 14,
+ "text": "复核：14条候选条件均与源码段一致；形参默认、越界早退、标签分支、返回形状、空容器前置均正确锚定；未发现 assert/None 假值误判、闭包前置缺失或源码不支持断言；position_ok=true 满足位置要求。\nreason: 全部条件逐条与源码相符，未发现需拒绝的语义偏差。\nverdict: ACCEPT",
+ "paths_policy": "脱敏（模块名已掩码）"
+}

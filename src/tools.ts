@@ -1,0 +1,302 @@
+/**
+ * 工具桥接：运行时从灵枢拉取工具清单（tools/list），把 JSON Schema
+ * 转换为 dsh-tools 的 ParameterSchemaSpec，经 defineTool 注册进 ctx.tools。
+ *
+ * 动态拉取意味着灵枢库升级新增工具后，DSH 侧零改动即可获得新能力。
+ */
+
+import type { Context } from '@deepseek-ai/cordis'
+// #222：`@deepseek-ai/dsh-tools` 是 **optional peer**（peerDependenciesMeta），而
+// optional 的语义是「没有它也能加载本包」。此前这里是**静态值导入**，于是干净
+// 安装（npm 7+ 不装 optional peer）后 `import('@furongjun1999/dsh-memory')` 直接
+// ERR_MODULE_NOT_FOUND——整包不可加载，不是「用到才失败」。故改为**惰性导入**
+// （仅在真正注册工具时 `await import`，见 registerLingshuTools）；类型仍走
+// `import type`（编译期擦除，运行期不解析）。
+import type { ParameterPropertySpec, ParameterSchemaSpec, ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
+import type { LingshuBridge, McpTool } from './bridge.ts'
+// B 治本批（2026-10-06）：写归因注入单点（运行期会话 → 写归因调用）。
+// 运行时导入写 `.js`（本仓口径：type-only 才写 `.ts`，tsconfig 未开
+// allowImportingTsExtensions —— 值导入写 `.ts` 会 TS5097 编译失败）。
+import { attributeSession } from './lib/session_state.js'
+import { neutralizeUntrustedBoundary } from './lib/prompt_safety.js'
+
+/** 默认暴露的核心工具集合：**记忆面已基元化**，只注册 `cg` / `stg` 两个认知基元。
+ *
+ * 三层拆分 S4 收敛后，插件工具面真源是 `md_cg.mcp_server`（不再是 pip aeis）；
+ * 旧的 aeis 工具名（remember/recall/think…）已不存在，写在这里只会被筛成空集
+ * ——「工具永久缺失」的根因，故一并移除。全部记忆/召回/时间线/落图能力由
+ * `cg(op=…)` / `stg(op=…)` 覆盖（见 src/lib/mdcg_client.ts 的显式映射）。 */
+export const CORE_TOOLS = [
+  'cg',   // md_cg 认知图统一入口（op 分发：route/read/recent/identity/verify/whitebox…）
+  'stg',  // md_cg 时空图入口（timeline/relation/anchor/consistency…）
+] as const
+
+/**
+ * 大脑模式工具集：`cg`/`stg` 基元 + md_cg 全部细粒度工具（`MDCG_MCP_SURFACE=full`）。
+ *
+ * 即「完整认知面」。不再区分身体/视觉——那些工具随 aeis 剥离，主仓无对应物。
+ * 管理类（forget / restore / review_decide）按映射表裁定「收窄后不留」，不在此列
+ * （如需显式启用，用 `tools: ['mdcg_forget', …]` 显式数组——显式配置不受 RISK 限制）。
+ */
+export const BRAIN_TOOLS = [
+  'cg', 'stg',
+  // 记忆读写
+  'mdcg_remember', 'mdcg_recall', 'mdcg_search', 'mdcg_get',
+  // 反思 / 验证 / 飞轮 / 负记忆
+  'mdcg_reflect', 'mdcg_verify', 'mdcg_flywheel', 'mdcg_mine_fix_pairs',
+  'mdcg_rejected', 'mdcg_unresolved',
+  // 审核队列（入队 / 列队 / 记录审计；裁决 review_decide 属管理类，不在此列）
+  'mdcg_propose', 'mdcg_review_list', 'mdcg_review_records',
+  // 保护 / 遗忘留痕（forget 属管理类，不在此列）
+  'mdcg_protect', 'mdcg_forgetting_history',
+  // 身份 / 一致性 / 元认知 / 自我状态
+  'mdcg_identity', 'mdcg_consistency', 'mdcg_metacognition', 'mdcg_self_state',
+  // 预测 / 因果 / 演化账本
+  'mdcg_predict', 'mdcg_causal', 'mdcg_evolution',
+  // 服务 / 状态
+  'mdcg_health', 'mdcg_whoami', 'mdcg_ingest', 'mdcg_watermarks',
+  'mdcg_whitebox', 'mdcg_service_info',
+] as const
+
+/** tools 配置：'core' | 'brain' | 'all' | 显式名称数组。 */
+export type ToolSelection = 'core' | 'brain' | 'all' | string[]
+
+/** P1 修复（GPT 审查）：只读/无副作用工具才允许并发——写操作（记忆/关系/
+ * 生命周期/摄取/学习）标 false，防止 DSH 并行调用导致 SQLite 写入竞争、
+ * 状态顺序错乱、关系边重复等。 */
+const READ_TOOLS = new Set([
+  // —— md_cg 细粒度只读工具（非多态：无 action 写分支）——
+  'mdcg_recall', 'mdcg_search', 'mdcg_get', 'mdcg_review_list', 'mdcg_review_records',
+  'mdcg_forgetting_history', 'mdcg_health', 'mdcg_whoami', 'mdcg_watermarks', 'mdcg_service_info',
+  // 注：cg / stg 是多态基元（op=focus/route 只读，op=write 写），一律按写处理（串行）。
+  // 多态工具（mdcg_predict/causal/evolution/protect/identity/self_state/whitebox…）
+  // 含 action=写 分支，同样保守按写处理。
+])
+
+/** 按工具名判定并发安全（只读查询 true；写操作 false） */
+export function isToolConcurrencySafe(name: string): boolean {
+  return READ_TOOLS.has(name)
+}
+
+/**
+ * P1 完善（GPT 审查·tools:all 自动扩权）：即使 selection='all' 也排除的宿主级
+ * 风险工具——此前后端新增工具即自动暴露给 Agent（动态扩权无 denylist）。
+ * 排除原则：宿主命令执行/权限终裁/外部设备/自主生命周期控制/角色卡写入。
+ * 显式名称数组（显式配置）不受此名单限制（配置者已明确选择）。
+ */
+export const RISK_TOOLS = new Set([
+  // —— md_cg 管理类（映射表裁定「收窄后不留」，需 can_admin）：即使 tools:'all'
+  //    也不自动暴露；要启用须用显式名称数组 ——
+  'mdcg_forget',        // 软删除（管理隔离：需 can_admin）
+  'mdcg_restore',       // 强恢复校验（管理隔离：需 can_admin）
+  'mdcg_review_decide', // 审核终裁（管理隔离：需 can_admin，等效设计者裁决）
+])
+
+/** 按配置筛选工具名（'all' 时排除 RISK_TOOLS 宿主级危险工具）。 */
+export function selectTools(all: string[], selection: ToolSelection): string[] {
+  if (selection === 'all') return all.filter((name) => !RISK_TOOLS.has(name))
+  const allowed = new Set(
+    selection === 'core' ? CORE_TOOLS
+      : selection === 'brain' ? BRAIN_TOOLS
+      : selection,
+  )
+  return all.filter((name) => allowed.has(name))
+}
+
+/** 把 MCP JSON Schema 的属性表转换为 ParameterSchemaSpec。 */
+export function schemaToParameters(inputSchema: Record<string, unknown> | undefined): ParameterSchemaSpec {
+  if (!inputSchema || typeof inputSchema !== 'object') return {}
+  const properties = inputSchema['properties'] as Record<string, unknown> | undefined
+  if (!properties || typeof properties !== 'object') return {}
+  const required = new Set(Array.isArray(inputSchema['required']) ? (inputSchema['required'] as string[]) : [])
+  // issue #354 [P2-15]：属性表必须是**无原型**对象。用 `{}` 时 `spec['__proto__'] = v`
+  // 走的是 Object.prototype 的原型 setter——局部 spec 的原型被换成 v，该属性在
+  // Object.keys / 展开 / JSON 序列化里静默消失（工具参数定义丢字段，且原型链上
+  // 多出一层可控对象）。`Object.create(null)` 让 `__proto__` 成为普通自有键。
+  // 类型断言：ParameterSchemaSpec 是「属性名 → 规格」的字典，无原型对象仍是合法字典。
+  const spec = Object.create(null) as Record<string, ParameterPropertySpec>
+  for (const [key, raw] of Object.entries(properties)) {
+    const value = toValueSpec(raw)
+    if (required.has(key)) {
+      spec[key] = { ...value, required: true as const }
+    } else {
+      spec[key] = value
+    }
+  }
+  return spec
+}
+
+/** 递归转换单个 JSON Schema 节点为 ValueSchemaSpec。 */
+function toValueSpec(raw: unknown): ValueSchemaSpec {
+  if (typeof raw !== 'object' || raw === null) return { type: 'json' }
+  const node = raw as Record<string, unknown>
+  const annotations: { description?: string } = {}
+  if (typeof node['description'] === 'string') annotations.description = node['description'] as string
+  const type = node['type']
+  const enumValues = Array.isArray(node['enum']) ? (node['enum'] as unknown[]) : undefined
+  switch (type) {
+    case 'string':
+      return { type: 'string', ...annotations, ...(enumValues ? { enum: enumValues as string[] } : {}) }
+    case 'number':
+      return { type: 'number', ...annotations }
+    case 'integer':
+      return { type: 'integer', ...annotations }
+    case 'boolean':
+      return { type: 'boolean', ...annotations }
+    case 'null':
+      return { type: 'null', ...annotations }
+    case 'array': {
+      const spec: { type: 'array'; items?: ValueSchemaSpec } & typeof annotations = { type: 'array', ...annotations }
+      if (node['items'] !== undefined) spec.items = toValueSpec(node['items'])
+      return spec
+    }
+    case 'object': {
+      const props = schemaToParameters(node)
+      // P1 修复（GPT 审查）：尊重后端 additionalProperties 声明（false 保留），
+      // 不再无条件 true——此前后端写 false 也会被覆盖成 true，DSH 侧认为
+      // 参数合法但后端拒绝。
+      const additional = node['additionalProperties'] === false ? false : true
+      return { type: 'object', properties: props, additionalProperties: additional, ...annotations }
+    }
+    default:
+      return { type: 'json', ...annotations }
+  }
+}
+
+/** 从灵枢 content 数组中提取文本（MCP text block 拼接）。 */
+/** 工具面返回文本的插件级兜底上限（issue #563②）。
+ *
+ * 服务端 `cg(op=read)` 等已有 `offset`/`truncated` 分页（`_clip_text`），本上限**不**替代
+ * 它、也不重新定义预算：只兜「一次把整库搬进上下文」的极端形态。取 64KiB——远大于
+ * 单页预算（服务端 preview 200 字 / read 分页 KB 级），正常调用不会触发。
+ */
+export const TOOL_RENDER_MAX_CHARS = 65536
+
+export function extractText(content: Array<{ type: string; text?: string; [key: string]: unknown }>): string {
+  return content
+    .map((block) => (block.type === 'text' && typeof block.text === 'string' ? block.text : ''))
+    .filter(Boolean)
+    .join('\n')
+}
+
+/** 注册灵枢工具到 ctx.tools；返回取消注册函数。
+ *
+ * #222：`defineTool` 在**这里**惰性导入（而不是模块顶层静态导入）——本包对
+ * `@deepseek-ai/dsh-tools` 的声明是 optional peer，静态导入会让「干净安装后
+ * import 本包」在模块求值前就失败。惰性导入后：不在 DSH 宿主内时包仍可加载，
+ * 只有真正注册工具才报错，且错误消息点名缺哪个包。
+ */
+/** 工具对外名（issue #634）：正式名 + 可选兼容别名。
+ *
+ * 0.9.9 起去掉了 `${serverName}_` 前缀（lingshu_cg -> cg），升级瞬间
+ * 已存在会话里的旧名调用全部变成 unknown tool。这里给出「一个工具要注册哪些名字」的
+ * 纯函数，注册面与测试共用，避免两处各写一份判据。
+ */
+export function toolPublicNames(
+  toolName: string,
+  prefix: string,
+  legacyAliases = true,
+): string[] {
+  const primary = `${prefix}${toolName}`
+  if (prefix || !legacyAliases || toolName.startsWith("lingshu_")) return [primary]
+  return [primary, `lingshu_${toolName}`]
+}
+
+export async function registerLingshuTools(
+  ctx: Context,
+  bridge: LingshuBridge,
+  opts: { selection: ToolSelection; toolPrefix: string; legacyAliases?: boolean },
+): Promise<() => void> {
+  let defineTool: typeof import('@deepseek-ai/dsh-tools').defineTool
+  try {
+    ({ defineTool } = await import('@deepseek-ai/dsh-tools'))
+  } catch (err) {
+    throw new Error(
+      '无法加载 @deepseek-ai/dsh-tools（灵枢工具注册依赖 DSH 宿主提供的该包）——'
+      + '请确认插件运行在 DSH 宿主内，或在宿主环境中安装 @deepseek-ai/dsh-tools。'
+      + `原始错误：${err instanceof Error ? err.message : String(err)}`)
+  }
+  const tools = await bridge.listTools()
+  const wanted = new Set(selectTools(tools.map((t) => t.name), opts.selection))
+  const disposers: Array<() => void> = []
+  const registered: string[] = []
+  try {
+    // issue #634（2026-10-22）：0.9.9 起工具名去掉 serverName 前缀（lingshu_cg -> cg），
+    // 升级瞬间已存在的会话里旧名调用全变 unknown tool，宿主与插件都没有提示。
+    // 这里加兼容别名：裸名照常注册，同时补注册 lingshu_<name>（legacyAliases=false 可关）。
+    // 别名与正式名指向同一个 execute，语义不变；描述标注 deprecated 供模型与人识别。
+    for (const tool of tools) {
+      if (!wanted.has(tool.name)) continue
+      const names = toolPublicNames(tool.name, opts.toolPrefix, opts.legacyAliases !== false)
+      const publicName = names[0] as string
+      const aliasName = names[1] ?? ""
+      const makeDefinition = (registeredName: string, deprecated: boolean) => defineTool({
+        name: registeredName,
+        description: deprecated
+          ? '【已弃用别名】旧版工具名（升级兼容用），请改用 ' + publicName + '。原始描述：'
+            + (tool.description || '灵枢 ' + tool.name)
+          : (tool.description || '灵枢 ' + tool.name),
+        parameters: schemaToParameters(tool.inputSchema),
+        output: {
+          schema: { type: 'json' } as never,
+          render(_args, value) {
+            // issue #563②：工具面与自动注入面同源（都可能含他者写入的记忆原文），
+            // 但此前**完全不打断边界标记、也无插件级上限**——同一条记忆在注入面被
+            // 打断，在 `cg(op=read)` 的返回里却原样带出，模型可据此提前闭合边界块。
+            // 两件事在此单点做：①打断（与注入面同一实现 `neutralizeUntrustedBoundary`）；
+            // ②兜底上限（服务端已有 offset 分页，插件层只兜一个远大于单页的硬上限，
+            // 防止一次把整库搬进上下文；截断必须显式标注，不静默）。
+            const raw = extractText((value as McpCallResultLike).content ?? [])
+            const safe = neutralizeUntrustedBoundary(raw)
+            const text = safe.length > TOOL_RENDER_MAX_CHARS
+              ? safe.slice(0, TOOL_RENDER_MAX_CHARS)
+                + `
+…[已截断：工具返回超过插件上限 ${TOOL_RENDER_MAX_CHARS} 字符]`
+              : safe
+            return [{ type: 'text', text }]
+          },
+        },
+        timeoutMs: 120_000,
+        // P1 修复（GPT 审查）：按工具分类——只读查询可并发，写操作串行
+        isConcurrencySafe: () => isToolConcurrencySafe(tool.name),
+        // P1 修复（GPT 审查）：接收 exec.signal（用户取消/上层超时）——
+        // 此前完全忽略取消，取消后写操作（remember/relate/ingest 等）仍可能产生副作用
+        async execute(args: Record<string, unknown>, exec: { signal: AbortSignal }) {
+          if (exec.signal.aborted) throw new Error(`灵枢 ${tool.name} 已取消`)
+          // B 治本批（2026-10-06）：agent 直调工具的转发面把**运行期会话**注入
+          // **写归因调用**——env（MDCG_SESSION）取消后，请求声明即归因唯一来源
+          // （md_cg/mcp_server.py 的 _declared_session：env > 请求声明 > 进程身份）。
+          // 判据单点在 lib/session_state.ts 的 attributeSession：只注入
+          // mdcg_remember 与 cg(op=write) 两个写面；读面（视图过滤）/ op 特化语义
+          // 一律不动。命中且未显式声明时返回新对象，否则原样透传。
+          const forwarded = attributeSession(tool.name, args as Record<string, unknown>)
+          const result = await bridge.callTool(tool.name, forwarded, exec.signal)
+          if (exec.signal.aborted) throw new Error(`灵枢 ${tool.name} 已取消`)
+          if (result.isError) {
+            throw new Error(extractText(result.content) || `灵枢 ${tool.name} 执行失败`)
+          }
+          return { content: result.content } as never
+        },
+      })
+      disposers.push(ctx.tools.register(makeDefinition(publicName, false)))
+      registered.push(publicName)
+      if (aliasName) {
+        // 兼容别名：指向同一个 execute（makeDefinition 复用了同一份定义体），
+        // 标记 deprecated；下一轮 minor 再评估是否移除。
+        disposers.push(ctx.tools.register(makeDefinition(aliasName, true)))
+        registered.push(aliasName)
+      }
+    }
+  } catch (err) {
+    for (const dispose of disposers) dispose()
+    throw err
+  }
+  ctx.logger.info(`dsh-memory: 已注册 ${registered.length} 个灵枢工具（${registered.join(', ')}）`)
+  return () => {
+    for (const dispose of disposers) dispose()
+  }
+}
+
+interface McpCallResultLike {
+  content: Array<{ type: string; text?: string; [key: string]: unknown }>
+}

@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""hive 执行器 · 确定性分支（零 LLM）：跑命令 / 测试 / 回归 / lint / 批处理。
+
+契约与 exec.py 完全一致（argv[1]=job 目录，读 spec.json 写 result.json，rust 侧只认
+result.json 的 error 字段），区别是**不调 LLM**——把 spec 里的命令当任务执行（第 17 条
+「确定性执行 = 自定义 worker」）。故 HIVE_EXEC_PY 指向本文件时，**一个 serve 同时承载
+两类任务**（无 command 的 spec 转发给同目录 exec.py）；不指向时行为零变动。
+
+确定性 spec 字段：
+  command                   ["python","-m","pytest","-q"] 单条 argv 数组（推荐）
+  commands                  [{"command":[...],"cwd":...,"label":...}, ...] 多步串行
+  cwd                       工作目录（缺省 spec.workdir → job 目录）
+  env                       {"K":"V"} 附加环境变量（覆盖继承值）
+  fail_fast                 默认 true：任一步非 0 即停
+  timeout_step_s            单步超时（缺省 600；**不继承 spec.timeout_s**——批次 23 D-5/v19
+                            两守卫解耦防同值撞车，rust 侧另有硬超时兜底）
+  expect_files              ["路径"] 执行后断言存在（相对 cwd），缺失即 error
+  expect_stdout_contains    ["子串"] 各步 stdout 合并文本须包含**全部**给定子串，缺一即 error
+订阅约定：model 写 "cmd"、user_prompt 写任务标签——仅为过 rust 侧必填校验，本执行器不调 API。
+
+command 只收 argv 数组，字符串形态一律拒绝（不经 shell，规避转义/GBK 陷阱，第 15 条）。
+字段脏类型一律**规格错**（rc=2）：`commands` 非数组、`env` 非对象、`timeout_step_s`
+非数字（含 step 内同名字段与 `cwd` 非字符串）都在进执行前拦下——不得让类型异常逃到
+顶层兜底被记成「执行错」（N234，2026-10-05）。
+
+退出码：0 成功 / 2 规格错 / 3 执行错（与 exec.py 同形）。
+"""
+from __future__ import annotations
+import re
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+HEAD_CHARS = 4000
+DEFAULT_STEP_TIMEOUT_S = 600
+EXIT_OK, EXIT_SPEC, EXIT_EXEC = 0, 2, 3
+
+
+# 生效条件：job_dir 与 obj 给出后，env HIVE_RESULT_ANCHOR 去空白非真时 obj["result_anchor"] = 该值（P11 批次53 执行器契约：serve 对锚预期任务注入此 env，执行器原样回写，值由 serve 侧 HMAC 校验——本处不做密码学运算；env 缺省不写字段，产物格式向后兼容）；随后 tempfile.mkstemp(prefix="result.json.", suffix=".tmp", dir=job_dir) 建唯一临时文件并 UTF-8 写入 json.dump(obj, ensure_ascii=False)+flush+fsync，再 os.replace 到 job_dir/result.json（N144，2026-09-28 第 23 轮：移植 exec.py v10 N82 两件套——固定共享名 p+".tmp" 在同 job 并发双执行者（rust 重投/N92 孤儿 recover 并存/双 serve 抢同池）下对撞，一者 replace 抢先消费共享 tmp、另一者 PermissionError/FileNotFoundError 外逃进 main 顶层兜底且兜底 _fail 复用同一坏路径可再抛；mkstemp 随机后缀天然防共享名对撞）；os.replace 撞 PermissionError（Windows 读者瞬态句柄 WinError 5/32）按 10ms×递增重试至多 50 次，撞 FileNotFoundError（tmp 被瞬态消费/清理）重建唯一名重写后重试，任一重试耗尽才向外抛（失败时旧完整结果仍在位，fail-safe）；finally 里 best-effort 清理仍存在的 tmp，成功路径零残留。
+def _write_result(job_dir: str, obj: dict) -> None:
+    """tmp + fsync + rename 原子替换（并发读者不读到截断空窗口）。"""
+    p = os.path.join(job_dir, "result.json")
+    _anchor = (os.environ.get("HIVE_RESULT_ANCHOR") or "").strip()
+    if _anchor:
+        obj["result_anchor"] = _anchor
+
+    def _mk_and_dump():
+        fd, tmp = tempfile.mkstemp(prefix="result.json.", suffix=".tmp",
+                                   dir=job_dir)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        return tmp
+
+    tmp = _mk_and_dump()
+    try:
+        for attempt in range(50):
+            try:
+                os.replace(tmp, p)
+                return
+            except PermissionError:
+                if attempt == 49:
+                    raise
+                time.sleep(0.01 * (attempt + 1))
+            except FileNotFoundError:
+                # tmp 被瞬态消费/清理（对撞残留形态）：重建唯一名重写再试，
+                # 不让偶发扑空外逃成顶层兜底覆写（fail-closed 前的自愈面）。
+                if attempt == 49:
+                    raise
+                tmp = _mk_and_dump()
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+# 生效条件：job_dir 与 msg 传入时写 job_dir/log.txt 一行带时间戳日志（观测面——open 失败降级 stderr，绝不打断任务，对齐 exec.py log 同族）。
+def _log(job_dir: str, msg: str) -> None:
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}\n"
+    # #465：改走跨进程安全追加；**保住 :83 的既有生效条件**——
+    # 失败/超时一律降级 stderr、**绝不打断任务**（不得把「写失败」变成抛出）。
+    try:
+        from hive._append import append_line as _append_line
+    except ImportError:                                    # 脚本方式直跑（无包上下文）
+        from _append import append_line as _append_line
+    if not _append_line(os.path.join(job_dir, "log.txt"), line, tag="exec_cmd"):
+        sys.stderr.write(line)
+
+
+# 生效条件：以 job_dir 与 msg 构造 {"ok": False, "error": msg, "model": "cmd"}，extra 为真值时 r.update(extra) 合并、假值（None/{}）时不合并；写前回看 job_dir/result.json——存在且可解析为 dict 且 ok 为 True（成功终态在位，N144，2026-09-28 第 23 轮：移植 exec.py write_error_result 重投对撞保护）时不动它，_log 留痕「成功终态在位，兜底 error 改写被拒」并返回 code（退出码语义不变，本进程照实返回失败码）；文件缺失/不可解析/ok 非真时 _write_result 写入 r（error→error 更新不受限）并返回 code。
+def _fail(job_dir: str, msg: str, code: int = EXIT_SPEC, extra: dict | None = None) -> int:
+    r: dict = {"ok": False, "error": msg, "model": "cmd"}
+    if extra:
+        r.update(extra)
+    p = os.path.join(job_dir, "result.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            prev = json.load(f)
+    except (OSError, ValueError):
+        prev = None
+    if isinstance(prev, dict) and prev.get("ok") is True:
+        _log(job_dir, "成功终态已在位，兜底 error 改写被拒（重投对撞保护，"
+                      "N144）——本进程失败不影响已落地终态")
+        return code
+    _write_result(job_dir, r)
+    return code
+
+
+# 生效条件：spec 为 dict 时逐项做**规格前置类型闸**——`commands` 键存在且非 None 时必须
+# 是 list（空列表合法：落回 `command` 口径）、`env` 非 None 时必须是为 dict、
+# `timeout_step_s` 非 None 时必须为数字（bool 不算——它是 int 子类但不是时长语义）；
+# 命中任一返回人话规格错文案，否则返回 None。
+# 为什么必须显式闸（N234，2026-10-05）：脏类型会让下游抛 AttributeError / ValueError /
+# TypeError 逃出 run_cmd，由 main 顶层兜底成 EXIT_EXEC(3)——规格错被记成执行错，与
+# :24「2=规格错 / 3=执行错」相悖；且 `commands` 非 list 真值形态旧版静默落进
+# 「无命令 → 转发 LLM」（:253-254）：确定性命令从未执行却以 ok=true 落盘，与同字段
+# 字符串 `command` 在 :128-131 的规格错执法不一致。
+def _is_num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+
+# ---- issue #464：池内 spec 的两道根闸（本件即其载体）---------------------------------
+# ★单点真源 + 派生视图（照 hive/exec.py 的 PII_FAMILIES -> _PII_PATTERNS 既有形态）：
+#   ENV_SECRET_FAMILIES 是**唯一手写清单**；ENV_SECRET_RES 与 is_secret_env_name 均由它派生。
+#
+# 与既有两族的关系（**本表属第三族**，不合并）：
+#   · hive/exec.py 的 PII_FAMILIES -> _PII_PATTERNS：对象是**内容形态**（文本里长什么样）；
+#   · md_cg/interop.py 的 _FORBIDDEN_RES：对象是**发布闸**（哪些串不许进发布物）；
+#   · 本表：对象是**环境变量名**（哪些名字不得继承给子进程）。对象不同故不合并；
+#     且 hive 不得反向依赖 md_cg（C1 腿所钉的约束）⇒ 不能复用 interop 的清单。
+#   · **已知漂移风险**：_FORBIDDEN_RES 与 _PII_PATTERNS 之间已按站点拆分、分叉点有注释与矩阵腿
+#     （hive/exec.py:1176 + md_cg/test_issue419_pii_redaction.py）。本表同样可能漂 —— 故必须登记在此，
+#     **不登记的副本就是下一例**。
+ENV_SECRET_FAMILIES = (
+    ('key', r'(?:^|_)(?:API_?)?KEY(?:$|_)'),
+    ('token', r'(?:^|_)TOKENS?(?:$|_)'),
+    ('secret', r'(?:^|_)SECRETS?(?:$|_)'),
+    ('password', r'(?:^|_)PASS(?:WORD|WD)?(?:$|_)'),
+    ('credential', r'(?:^|_)CREDENTIALS?(?:$|_)'),
+    ('designer_key', r'^AEIS_DESIGNER_KEY$'),
+)  #: 手写唯一真源；新增族只改这里
+#: _PII_PATTERNS 式派生视图
+ENV_SECRET_RES = tuple((label, re.compile(pat)) for label, pat in ENV_SECRET_FAMILIES)
+
+#: 允许的可执行文件（裸名）白名单
+ALLOWED_EXECUTABLES = ('python', 'python3', 'py', 'node', 'npm', 'npx', 'git')
+
+
+# 生效条件：name 为字符串即成立；大小写归一后任一 ENV_SECRET_RES 命中即 True。
+def is_secret_env_name(name) -> bool:
+    n = str(name).upper()
+    return any(rx.search(n) for _lab, rx in ENV_SECRET_RES)
+
+
+# 生效条件：env 为 dict 或 None 即成立；返回剥离敏感键后的新 dict（不改原 dict）。
+def strip_secret_env(env: dict) -> dict:
+    return {str(k): v for k, v in (env or {}).items() if not is_secret_env_name(k)}
+
+
+# 生效条件：argv 为非空字符串列表即成立；返回 None（放行）或错误字符串（拒）。
+def command_root_gate(argv):
+    if not (isinstance(argv, list) and argv and all(isinstance(x, str) for x in argv)):
+        return 'command 必须是非空字符串数组'
+    exe = argv[0]
+    roots = (os.path.dirname(os.path.realpath(sys.executable)),
+             os.path.realpath(tempfile.gettempdir()))
+    if os.sep in exe or (os.altsep and os.altsep in exe):
+        real = os.path.realpath(exe)
+        if not any(real == r or real.startswith(r + os.sep) for r in roots):
+            return ('可执行文件根闸：%s 不在允许根内（%s）——池内 spec 不得执行任意路径的程序'
+                    % (real, ', '.join(roots)))
+        return None
+    if exe not in ALLOWED_EXECUTABLES:
+        return ('可执行文件根闸：%r 不在白名单内（%s）——需新增请改 ALLOWED_EXECUTABLES'
+                % (exe, ', '.join(ALLOWED_EXECUTABLES)))
+    return None
+
+
+def _spec_gate(spec: dict):
+    raw = spec.get("commands")
+    if raw is not None and not isinstance(raw, list):
+        return ('commands 必须是数组（对象数组 [{"command": [...]}] 或 argv 数组 '
+                '["python","x.py"]）——当前是 %s；本执行器不把脏类型当「无命令」'
+                '转发 LLM' % type(raw).__name__)
+    env = spec.get("env")
+    if env is not None and not isinstance(env, dict):
+        return "env 必须是对象（键值对）——当前是 %s" % type(env).__name__
+    ts = spec.get("timeout_step_s")
+    if ts is not None and not _is_num(ts):
+        return "timeout_step_s 必须是数字（秒）——当前是 %s" % type(ts).__name__
+    return None
+
+
+# 生效条件：spec["commands"] 为非空 list 时逐项归一（dict 原样收、list 包成 {"command": item}、其它类型返回错误 err），commands 缺失/非 list/空列表时若 spec.get("command") 为真值则只生成单步，否则返回 (None, None) 走 LLM 委托；随后逐步校验 command：是字符串时报「只收 argv 数组」，是 None 或不是「非空且全为 str 的 list」时统一报「必须是非空字符串数组」；并做步内字段类型闸（N234 同族：cwd 非字符串、timeout_step_s 非数字会让 _run_step 抛 TypeError/ValueError 逃出 run_cmd 记成执行错）——任一报错均返回 (None, err) 由调用方按规格错（rc=2）收口。
+def _norm_steps(spec: dict):
+    """→ (steps, err)；两者皆 None 表示「无命令 → 走 LLM 委托」。"""
+    raw = spec.get("commands")
+    steps: list = []
+    if isinstance(raw, list) and raw:
+        for item in raw:
+            if isinstance(item, dict):
+                steps.append(item)
+            elif isinstance(item, list):
+                steps.append({"command": item})
+            else:
+                return None, "commands 元素必须是对象或 argv 数组"
+    elif spec.get("command"):
+        steps.append({"command": spec["command"]})
+    else:
+        return None, None
+    for i, s in enumerate(steps, 1):
+        argv = s.get("command")
+        if isinstance(argv, str):
+            return None, (f"第 {i} 步 command 是字符串——只收 argv 数组（不经 shell），"
+                          '请改 ["python","scripts/x.py"] 形态')
+        if not (isinstance(argv, list) and argv and all(isinstance(x, str) for x in argv)):
+            return None, f"第 {i} 步 command 必须是非空字符串数组"
+        _gate = command_root_gate(argv)
+        if _gate:
+            return None, "第 %d 步 %s" % (i, _gate)
+
+        cwd = s.get("cwd")
+        if cwd is not None and not isinstance(cwd, str):
+            return None, f"第 {i} 步 cwd 必须是字符串路径——当前是 {type(cwd).__name__}"
+        ts = s.get("timeout_step_s")
+        if ts is not None and not _is_num(ts):
+            return None, (f"第 {i} 步 timeout_step_s 必须是数字（秒）——当前是 "
+                          f"{type(ts).__name__}")
+    return steps, None
+
+
+# 生效条件：对 ("stdout", out) 与 ("stderr", err) 各自把全文写入 job_dir/step_<idx>_<name>.txt 并在写成功时记 rec["<name>_path"]（OSError 仅 pass 不留路径），同时无条件记 rec["<name>_head"] = text[:HEAD_CHARS]，仅当 len(text) > HEAD_CHARS 才置 rec["<name>_truncated"] = True。
+def _dump_step(job_dir: str, idx: int, out: str, err: str, rec: dict) -> None:
+    """完整输出落 step_<i>_stdout/stderr.txt，result 只留 head（防爆炸）。"""
+    for name, text in (("stdout", out), ("stderr", err)):
+        path = os.path.join(job_dir, f"step_{idx}_{name}.txt")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            rec[f"{name}_path"] = path
+        except OSError:
+            pass
+        rec[f"{name}_head"] = text[:HEAD_CHARS]
+        if len(text) > HEAD_CHARS:
+            rec[f"{name}_truncated"] = True
+
+
+# 生效条件：argv 直接取 step["command"]（缺键即 KeyError）；cwd 取 step.get("cwd") or default_cwd 并在非绝对时转 abspath，timeout 按 step.get("timeout_step_s") or spec.get("timeout_step_s") or DEFAULT_STEP_TIMEOUT_S 回退（**不继承 timeout_s**——批次 23 D-5/v19：step 守卫继承 job 总超时会与 scheduler 的 kill_tree 守卫同值撞车，终态随机 timeout/error；两守卫解耦后 step 级缺省 600s 远大于常规 job 超时，由 job 级兜底）；cwd 非目录即返回失败 rec 与 ""，否则以 shell=False 运行 subprocess.run，FileNotFoundError / TimeoutExpired（此路先 _dump_step 再返回 out）/ OSError 各返回失败 rec，正常结束记 ok=rc==0、exit_code=rc 并 _dump_step。
+def _run_step(step: dict, idx: int, job_dir: str, spec: dict, env: dict, default_cwd: str):
+    argv = list(step["command"])
+    cwd = step.get("cwd") or default_cwd
+    cwd = cwd if os.path.isabs(cwd) else os.path.abspath(cwd)
+    label = step.get("label") or f"step {idx}"
+    timeout = step.get("timeout_step_s") or spec.get("timeout_step_s") or \
+        DEFAULT_STEP_TIMEOUT_S
+    t0 = time.time()
+    rec = {"label": label, "command": argv, "cwd": cwd}
+    if not os.path.isdir(cwd):
+        rec.update({"ok": False, "exit_code": None, "duration_s": 0.0,
+                    "error": f"cwd 不存在：{cwd}"})
+        return rec, ""
+    try:
+        p = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
+                           timeout=float(timeout), shell=False)
+        out, err, rc = p.stdout or "", p.stderr or "", p.returncode
+    except FileNotFoundError:
+        rec.update({"ok": False, "exit_code": None, "duration_s": round(time.time() - t0, 3),
+                    "error": f"命令不存在：{argv[0]}（检查 PATH 或改用解释器全名）"})
+        return rec, ""
+    except subprocess.TimeoutExpired as e:
+        dec = lambda b: b.decode("utf-8", "replace") if isinstance(b, bytes) else (b or "")  # noqa: E731
+        out, err = dec(e.stdout), dec(e.stderr)
+        rec.update({"ok": False, "exit_code": None, "duration_s": round(time.time() - t0, 3),
+                    "error": f"单步超时（{timeout}s）被强杀"})
+        _dump_step(job_dir, idx, out, err, rec)
+        return rec, out
+    except OSError as e:
+        rec.update({"ok": False, "exit_code": None, "duration_s": round(time.time() - t0, 3),
+                    "error": f"启动失败：{type(e).__name__}: {e}"})
+        return rec, ""
+    rec.update({"ok": rc == 0, "exit_code": rc, "duration_s": round(time.time() - t0, 3)})
+    _dump_step(job_dir, idx, out, err, rec)
+    return rec, out
+
+
+# 生效条件：以 steps 与 elapsed 生成首行「确定性执行：{len(steps)} 步，用时 {elapsed:.2f}s」，note 为真值时追加 " | {note}"、假值（空串）不追加，再逐步行输出 [i] OK/FAIL label、exit、duration、' '.join(s.get('command') or [])、error 真值时的 "! error"、stdout_head 去空白后末 6 行与 stderr_head 去空白后末 4 行，最后 "\n".join(lines)。
+def _render(steps: list, elapsed: float, note: str = "") -> str:
+    head = f"确定性执行：{len(steps)} 步，用时 {elapsed:.2f}s" + (f" | {note}" if note else "")
+    lines = [head]
+    for i, s in enumerate(steps, 1):
+        lines.append(f"[{i}] {'OK ' if s.get('ok') else 'FAIL'} {s.get('label')} — "
+                     f"exit={s.get('exit_code')} {s.get('duration_s')}s")
+        lines.append(f"    $ {' '.join(s.get('command') or [])}")
+        if s.get("error"):
+            lines.append(f"    ! {s['error']}")
+        for ln in (s.get("stdout_head") or "").strip().splitlines()[-6:]:
+            lines.append(f"    | {ln}")
+        for ln in (s.get("stderr_head") or "").strip().splitlines()[-4:]:
+            lines.append(f"    E {ln}")
+    return "\n".join(lines)
+
+
+# 生效条件：spec 为 None 时从 job_dir/spec.json 读取（OSError/ValueError 时置 {}）；spec.get("orchestrate") 真值时 exe 取 os.environ.get("HIVE_ORCH_PY")（空串视假值回落）或 here/orch.py，否则取 os.environ.get("HIVE_LLM_EXEC_PY") 或 here/exec.py；exe 非文件时返回 _fail(..., EXIT_EXEC)，否则用 sys.executable 运行 [exe, job_dir]、透传其 stdout/stderr 并返回 p.returncode。
+def _delegate(job_dir: str, spec: dict | None = None) -> int:
+    """无命令 → 转发执行器：`spec.orchestrate` 真值 → orch.py（编排器），否则 exec.py。
+
+    为什么分档落在**转发层**而不是 exec.py 内部：编排器是独立 worker（要注册编排
+    工具、把身份换成派生令牌编排器），放转发层后 exec.py 的累积式修复面零触碰
+    （2026-09-16 Q1 裁定）。HIVE_ORCH_PY 可覆盖编排器路径（对称于 HIVE_LLM_EXEC_PY）。
+    """
+    if spec is None:
+        try:
+            with open(os.path.join(job_dir, "spec.json"), encoding="utf-8") as f:
+                spec = json.load(f)
+        except (OSError, ValueError):
+            spec = {}
+    here = os.path.dirname(os.path.abspath(__file__))
+    if spec.get("orchestrate"):
+        exe = os.environ.get("HIVE_ORCH_PY") or os.path.join(here, "orch.py")
+        what = "orch.py（编排器）"
+    else:
+        exe = os.environ.get("HIVE_LLM_EXEC_PY") or os.path.join(here, "exec.py")
+        what = "exec.py（LLM 委托）"
+    if not os.path.isfile(exe):
+        return _fail(job_dir, f"spec 无 command/commands，需转发 {what} 但未找到：{exe}",
+                     EXIT_EXEC)
+    p = subprocess.run([sys.executable, exe, job_dir], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    if p.stdout:
+        sys.stdout.write(p.stdout)
+    if p.stderr:
+        sys.stderr.write(p.stderr)
+    return p.returncode
+
+
+# 生效条件：job_dir/spec.json 读取抛 OSError/ValueError 即 _fail(..., EXIT_SPEC)；_spec_gate 命中（commands/env/timeout_step_s 脏类型）即 _fail(..., EXIT_SPEC)；_norm_steps 返回 err 即 _fail(..., EXIT_SPEC)、返回 steps 为 None 即转 _delegate(job_dir, spec)；否则 env 由 spec.get("env") 字符串化后叠加在 os.environ 之上并 setdefault PYTHONUTF8="1"，default_cwd 取 spec.get("cwd") or spec.get("workdir") or job_dir，fail_fast 取 spec.get("fail_fast", True)（显式假值则不提前中断），逐步 _run_step 后按 expect_files、expect_stdout_contains 缺失项追加失败记录，写 result.json 并返回 EXIT_OK 或 EXIT_EXEC。
+def run_cmd(job_dir: str) -> int:
+    t0 = time.time()
+    try:
+        with open(os.path.join(job_dir, "spec.json"), encoding="utf-8") as f:
+            spec = json.load(f)
+    except (OSError, ValueError) as e:
+        return _fail(job_dir, f"spec.json 读取失败：{e}", EXIT_SPEC)
+
+    gate_err = _spec_gate(spec)
+    if gate_err:
+        return _fail(job_dir, gate_err, EXIT_SPEC)
+    steps, err = _norm_steps(spec)
+    if err:
+        return _fail(job_dir, err, EXIT_SPEC)
+    if steps is None:
+        return _delegate(job_dir, spec)
+
+    env = {str(k): str(v) for k, v in (spec.get("env") or {}).items()}
+    # issue #464：剥离敏感键后再叠加 —— serve 凭据（*_KEY/TOKEN/SECRET/PASSWORD、
+    # AEIS_DESIGNER_KEY）不得经子任务外带；清单派生自 ENV_SECRET_FAMILIES（单一真源）。
+    env = strip_secret_env(env)
+    env = {**strip_secret_env(dict(os.environ)), **env}
+    env.setdefault("PYTHONUTF8", "1")
+    default_cwd = spec.get("cwd") or spec.get("workdir") or job_dir
+    fail_fast = spec.get("fail_fast", True)
+    recs: list = []
+    outs: list = []
+    for i, step in enumerate(steps, 1):
+        rec, out = _run_step(step, i, job_dir, spec, env, default_cwd)
+        recs.append(rec)
+        outs.append(out)
+        if fail_fast and not rec.get("ok"):
+            break
+
+    elapsed = round(time.time() - t0, 3)
+    failed = [r for r in recs if not r.get("ok")]
+    notes: list = []
+    for rel in spec.get("expect_files") or []:
+        path = rel if os.path.isabs(rel) else os.path.join(default_cwd, rel)
+        ok = os.path.exists(path)
+        notes.append(f"expect_files {rel}: {'OK' if ok else 'MISSING'}")
+        if not ok:
+            failed.append({"label": f"expect_files:{rel}", "ok": False, "exit_code": None,
+                           "duration_s": 0.0, "command": [],
+                           "error": f"预期产出文件不存在：{path}", "stdout_head": "", "stderr_head": ""})
+    joined = "\n".join(outs)
+    for sub in spec.get("expect_stdout_contains") or []:
+        hit = sub in joined
+        notes.append(f"expect_stdout_contains {sub!r}: {'OK' if hit else 'MISSING'}")
+        if not hit:
+            failed.append({"label": f"expect_stdout:{sub}", "ok": False, "exit_code": None,
+                           "duration_s": 0.0, "command": [],
+                           "error": f"输出未命中预期子串：{sub}", "stdout_head": "", "stderr_head": ""})
+
+    result = {
+        "ok": not failed,
+        "content": _render(recs, elapsed, "；".join(notes)),
+        "exit_code": 0 if not failed else (failed[0].get("exit_code") or 1),
+        "duration_s": elapsed,
+        "finished_ts": time.time(),
+        "steps": recs,
+        "model": "cmd",
+        "usage": {},
+    }
+    if failed:
+        result["error"] = "；".join(str(f.get("error") or f.get("label")) for f in failed)[:2000]
+    _write_result(job_dir, result)
+    return EXIT_OK if not failed else EXIT_EXEC
+
+
+# 生效条件：len(sys.argv) < 2 时打印用法返回 EXIT_SPEC，sys.argv[1] 非目录时打印提示返回 EXIT_SPEC，否则返回 run_cmd(sys.argv[1])，其中任何异常由 _fail(job_dir, ..., EXIT_EXEC) 兜底转为返回码（N144：兜底写经 _fail 的成功终态回看保护——对撞写者已落地的成功终态不被覆写、共享 tmp 对撞不再二次外逃）。
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("用法: python exec_cmd.py <job_dir>", file=sys.stderr)
+        return EXIT_SPEC
+    job_dir = sys.argv[1]
+    if not os.path.isdir(job_dir):
+        print(f"job 目录不存在: {job_dir}", file=sys.stderr)
+        return EXIT_SPEC
+    try:
+        return run_cmd(job_dir)
+    except Exception as e:  # noqa: BLE001 —— 顶层兜底：任何异常也落 result.json，不留无终态任务
+        return _fail(job_dir, f"执行器内部异常：{type(e).__name__}: {e}", EXIT_EXEC)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
