@@ -245,7 +245,28 @@ def group_b():
     cg2.add("s_base", SENT_A, layer="knowledge")
     from .mdcos import MdCGSecure
     from .security import Principal
-    sec = MdCGSecure(os.path.join(_SANDBOX, "lib_secure_r%d" % _RUN[0]),
+    from . import crypto
+    # issue #789（B6 隔离）：本断言读的是「留痕文件里有没有明文」，而窗口里**看不见**的
+    # 两件事会把它打红：①root 被上一个用例/上一轮复用（旧写法用 _SANDBOX 下的固定名
+    # lib_secure_r<N>），文件里残留的明文行会让 raw_log 命中 PORT_B ⇒
+    # kept=False / raw_has_new=True 的假红（CI run 42151980042 实测签名与本文件逐字一致，
+    # 本地以「预置一条含 PORT_B 的留痕行」复现，见 evidence/issue-789/inject_789.py）；
+    # ②全局 MDCG_* 指向非沙箱 root。故本用例**自建 root**（mkdtemp 保证全新）并在开头
+    # 断言前置形态，不继承任何外部状态。
+    _sb = os.path.abspath(_SANDBOX)
+    for _k in ("MDCG_ROOT", "MDCG_AUX_ROOT"):
+        _v = os.path.abspath(os.environ.get(_k) or "")
+        _inside = bool(_v) and (_v == _sb or _v.startswith(_sb + os.sep))
+        _check("B6-0 前置：%s 落在本用例沙箱内（不指向在役库）" % _k,
+               _inside, "%s=%r sandbox=%r" % (_k, _v, _sb))
+    _sec_root = tempfile.mkdtemp(prefix="b6_secure_", dir=_SANDBOX)
+    _check("B6-0b 前置：新 root 里没有任何 forgetting 留痕（隔离前这里会读到污染行）",
+           not os.path.exists(os.path.join(_sec_root, forgetting.LOG_FILE)),
+           _sec_root)
+    _check("B6-0c 前置：private 属加密档（分流判据的前提，不随 env 变）",
+           crypto.is_encrypted_level("private") is True,
+           repr(crypto.is_encrypted_level("private")))
+    sec = MdCGSecure(_sec_root,
                      principal=Principal(tenant="t1", actor="alice",
                                          role="designer", clearance="secret",
                                          can_write=True, can_admin=True),
