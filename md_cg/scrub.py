@@ -484,7 +484,13 @@ _EXPIRY_KEYS = ("effective_until", "valid_until", "expires_at", "expire_at",
 _SKIP_KEYS = ("功能名", "执行", "条件", "来源", "标签", "状态", "备注", "标题",
               "描述", "name", "id", "title", "layer", "tags", "说明",
               "假设", "否决原因", "验证")
-_NEG_WORDS = ("禁止", "不得", "不要", "不能", "切勿", "避免", "不应", "不可")
+# 引用/出处行的键形（本地实测：正文「…（源：src_x、src_y）」会被 partition("：") 切成
+# 键「…（源」——单字「源」本来就被 2–12 长度闸过滤，真正的入口是**带括号的前缀键**）。
+# 判据：**键里不得出现括号类标点**（字段名是标识符，不是半句话）；值侧再拦「src_ 列表」形态。
+_KEY_BAD_CHARS = "（）()【】[]{}<>《》〈〉「」『』"
+_SOURCE_VALUE_PREFIXES = ("src_", "ref_", "doc_")
+_NEG_WORDS = ("禁止", "不得", "不要", "不能", "切勿", "避免", "不应", "不可",
+              "不会", "没有", "无须", "不必", "无需")
 _POS_WORDS = ("应当", "建议", "必须", "需要", "可以", "允许", "推荐", "宜")
 
 
@@ -534,7 +540,11 @@ def _kv_pairs(content) -> dict:
                 # 互为「同键不同值」矛盾（实测 12 抽样里 9 条 high 全是这类误报，
                 # 且 apply 会把好节点 weaken+demote 并跨层移动文件）。
                 if (2 <= len(k) <= 12 and v and k not in _SKIP_KEYS
-                        and not nodefile.is_ccg_mark(k)):
+                        and not nodefile.is_ccg_mark(k)
+                        # issue（scrub 误判）：括号类标点出现即不是字段名（引用/出处行）
+                        and not any(ch in k for ch in _KEY_BAD_CHARS)
+                        # 值侧兜底：纯引用 id 列表（src_x、ref_y）不是可断言的值
+                        and not v.startswith(_SOURCE_VALUE_PREFIXES)):
                     out.setdefault(k, v)
                 break
     return out
@@ -575,9 +585,85 @@ def _not_yet(fm, now):
     return None
 
 
-# 生效条件：对 content 取 kv_pairs、bigrams 和 polarity，遍历 related（若 related 为假值则视为空）的前 int(max_compare) 个 r，以 r["node_id"] 调 cg.get；【#444】返回的 why **只含键名 + 不可逆摘要（同键不同值）/ 计数与占比（极性相反）**，两端正文原值与共享词面一律不进串（该串会经 verify 落进 fm 与 _trust.jsonl 等明文面）；若某 oid 节点可读非空，先在其 content 与 content 的共同键中找到值不同者并返回 {'with':oid,'via':r.get('via'),'why':'同键不同值：...'}；否则若极性乘积 <0 且双方 bigram 非空，且共享 bigram 数 >=3 且 ratio>=0.15，返回 {'with':oid,'via':r.get('via'),'why':'极性相反且共享内容：...'}；全部遍历完无命中则返回 None；
+# 生效条件：对 content 取 kv_pairs（同键不同值，旧支）与**槽位主张**（`_slot_claims`），遍历 related
+# 前 int(max_compare) 个 r 读对端正文；判定顺序：① 同键不同值；② **槽位比对**（`_slot_contradiction`：
+# 同槽位自比排除 `功能名`，另含「主张 vs 对端拒绝域」交叉与 `执行↔生效条件/验证方式` 跨槽位；
+# 两侧该槽位都非零且严格异号、共享 bigram ≥ SLOT_MIN_SHARED 且占比 ≥ 0.15（跨槽位用 Dice））。
+# 【#444】返回的 why **只含键名 + 不可逆摘要（同键不同值）/ 槽位名 + 计数与占比（极性支）**，
+# 两端正文原值与共享词面一律不进串（该串会经 verify 落三处明文面）。
+#: 槽位比对的**绝对下限**（#747 复核 ①）：剥模板后分母同步变小，仅看 ratio 会让 3 个巧合
+#: 共享越过 0.15；破坏性不对称（weaken + demote + 跨层移动）故加绝对下限。
+SLOT_MIN_SHARED = 5
+
+
+def _slot_claims(content):
+    """按六要素槽位切分正文：{mark: [主张行...]}（剥前缀；h2/h3 写法同样识别）。
+
+    「不适用条件」**保留**（#747 复核 ②：它是 rejection_domain，与 precondition 是同一份
+    契约的两半；整行丢掉会把最硬的一类矛盾也丢掉）。非模板行归入键 ""。
+    """
+    out = {}
+    for raw in (content or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        head = line.lstrip("#").strip()
+        mark = next((m for m in nodefile.CCG_MARKS if head.startswith(m)), None)
+        if mark is None:
+            out.setdefault("", []).append(line)
+            continue
+        rest = head[len(mark):]
+        # 分隔符校验（#747 复核）：`执行成功后再验证` 这类自然语句不得算成「执行」槽。
+        if rest and rest[0] not in "：: \t　-—":
+            out.setdefault("", []).append(line)
+            continue
+        claim = rest.lstrip("：:\t　-—").strip()
+        if claim:
+            out.setdefault(mark, []).append(claim)
+    return out
+
+
+def _slot_contradiction(ca, cb):
+    """按**槽位**判矛盾（#747）：同槽位、或「主张 vs 对端拒绝域」两半契约。
+
+    判据：两侧该槽位**都非零且严格异号**（双值极性）+ 共享 bigram ≥ SLOT_MIN_SHARED 且占比 ≥ 0.15。
+    返回证据串或 None（证据串不含词面，见 #444）。
+    """
+    sa, sb = _slot_claims(ca), _slot_claims(cb)
+    # 自比：**排除功能名**（它是 signature、不是主张，做矛盾主体最容易误判）。
+    pairs = [(m, m) for m in nodefile.CCG_MARKS if m != "功能名"]
+    # 拒绝域交叉：单点派生自 CCG_MARKS（不写第二份槽位枚举）。
+    for m in nodefile.CCG_MARKS:
+        if m == "不适用条件":
+            continue
+        pairs.append((m, "不适用条件"))
+        pairs.append(("不适用条件", m))
+    # 跨槽位（只有两条有契约理由）：执行 ↔ 生效条件（precondition）/ 验证方式（postcondition）。
+    pairs.extend([("执行", "生效条件"), ("执行", "验证方式")])
+    for ma, mb in pairs:
+        ta = "\n".join(sa.get(ma, []))
+        tb = "\n".join(sb.get(mb, []))
+        if not ta or not tb:
+            continue
+        pa, pb = _polarity(ta), _polarity(tb)
+        if pa == 0 or pb == 0 or pa * pb > 0:
+            continue                 # 双值：任一侧中立不算矛盾（#747 ③）
+        ba, bb = bigrams(ta), bigrams(tb)
+        if not ba or not bb:
+            continue
+        shared = ba & bb
+        # 同槽位：短侧覆盖率；跨槽位：Dice（长度悬殊时更保守，避免新增对变误报源）。
+        if ma == mb:
+            ratio = len(shared) / max(1, min(len(ba), len(bb)))
+        else:
+            ratio = 2.0 * len(shared) / max(1, len(ba) + len(bb))
+        if len(shared) >= SLOT_MIN_SHARED and ratio >= 0.15:
+            return (f"槽位 {ma} / {mb} 极性相反且共享内容：共享片段 {len(shared)} 个"
+                    f"（占比 {ratio:.2f}），词面不入证据串")
+    return None
+
 def _contradiction(cg, content, related, max_compare=10):
-    """与同族节点比对：同键不同值 / 极性相反且共享 bigram。
+    """与同族节点比对：同键不同值 / **按槽位**极性相反且共享内容（#747）。
 
     issue #444（P0 密级泄漏，2026-10-17 U05c）：本函数产出的 `why` 会经
     `add("contradiction", why)` → `_weaken` → `cg.verify(..., "weakened")` 写成
@@ -592,7 +678,6 @@ def _contradiction(cg, content, related, max_compare=10):
         return hashlib.sha1(str(v).encode("utf-8")).hexdigest()[:8]
 
     kv_a = _kv_pairs(content)
-    bg_a, pol_a = bigrams(content or ""), _polarity(content)
     for r in (related or [])[:int(max_compare)]:
         oid = r["node_id"]
         try:
@@ -608,15 +693,10 @@ def _contradiction(cg, content, related, max_compare=10):
                 return {"with": oid, "via": r.get("via"),
                         "why": f"同键不同值：{k}（本端 {_h(kv_a[k])} / "
                                f"对端 {_h(kv_b[k])}）"}
-        bg_b = bigrams(oc)
-        if pol_a * _polarity(oc) < 0 and bg_a and bg_b:
-            shared = bg_a & bg_b
-            ratio = len(shared) / max(1, min(len(bg_a), len(bg_b)))
-            if len(shared) >= 3 and ratio >= 0.15:
-                # 同 #444：共享 bigram **词面也是正文片段**，同属泄漏面 ⇒ 只留计数与占比。
-                return {"with": oid, "via": r.get("via"),
-                        "why": f"极性相反且共享内容：共享片段 {len(shared)} 个"
-                               f"（占比 {ratio:.2f}），词面不入证据串"}
+        # #747：只按**槽位**比对（全文比会被六要素模板头 + 拒绝域噪声主导）。
+        slot_hit = _slot_contradiction(content or "", oc)
+        if slot_hit:
+            return {"with": oid, "via": r.get("via"), "why": slot_hit}
     return None
 
 

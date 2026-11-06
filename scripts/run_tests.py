@@ -211,7 +211,7 @@ def _run_one(name, argvs, timeout, parallel=False):
         r = subprocess.CompletedProcess(argv, _proc.returncode, _out, _err)
         if not (r.returncode != 0 and "No module named" in (r.stderr or "")
                 and len(argvs) > 1):
-            tail = ((r.stdout or "") + (r.stderr or ""))[-800:]
+            tail = ((r.stdout or "") + (r.stderr or ""))[-4000:]   # 4000：至少容得下前部 FAIL 行（见下游打印逻辑）
             # issue #284（量具失效）：**模块内 SKIP 不得冒充 PASS**。修前判据只有
             # `rc == 0`，而守卫在缺依赖时「打印 SKIP + return 0」⇒ 汇总记 PASS、
             # SKIP 行不进日志（`:368` 只在 not ok 时打印尾部）⇒ CI 假绿。本仓自己的
@@ -380,6 +380,56 @@ def _child_env(parallel=False):
     return env
 
 
+#: 「重质检」守卫：**同一功能**要付出「复制整棵树 / 起子进程再跑一遍 / 高并发压测 / 定点变异」这类
+#: 数量级更大的代价。它们不是不该跑，而是**不适合每次快速反馈都跑**——按使用者裁定，
+#: 是否开启交给上层（`--gate strict` / CI），守卫自身不判断（各自仍只认 `--mutate`）。
+HEAVY_GUARDS = {
+    "md_cg/test_h4_sustain_snapshot": "并发写数百条 + 反包裹对照（分钟级）",
+    "md_cg/test_issue452_ingest_root_sensitivity": "镜像复制 md_cg/scripts 全树 + 子进程自跑",
+    "md_cg/test_spatial_coords3d": "3D 坐标全量重算",
+}
+
+
+# 生效条件：把 `--module` 的三种写法（`md_cg/test_x` · `md_cg.test_x` · `test_x`）统一成点号形态后再做前缀/子串匹配；
+# 任一侧为空时返回 False。1_ai 会话报告的假绿缺陷（跨仓 #1910）：不归一化会让文档里的斜杠示例零选中（假绿）。
+def _module_match(selector, name):
+    """`--module` 匹配：斜杠与点号等价、忽略 `.py` 后缀、允许子串/前缀。"""
+    s = str(selector or "").replace("/", ".").replace(".py", "").strip(".")
+    n = str(name or "").replace("/", ".").replace(".py", "").strip(".")
+    if not s or not n:
+        return False
+    return n.startswith(s) or s in n or n.endswith("." + s)
+
+
+# 生效条件：name 命中 HEAVY_GUARDS，或命中 check_guard_coverage 登记的定点变异守卫（MUTATE_GUARDS，整份改名）时返回原因串；否则返回空串。import 失败（脚本被单独拷走）时只认本地清单，不抛错。
+def _heavy_reason(name):
+    """该守卫是否属「重质检」→ 原因串（空串＝不是）。
+
+    数据源两处：①本地 HEAVY_GUARDS（按实测耗时登记）；②`check_guard_coverage.MUTATE_GUARDS`
+    （既有登记表：必须有定点变异腿的守卫）——直接复用，避免两处清单漂移。
+    """
+    # 归一：targets 里的名字是点号形态（md_cg.test_x），两份登记表是斜杠形态。
+    _norm = str(name).replace(".", "/")
+    if _norm in HEAVY_GUARDS:
+        return HEAVY_GUARDS[_norm]
+    if _norm + ".py" in HEAVY_GUARDS:
+        return HEAVY_GUARDS[_norm + ".py"]
+    try:
+        import importlib.util as _ilu
+        _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check_guard_coverage.py")
+        _spec = _ilu.spec_from_file_location("_cgc_for_gate", _p)
+        _mod = _ilu.module_from_spec(_spec) if _spec else None
+        if _mod is not None and _spec.loader is not None:
+            _spec.loader.exec_module(_mod)
+            _mg = getattr(_mod, "MUTATE_GUARDS", {}) or {}
+            for rel, meta in _mg.items():
+                if rel.replace(".py", "").replace("/", ".") == str(name).replace("/", "."):
+                    return "定点变异自证（%s）" % ((meta or {}).get("why") or "见 MUTATE_GUARDS")
+    except Exception:
+        pass
+    return ""
+
+
 # 生效条件：解析命令行（位置参数 group 为 nargs="*"、default=None，-k 默认 ""，--jobs 默认 4，--timeout 默认 900，--list 为 store_true）后，若 args.group 里有不在 ("md_cg","compiler","swarm","scripts","hive") 中的组名则 ap.error 报错退出（args.group 为 None 或空列表时该检查不触发）；groups 取 set(args.group) 或（其为假值时）全部五组；targets 由 _discover() 按 groups 过滤且 args.k 为假值或出现在显示名中；args.list 为真时打印组名与显示名及总数并返回 0；否则先按 _SKIPS 探测跳过有原因的目标，再以 max(1, args.jobs) 个线程跑 _run_one(name, a, args.timeout)，无失败打印汇总返回 0，有失败打印失败名单返回 1；
 def main():
     ap = argparse.ArgumentParser(description="灵枢全仓测试入口（python -m 约定）")
@@ -392,6 +442,15 @@ def main():
     ap.add_argument("--jobs", type=int, default=4, help="并发数（默认 4）")
     ap.add_argument("--timeout", type=int, default=900, help="单测超时秒数")
     ap.add_argument("--list", action="store_true", help="只列出目标不执行")
+    # 门禁档位（2026-10-27 使用者裁定）：
+    #   「快 = 问题放一边；慢 = 细究根本原因」是**价值观取舍**，选择权交给使用者；
+    #   模块化只做自己那一个功能，「是否开启重质检」由**上层**（本入口/CI）决定——
+    #   守卫侧一律不改（它们仍只认自己的 `--mutate`，不自行判断该不该跑）。
+    ap.add_argument("--gate", choices=("fast", "strict"), default="strict",
+                    help="门禁档位：strict=全量（缺省，不改变既有行为）；"
+                         "fast=跳过重质检守卫，只求快速反馈")
+    ap.add_argument("--module", default="",
+                    help="按模块名前缀过滤（如 md_cg/test_issue4 或 test_issue4）")
     args = ap.parse_args()
 
     _known = ("md_cg", "compiler", "swarm", "scripts", "hive", "test")
@@ -400,7 +459,26 @@ def main():
         ap.error(f"invalid group: {', '.join(_bad)}（可选：{'/'.join(_known)}）")
     groups = set(args.group or ()) or set(_known)
     targets = [(g, n, a) for g, n, a in _discover()
-               if g in groups and (not args.k or args.k in n)]
+               if g in groups and (not args.k or args.k in n)
+               and (not args.module or _module_match(args.module, n))]
+    # 1_ai 会话报告的假绿缺陷（跨仓 #1910） 假绿（2026-10-28，1_ai 会话复现）：`--module` 的 help 教的是**斜杠**写法
+    # （`md_cg/test_issue4`），而实际目标名是**点号**（`md_cg.test_issue4`）。旧实现直接
+    # `n.startswith(args.module) or args.module in n` ⇒ 斜杠写法**选中零个目标**，
+    # 但入口仍 `SUMMARY 0/0 通过` + `rc=0`——**零选中的假绿**，比单个测试失败危险得多
+    # （失败的会喊，零选中只会沉默地说"通过"；CI 只看退出码时整条流水线可能是假的）。
+    # 两处一起修：①归一化（`/` 与 `.` 等价，去结尾 `.py`）；②**零选中不得返回 0**。
+    _norm_mod = str(args.module or "").replace("/", ".").replace(".py", "").strip(".")
+    if _norm_mod:
+        targets = [t for t in targets if _module_match(_norm_mod, t[1])]
+
+    if not targets:
+        print("无匹配目标：group=%s -k=%r --module=%r —— 拒绝以 0/0「通过」收场（1_ai 会话报告的假绿缺陷（跨仓 #1910））"
+              % (sorted(groups), args.k, args.module), flush=True)
+        print("提示：模块名是**点号**形态（md_cg.test_x）；斜杠写法已归一化，但拼错/不存在的名字仍会零选中。",
+              flush=True)
+        # --list 是"查看有什么"，零选中给 0 但已打印明确原因；**执行路径必须非零**。
+        return 0 if args.list else 2
+
     if args.list:
         for g, n, _a in targets:
             print(f"{g:<9}{n}")
@@ -411,6 +489,30 @@ def main():
         print(f"已发现 {_md_n} 个 / 磁盘递归 {_md_cg_disk_recursive_count()} 个"
               f"（md_cg test_*.py）")
         return 0
+
+    # 门禁档位生效点（2026-10-27）：只在这里决定「跑不跑重质检」，守卫内部一律不改。
+    gate = args.gate
+    if gate == "fast" and str(os.environ.get("CI", "")).strip():
+        print("[gate] 检测到 CI 环境 + fast 档 ⇒ 自动升级为 strict（防止误用导致漏检）",
+              flush=True)
+        gate = "strict"
+    _heavy_skipped = []
+    if gate == "fast":
+        _keep = []
+        for g, n, a in targets:
+            why = _heavy_reason(n)
+            if why:
+                _heavy_skipped.append((n, why))
+                print("SKIP  %s  （gate=fast：%s；要跑请用 --gate strict）" % (n, why),
+                      flush=True)
+            else:
+                _keep.append((g, n, a))
+        targets = _keep
+        if _heavy_skipped:
+            print("[gate] fast 档：跳过 %d 条重质检，执行 %d 条（strict 档会全跑）"
+                  % (len(_heavy_skipped), len(targets)), flush=True)
+        else:
+            print("[gate] fast 档：本批无重质检项，执行 %d 条" % len(targets), flush=True)
 
     # SKIP 探测：依赖缺失/平台不符的测试不执行（外部复核建议 #3，裸 clone 友好）
     skipped, runnable = [], []
@@ -445,8 +547,24 @@ def main():
             print(("PASS  " if ok else "FAIL  ") + name, flush=True)
             if not ok:
                 bad.append(name)
-                for ln in tail.splitlines()[-6:]:
+                # 诊断面（2026-10-27）：原来只打 `tail` 的**末 6 行**，而 `tail` 本身只有末 800 字符——
+                # 一个测试若在**前部**断言失败（如 A/B/D 组）、尾部还打印了 PASS 明细，
+                # 真正的 `FAIL <项>` 行会被这两层截断**双双吞掉**，CI 日志只剩「1 失败」却看不到是哪条。
+                # 实测代价：PR #692 因此白查一轮（只能看到 C 组 PASS）。
+                # 现在：①tail 扩到末 4000 字符 ②失败时**优先**打印含 FAIL 的行，再附末 6 行上下文。
+                _lines = tail.splitlines()
+                # 明细行有两种形态：模块级 `FAIL <name>` 与测试内自定义 `[FAIL] <项>`（后者常见于
+                # scripts/test_*_coverage 这类自检脚本）。首修只认前者，导致
+                # `test_check_publish_artifact_coverage` 的 2 条 `[FAIL]` 仍看不到——一并补上。
+                _fails = [ln for ln in _lines
+                          if ln.strip().startswith(("FAIL ", "ANCHOR-MISS", "[FAIL]"))]
+                _shown = set()
+                for ln in _fails[:8]:
                     print("      " + ln, flush=True)
+                    _shown.add(ln)
+                for ln in _lines[-6:]:
+                    if ln not in _shown:
+                        print("      " + ln, flush=True)
 
     if mod_skips:
         print("模块内跳过（**不计入通过数**，issue #284）：", flush=True)

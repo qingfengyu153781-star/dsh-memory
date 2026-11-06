@@ -129,6 +129,18 @@ def _s(_desc, **props):
             [k for k, v in props.items() if v.get("_req")]}
 
 
+# 生效条件：把任意 MCP 入参收敛成布尔。bool 原样返回；数字 0/非 0 判假/真；
+# 字符串按 true/1/yes/on 判真（大小写与空白不敏感），其余判假；None 判假。
+def _as_flag(v):
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    if isinstance(v, (int, float)):
+        return v != 0
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
 # 生效条件：始终返回 {"type":t,"description":desc}，仅当 req 为真值时该字典额外含 "_req": True。
 def drop_doc_nodes(items, id_of, enabled=False):
     """过滤 doc_ 索引节点（会话日志切片）——**单一判据**，供所有可达路径共用。
@@ -139,6 +151,9 @@ def drop_doc_nodes(items, id_of, enabled=False):
       · 唯一生效的 cg(op=read) 面其 inputSchema 未声明该参数。
     本函数把判据收成一处，调用方只负责传 enabled 与取 id 的方式。
     """
+    # issue #659 F26-28：调用方可能传字符串（MCP 客户端不保证类型）——
+    # 旧实现直接 if enabled，字符串 "false" 是真值 → 反向开启过滤。
+    enabled = _as_flag(enabled)
     if not enabled:
         return list(items or []), 0
     kept, dropped = [], 0
@@ -224,6 +239,9 @@ TOOLS = [
                           tags=_p("array", "标签"), importance=_p("number", "重要性 0-1"),
                           importance_hint=_p("number", "闸门的重要性提示（≥0.7 保护优先直接 ACCEPT）"),
                           gated=_p("boolean", "启用主动遗忘闸门（默认否；写情景层建议开）"),
+                          dedupe=_p("boolean", "写入幂等（issue #677，缺省 false）：同层已存在内容指纹"
+                                            "相同的节点时不新增，直接返回既有 id 且 deduped=true。"
+                                            "用于「调用超时但可能已落盘」的重试（自动记忆面同样适用）"),
                           override=_p("boolean", "覆盖受保护节点需显式 true"),
                           consistency=_p("boolean", "写入前节点间自动冲突检测（三级决策，默认 true）"),
                           on_conflict=_p("string", "冲突处置：reject（默认，抛错）|defer（不写）|record（记录放行）"),
@@ -709,6 +727,9 @@ KERNEL_TOOLS = [
             offset=_p("integer", "read 的续读起始行（1 基；传上次返回的 next_offset）；"
                                  "edges 的分页偏移（排序后切片，默认 0）"),
             content=_p("string", "write 的内容（建议含 CCG 5 要素注释）"),
+            dedupe=_p("boolean", "write 幂等（issue #677，缺省 false）：同层已存在**内容指纹相同**"
+                               "的节点时不新增，直接返回既有 id 且 deduped=true。用于「调用超时但可能已落盘」"
+                               "后重试——超时 ≠ 失败，先查后写；需要真的另存一份时不要带该参数"),
             content_kind=_p("string", "write 的内容类型：code|image_desc|text|permission|work_done|work_wip|ccg_marks|hyperedge。"
                                       "text 类需带 CCG 六要素（功能名／生效条件／子功能／执行／验证方式／不适用条件，各占一行、"
                                       "以「# 要素名：」起首）；缺失会被写入闸门拒绝，返回体如实列出缺失清单（verdict.detail.missing）——"
@@ -736,6 +757,10 @@ KERNEL_TOOLS = [
                                    "**edges 的缺省轴**——派生边只有记录时刻，无效力声明）"),
             layer=_p("string", "层：anchor|structural|knowledge|contextual|self"),
             tags=_p("array", "标签（cap:xxx 会作为 route 的建议能力名）"),
+            aliases=_p("array", "写入别名（issue #722）：把「用户以后可能怎么问这件事」的说法"
+                              "写进来（3–8 个，口语/情绪/近义都算）。只参与词法召回，**不进 tags**"
+                              "（tags 被机器判据占用：是不是任务卡、能不能当锚点）。"
+                              "⚠️ 不要机械抽词——实测从功能名切词提升 +0，别名只能「想」出来"),
             importance=_p("number", "重要性 0-1"),
             importance_hint=_p("number", "write gated=true 时的重要性提示"
                                         "（≥0.7 触发保护优先，直接 ACCEPT）"),
@@ -776,15 +801,26 @@ KERNEL_TOOLS = [
                              "receipt（回执审计：命令与预期输出）；"
                              "非法值库层报错（fail-closed）"),
             budget_tokens=_p("integer", "read 的 token 预算"),
-                          exclude_doc=_p("boolean", "检索面排除 doc_ 索引节点（会话日志切片；"
+                          # issue #722：工具面缺省 false=放宽（库面默认严格）。
+                          strict_conditions=_p("boolean", "条件闸门严格度（**缺省 false=放宽**："
+                                                         "生效条件未在情境确认时仍标 usable，但 state 保持"
+                                                         "DEFER、不冒充已确认；传 true 回严格闸门）"),                          exclude_doc=_p("boolean", "检索面排除 doc_ 索引节点（会话日志切片；"
                                                 "默认 false = 保持既有契约——test_p27_docindex 断言"
                                                 "文档节点必须可被检索到；需要只看真记忆卡时显式传 true）"),
             excerpt_strategy=_p("string", "read 超预算条目摘录方式：prefix（默认）或 query（查询相关原文片段）"),
             bm25=_p("boolean", "read：显式使用 BM25 倒排评分（默认否）"),
             evidence=_p("string", "verify 的证据；state_event：出处（五元之一，"
                                  "回指原文/轮次）"),
-            verdict=_p("string", "verify 裁决：confirmed|weakened|falsified；"
+            verdict=_p("string", "verify 裁决：confirmed|weakened|falsified"
+                                 "|superseded（superseded=被新版本取代：不删除、"
+                                 "不动验证态，需同时给 superseded_by）；"
                                  "insight verify：verified|falsified"),
+            superseded_by=_p("string", "verify verdict=superseded 时必填："
+                                      "取代它的节点 id"),
+            tags_add=_p("array", "maintain retag：要新增的标签（含 domain:<域>）"),
+            tags_remove=_p("array", "maintain retag：要移除的标签"),
+            condition_space_patch=_p("object", "maintain retag：条件空间补丁"
+                                              "（浅合并，如 observation_position）"),
             question=_p("string", "whitebox：ask/verify 的问题"),
             message=_p("string", "whitebox ask：问题（question 的别名）"),
             session_id=_p("string", "whitebox：会话 id（默认 md_cg-whitebox-verify）"),
@@ -843,6 +879,8 @@ KERNEL_TOOLS = [
             reason=_p("string", "原因；consolidate contextualize 的归位理由（写台账）"),
             force=_p("boolean", "restore 强制（忽略前置条件：墓碑等）"),
             overwrite_live=_p("boolean", "restore 覆写同 id 在位节点需显式确认（#426-E，默认 False）"),
+            full=_p("boolean", "info：全量诊断（健康/理论/链接/代校验/策略自描述）。缺省 false = 只回内存态快照"
+                             "（issue #677：大库上慢诊断面会让 info 本身超时）"),
             path=_p("string", "index_code/index_doc 的目录（大域）；link import 的证据包文件"),
             patterns=_p("array", "index_code/index_doc 的文件后缀，默认取各自注册表"
                                  "（代码 .py/.ts/.tsx/.js/.mjs/.cjs；文档 .md/.markdown）"),
@@ -862,6 +900,7 @@ KERNEL_TOOLS = [
             incremental=_p("boolean", "index_code/index_doc：按 _refindex.json 水位跳过"
                                      "未变文件（默认否=全量重切，保证不漏召回）；"
                                      "传 sensitivity 覆盖时自动退回全量"),
+            allow_nested=_p("boolean", "index_code/index_doc：显式允许与已索引根互相嵌套（issue #754）；默认拒绝——同一物理文件会因「相对 root 的 path」不同而生成两套节点"),
             max_nodes=_p("integer", "ref action=check：最多巡检节点数（默认 2000，"
                                     "越限返回 truncated=true）"),
             sensitivity=_p("string", "密级声明：index_doc 的节点密级（默认 internal 并显式"
@@ -893,7 +932,8 @@ KERNEL_TOOLS = [
                                       "（仅重要性重算；固化需 LLM 仍交人工。默认否）"),
             allow_evolve=_p("boolean", "sustain heal：放行演化类修复"
                                       "（确定性动作才执行；默认否）"),
-            dry_run=_p("boolean", "sustain heal / scrub：只列动作不落盘"),
+            dry_run=_p("boolean", "sustain heal / scrub：只列动作不落盘；"
+                            "maintain retag：只算不写（缺省沿用 apply 口径）"),
             ids=_p("array", "scrub：节点 id 列表（缺省全库）"),
             kinds=_p("string", "scrub：限定污染类型，逗号分隔"),
             strategy=_p("string", "scrub sample：stratified|risk|random"),
@@ -2354,7 +2394,14 @@ def _require_verify_for_vstate(p, a):
 
 
 def _cg_dispatch(cg, a):
+    # issue #722（Q1=A）：**工具面 read/route 缺省放宽**——在派发入口补默认，
+    # 而不是在每个调用点编造参数：读面「不编造默认」约束的是**参数推导/回显**，
+    # 这里是 op 级默认策略（不改 action_source，不伪造调用方意图）。
+    if a.get("op") in ("read", "route") and "strict_conditions" not in a:
+        a["strict_conditions"] = False
     """认知图唯一入口的 op 分发主体。"""
+    # 防御性再剥一次（`_dispatch` 已剥；内部调用方若直接调本函数，同样不许传内部标志）。
+    a = {k: v for k, v in (a or {}).items() if not str(k).startswith("_")}
     op = (a.get("op") or "read").strip().lower()
     if op == "help":
         return _help_call(cg, a)
@@ -2538,12 +2585,42 @@ def _cg_dispatch(cg, a):
         from . import nodefile
         from . import theory as _th
         from . import links as _lk
-        h = cg.health_os()
-        h.update({"surface": SURFACE,
-                  "tools": [t["name"] for t in tools_for_surface()],
-                  "audit_kinds": audit.kinds(), "whoami": cg.whoami(),
-                  # 裁定 B：CCG 六要素的契约角色（术语真源在 nodefile，此处只透出）
-                  "ccg_contract": dict(nodefile.CCG_CONTRACT_ROLES)})
+        # issue #677（B，2026-11-04）：info 的**慢面**（`health_os()`：分桶健康 + 审计规模，
+        # 全库扫描类，大库上数十秒）改为 **full=true 才跑**；其余诊断键（策略/代校验/
+        # 理论/链接/审计种类）留在缺省返回 —— 既有消费者不受影响。
+        # 为什么必须拆：MCP stdio **串行**，一个慢 info 会把后续请求（含写入应答）挡在队列里，
+        # 客户端 60s 超时（#677 现场：write 与 info 同时超时）。
+        _full = _as_flag(a.get("full"))
+        _nodes_info = ((getattr(cg, "index", None) or {}).get("nodes") or {})
+        h = {"surface": SURFACE,
+             "tools": [t["name"] for t in tools_for_surface()],
+             # 纯 MdCG 没有 whoami（Secure 才有）——诊断面不得因它崩（#677 B）。
+             "whoami": (cg.whoami() if callable(getattr(cg, "whoami", None)) else None),
+             "node_count": len(_nodes_info),
+             "audit_kinds": audit.kinds(),
+             # 裁定 B：CCG 六要素的契约角色（术语真源在 nodefile，此处只透出）
+             "ccg_contract": dict(nodefile.CCG_CONTRACT_ROLES),
+             "full": _full}
+        _fs = getattr(cg, "flush_state", None)
+        h["flush_state"] = None            # 键**恒在**（守卫按必需键登记；值可 None）
+        if callable(_fs):
+            try:
+                h["flush_state"] = _fs()
+            except Exception:               # noqa: BLE001 —— 诊断面不得拖崩
+                h["flush_state"] = None
+        if _full:
+            # 慢面：只有显式 full=true 才跑。**慢面不得覆盖快照已有键**（#677 复核：
+            # 旧序 h.update(health_os()) 会让同名键覆盖快照值，两条腿对同一键不同值）。
+            # 异常收口，诊断面不拖崩。
+            try:
+                _hh = cg.health_os() or {}
+            except Exception as _he:            # noqa: BLE001
+                _hh = {"health_os_error": "%s: %s" % (type(_he).__name__, _he)}
+            for _k, _v in _hh.items():
+                h.setdefault(_k, _v)
+        else:
+            h["hint"] = ("快照模式（issue #677）：未包含 health_os 慢面（分桶健康/审计规模）；"
+                         "要它请加 full=true")
         # 能力外置可观测：本进程实际注入了哪些外部验证器（含失败原因）
         h["external_verifiers"] = audit.load_external_verifiers()
         # 写入策略来源（issue #43 契约④）：与启动 stderr / --show-config 同一
@@ -2555,6 +2632,15 @@ def _cg_dispatch(cg, a):
             h["write_policy"] = audit.policy_report()
         except Exception as _pe:                  # noqa: BLE001
             h["write_policy"] = audit.unavailable_report(_pe)
+        # issue #708：分层写入闸的**可观测性**（warn 档此前只写子进程 stderr，
+        # DSH 不转发 ⇒ 用户看不到）。此处透出进程内计数，不依赖 stderr。
+        # 诊断面不得把 op=info 拖崩：异常收口成不可用形状。
+        try:
+            from . import writegate as _wg2
+            h["write_gate"] = _wg2.warn_report()
+        except Exception as _wge:            # noqa: BLE001
+            h["write_gate"] = {"mode": None, "total": None,
+                               "hint": "write_gate 不可用：%s: %s" % (type(_wge).__name__, _wge)}
         h["theory"] = _th.check()
         h["links"] = _lk.ls()
         # 代校验（纯增量，2026-09-30）：长驻进程可被问「你现在这一代是不是盘面那一代」。
@@ -2578,7 +2664,9 @@ def _cg_dispatch(cg, a):
         intent = a.get("intent") or a.get("query") or ""
         res, meta = cg.search(intent, k=_int_arg(a, "k", 10),
                               context=a.get("context"), record=False,
-                              view=a.get("view"))
+                              view=a.get("view"),
+                              **({"strict_conditions": _as_flag(a["strict_conditions"])}
+                                 if "strict_conditions" in a else {}))
         knowledge, caps = [], []
         for n, s, q in res:
             fm = n.get("frontmatter") or {}
@@ -2698,9 +2786,20 @@ def _cg_dispatch(cg, a):
                 _out["warning"] = _kwarn
             return _out
         from . import refindex
+        # issue #659 F26-11：过滤发生在 k 截断**之后**，当 top-k 全被 doc_ 占满时
+        # 结果直接空掉（配额被吃光）。开启过滤时按 k 的若干倍超取，过滤后再截回 k。
+        _doc_filter_on = _as_flag(a.get("exclude_doc", False))
         search_args = dict(layer=a.get("layer"), k=_int_arg(a, "k", 20),
                            context=a.get("context"), session=a.get("session"),
-                           validity=a.get("validity"), **_tkw)
+                           validity=a.get("validity"),
+                           # issue #722：**只在显式传参时透传**（读面纪律：不编造默认）。
+                           **({"strict_conditions": _as_flag(a["strict_conditions"])}
+                              if "strict_conditions" in a else {}),
+                           **_tkw)
+        _k_want = search_args["k"]
+        if _doc_filter_on:
+            # 只在过滤开启时超取（过滤后再截回 _k_want，对外语义不变）
+            search_args["k"] = min(max(_k_want * 4, _k_want + 32), 400)
         if a.get("bm25", True) and hasattr(cg, "search_rrf"):
             ranked, meta = cg.search_rrf(q, paths=("bm25",), **search_args)
             res = [(n, s, qual) for n, s, qual, _provenance in ranked]
@@ -2710,11 +2809,19 @@ def _cg_dispatch(cg, a):
         # 与真记忆卡同分（0.016）且占 top5 的 60–80%，稀释可达性。默认 true，可显式关。
         # issue #653：判据收敛到 drop_doc_nodes（单一真源），不再就地手写第二条。
         res, _excluded_doc = drop_doc_nodes(
-            res, lambda x: (x[0] or {}).get("id"), a.get("exclude_doc", False))
-        meta = _note_doc_filter(meta, _excluded_doc, a.get("exclude_doc", False))
+            res, lambda x: (x[0] or {}).get("id"), _doc_filter_on)
+        # 截回调用方要的 k（超取只为让 doc_ 不占配额，不改变对外语义）
+        if _doc_filter_on and len(res) > _k_want:
+            res = res[:_k_want]
+        meta = _note_doc_filter(meta, _excluded_doc, _doc_filter_on)
         _out = {"meta": meta, "results": [
             {"node": _node_view(n), "score": s, "state": q2.get("state"),
-             "reason": q2.get("reason"), **refindex.ref_fields(n)}
+             "reason": q2.get("reason"),
+             **({"usable": q2["usable"],
+                "relaxed": q2["relaxed"],
+                "code": q2["code"]}
+               if "usable" in q2 else {}),
+             **refindex.ref_fields(n)}
             for n, s, q2 in res]}
         if _kwarn:
             _out["warning"] = _kwarn
@@ -2759,6 +2866,36 @@ def _cg_dispatch(cg, a):
         # 本文件；新增闸门 = register_before 一行，即插即拔。
         # 角色/层权限校验在 MdCGSecure.add 库层，结构上不可被拦截器绕过。
         from .writepipe import default_pipeline
+        # **元数据补丁**（issue #732 的实用形态）：只给 node_id + tags /
+        # condition_space / depends_on 而不给 content ⇒ 视为「改元数据、不动
+        # 正文」，正文按原样从盘面取回再走同一条写链。这样「给存量节点补
+        # domain: 标签以迁出 orphan 桶」不必再用同 id 覆写——覆写是全量重建
+        # fm，历史上会重置 created_at/session 并丢 evidence_log/edges。
+        # 为何挂在 write 下而不是新造 op：它本质是**单节点写**（与 verify 同类），
+        # 不是批量维护；也不给令牌 face 引入新 op 词（派生收窄面零改动）。
+        if not str(a.get("content") or "").strip() and a.get("node_id"):
+            _cur = cg.get(a.get("node_id"))
+            if not _cur:
+                return {"ok": False, "error": "node_not_found",
+                        "node_id": a.get("node_id"),
+                        "hint": "content 为空时按「元数据补丁」处理，此时 node_id "
+                                "必须指向既有节点（新建节点必须给 content）"}
+            a = dict(a)
+            a["content"] = _cur.get("content") or ""
+            # 内容类型必须补齐：写入闸按 content_kind 选规则，缺省会判
+            # 「未知内容类型 ''」→ BLINDSPOT → 入审核队列（实测）。补丁的
+            # 正文是原来那条，故类型也沿用原节点的（modality 是既有落盘列）。
+            _pfm = _cur.get("frontmatter") or {}
+            if not a.get("content_kind"):
+                a["content_kind"] = (_pfm.get("content_kind")
+                                     or _pfm.get("modality") or "text")
+            # 显式标记：写链据此放行内容闸与档位闸（见 writepipe.execute 的注释）。
+            # 只有**这条**路径会置位——普通 write 即便正文一样也走全套闸。
+            a["_meta_patch"] = True
+            # importance 继承：写链 direct 出口对未声明值回落 0.5（那是两出口的
+            # 既有不变量，不动），故补丁要保原值必须在这里把旧值显式填进去。
+            if a.get("importance") is None and _pfm.get("importance") is not None:
+                a["importance"] = _pfm["importance"]
         return default_pipeline().execute(cg, a)
 
     if op == "goal":
@@ -2816,10 +2953,37 @@ def _cg_dispatch(cg, a):
     if op == "recent":
         act = (a.get("action") or "list").strip().lower()
         if act in ("add", "append", "remember"):
-            return cg.remember_event(a.get("role") or "user",
-                                     a.get("text") or a.get("content") or "",
-                                     tags=a.get("tags"), meta=a.get("meta"),
+            _role = a.get("role") or "user"
+            _text = a.get("text") or a.get("content") or ""
+            _meta = a.get("meta") or {}
+            _res = cg.remember_event(_role, _text, tags=a.get("tags"),
+                                     meta=a.get("meta"),
                                      window=int(a.get("window") or 200))
+            # L2 状态台账的**双端共用触发点**（2026-11-02 接线）。
+            # 放在这里而不是各端钩子里的理由：DSH 端（src/hooks.ts 的
+            # recentAdd）与 zcode 端（sync_zcode_session）**都**经过本分支，
+            # 一处接线即覆盖两端；且 op 面零扩张——本 op 的 require 是
+            # `recent`，而「能写 _recent」本就已隐含「能写运行态面」，
+            # 不把任何角色抬到 `write`（实测：output/guest 两个角色有 recent
+            # 无 write，但它们 can_write=False，remember_event 已在上一行拒掉，
+            # 到不了这里）。
+            #
+            # 三个前置条件（缺一不抽）：
+            #   ① role == "user"——抽取器只认真人发言（助手自述不复盖真值）；
+            #   ② meta 带 session——无会话归属的事件无法做去重与审计；
+            #   ③ 开关 MDCG_STATE_EXTRACT 开（缺省开）。
+            # 逐轮 fail-soft：抽取/记账任何失败都**不得**影响窗口写入的返回值
+            # （窗口是运行态面，状态台账是派生面）。
+            if _role == "user" and _text and _meta.get("session"):
+                try:
+                    from . import state_extract as _sx
+                    if _sx.enabled():
+                        _sx.extract_and_record(
+                            cg, _meta.get("session"),
+                            _meta.get("turn"), "user", _text)
+                except Exception:  # noqa: BLE001
+                    pass
+            return _res
         if act == "clear":
             return {"cleared": cg.clear_recent()}
         return {"events": cg.recent_events(limit=int(a.get("limit") or 20),
@@ -2848,7 +3012,8 @@ def _cg_dispatch(cg, a):
     if op == "verify":
         return cg.verify(a.get("node_id", ""), a.get("evidence", ""),
                          a.get("verdict", ""),
-                         override=bool(a.get("override")))
+                         override=bool(a.get("override")),
+                         superseded_by=a.get("superseded_by"))
 
     if op == "review":
         act = (a.get("action") or "list").strip().lower()
@@ -2881,7 +3046,9 @@ def _cg_dispatch(cg, a):
                                 edits=a.get("edits"), merge_into=a.get("merge_into"),
                                 reason=a.get("reason", ""),
                                 redteam=a.get("redteam"), issues=a.get("issues"),
-                                override=bool(a.get("override")))
+                                override=bool(a.get("override")),
+                                reviewed_by=a.get("reviewed_by"),
+                                decided_by=a.get("decided_by"))
 
     if op == "forget":
         if (a.get("action") or "forget").strip().lower() == "restore":
@@ -2936,6 +3103,18 @@ def _cg_dispatch(cg, a):
         check_path_root(a.get("path"), "MDCG_INGEST_ROOT", "index_code")
         if not os.path.isdir(root):
             return {"ok": False, "error": f"目录不存在：{root}"}
+        # issue #754：父/子根互相包含 ⇒ 同一物理文件生成两套节点（id 键是相对 path）。
+        # 默认 root（未显式给 path）是部署侧「全库刷一遍」语义，不做嵌套拦截；
+        # allow_nested=true 强制时回执留痕（nested_override），便于日后清理区分。
+        _nest, _nest_ok = ((None, True) if not a.get("path")
+                           else _nested_root_guard(cg, root, "code_ref"))
+        _nest_allowed = _nest if (_nest and a.get("allow_nested")) else None
+        if _nest and not a.get("allow_nested"):
+            return {"ok": False, "error": "nested_root", "path": root,
+                    "conflicts_with": _nest,
+                    "hint": ("该目录与已索引根互相嵌套（%s）——同一文件会生成两套"
+                             "节点（issue #754）。请改为索引最外层根；确需同时"
+                             "索引请显式 allow_nested=true。" % _nest)}
         # 写序（commit=False → add_items 成功后再 save）：水位是**派生物的水位**，
         # 必须落在「节点已写成功」之后。否则进程在两步之间被杀，会留下
         # 「水位新 + 节点旧」——下次巡检按水位判「未变、可跳过」，漂移静默漏报。
@@ -2966,6 +3145,11 @@ def _cg_dispatch(cg, a):
                "skipped_unchanged": stats.get("skipped_unchanged", 0),
                "skipped_suffixes": stats["skipped_suffixes"], "note": note}
         out.update(_skip_dirs_report(stats))
+        if _nest_allowed:               # issue #754：强制放行留痕（不静默）
+            out["nested_override"] = True
+            out["conflicts_with"] = _nest_allowed
+        if not _nest_ok:                # 守卫读不到水位 ⇒ 显式降级，不扮成「无嵌套」
+            out["nested_guard"] = "unavailable"
         if stats["truncated"]:
             # 截断必须显式说出来：以前静默 return，调用方以为索引是完整的。
             out["truncated_reason"] = stats["truncated_reason"]
@@ -2991,6 +3175,16 @@ def _cg_dispatch(cg, a):
         check_path_root(a.get("path"), "MDCG_INGEST_ROOT", "index_doc")
         if not os.path.isdir(root):
             return {"ok": False, "error": f"目录不存在：{root}"}
+        # issue #754：同 index_code——父/子根嵌套会双写（按 doc_ref kind 判）。
+        _nest, _nest_ok = ((None, True) if not a.get("path")
+                           else _nested_root_guard(cg, root, "doc_ref"))
+        _nest_allowed = _nest if (_nest and a.get("allow_nested")) else None
+        if _nest and not a.get("allow_nested"):
+            return {"ok": False, "error": "nested_root", "path": root,
+                    "conflicts_with": _nest,
+                    "hint": ("该目录与已索引根互相嵌套（%s）——同一文件会生成两套"
+                             "节点（issue #754）。请改为索引最外层根；确需同时"
+                             "索引请显式 allow_nested=true。" % _nest)}
         layer = a.get("layer") or "knowledge"
         # 显式改密级时必须全量重切（增量会跳过未变文件、覆盖不生效）。
         incremental = bool(a.get("incremental")) and not a.get("sensitivity")
@@ -3020,6 +3214,11 @@ def _cg_dispatch(cg, a):
                "skipped_suffixes": stats["skipped_suffixes"],
                "layer": layer, "sensitivity": sens_counts, "note": note}
         out.update(_skip_dirs_report(stats))
+        if _nest_allowed:               # issue #754：强制放行留痕（不静默）
+            out["nested_override"] = True
+            out["conflicts_with"] = _nest_allowed
+        if not _nest_ok:                # 守卫读不到水位 ⇒ 显式降级，不扮成「无嵌套」
+            out["nested_guard"] = "unavailable"
         if stats["truncated"]:
             out["truncated_reason"] = stats["truncated_reason"]
             out["note"] = (f"⚠ 索引被截断，结果不完整（{stats['truncated_reason']}），"
@@ -3283,7 +3482,6 @@ def _session_call(cg, a):
     raise ValueError(f"session 未知 action：{act}（允许 note/recall/compact）")
 
 
-# 生效条件：flag=a.get("prune", True)，flag 为字符串时重算为 flag.strip().lower() not in ("false","0","no","off","")；若 not flag 或 stats.get("truncated") 为真则返回 None；否则返回 refindex.prune_orphans(cg, kind=kind, root=root, items=items, dry_run=bool(a.get("prune_dry_run"))).
 def _prune_after_index(cg, a, *, kind, root, items, stats):
     """索引后的**节点级对账**：清退「同 root + 同 path 的过期代」。
 
@@ -3307,6 +3505,66 @@ def _prune_after_index(cg, a, *, kind, root, items, stats):
 
 
 # 生效条件：sd=list(stats.get("skipped_dirs") or [])，返回 {"skipped_dirs": sd[:limit], "skipped_dirs_count": len(sd), "skip_dirs": list(stats.get("skip_dirs") or [])}，且仅当 len(sd)>limit 时追加 skipped_dirs_note。
+# 生效条件：cg 为认知图实例、root 为待索引源根、kind 为 code_ref/doc_ref 时，读
+# <cg.root>/_refindex.json 的 files 记录（逐条带 root/kind），若新 root 与**同 kind** 的
+# 某个已索引根 realpath 互相包含（且不是同一个根）则返回 (该根, True)；无嵌套返回
+# (None, True)；水位缺失/损坏/schema 不符 ⇒ (None, False)（不拦，但回执显式降级）。
+def _nested_root_guard(cg, root, kind):
+    '''issue #754：同一物理文件从父/子根各索引一次会写两套 doc/code 节点。
+
+    node_id 的键是「相对传入 root 的 path」⇒ 换 root 就换 id；#352-E 的冲突检测只在
+    **同 id 被另一源根占用**时触发，本例 id 不同 ⇒ 静默双写。故在入口按 realpath 判
+    「新根与已索引根互相包含」，命中即拒（调用方可显式 allow_nested=true 强制）。
+
+    **按 kind 过滤（#754 复核）**：code_ref 与 doc_ref 的后缀面不相交，repo 的代码索引
+    与 repo/docs 的文档索引是**两种域**，不能因目录嵌套就互拦。
+
+    为什么读水位而不是扫节点：水位文件的 files 记录逐文件带 root（绝对路径键），是
+    全库已索引根的可靠单点；扫节点需逐个 get() 读 fm，大库不可承受。
+    '''
+    import os as _os
+    from . import refindex
+    try:
+        _fp = _os.path.join(cg.root, refindex.LEDGER_FILE)
+        if _os.path.exists(_fp):
+            import json as _json
+            with open(_fp, "r", encoding="utf-8") as _f:
+                _raw = _json.load(_f)
+            if not (isinstance(_raw, dict)
+                    and _raw.get("schema") == refindex.SCHEMA
+                    and isinstance(_raw.get("files"), dict)):
+                return None, False   # 水位在但 schema/形状不符 ⇒ 显式降级，不静默放行
+            files = _raw["files"]
+        else:
+            files = {}               # 尚无水位＝全新库，不是降级
+    except Exception:                # noqa: BLE001 —— 读失败不改既有行为，但须显式降级
+        return None, False
+    try:
+        new = _os.path.normcase(_os.path.realpath(str(root)))
+        seen = []
+        for rec in files.values():
+            if not isinstance(rec, dict) or rec.get("kind") != kind:
+                continue
+            r = rec.get("root")
+            if not r:
+                continue                  # root 兜底值（dirname）不自洽 ⇒ 不当根用
+            seen.append(str(r))
+        for r_raw in seen:
+            r = _os.path.normcase(_os.path.realpath(r_raw))
+            if r == new:
+                continue
+            # commonpath 而非 startswith(r+sep)：后者对盘符根与尾分隔符失效
+            try:
+                common = _os.path.commonpath([new, r])
+            except ValueError:        # 不同盘符 ⇒ 必不包含
+                continue
+            if common == r or common == new:
+                return r_raw, True
+    except Exception:                # noqa: BLE001 —— 守卫自身不得成为新失败源
+        return None, False
+    return None, True
+
+
 def _skip_dirs_report(stats, limit=20):
     """把「本次被 skip_dirs 排掉的目录」压成可审计字段。
 
@@ -3474,7 +3732,11 @@ def _maintain_call(cg, a):
         min_conf=a.get("min_conf"), basis_text=a.get("basis_text"),
         prefixes=a.get("prefixes"), aeis_root=a.get("aeis_root"),
         sample_n=a.get("sample_n"), prefix=a.get("prefix"),
-        verdicts=a.get("verdicts"), reason=a.get("reason"))
+        verdicts=a.get("verdicts"), reason=a.get("reason"),
+        # action=retag 的形参（只改元数据，正文与证据链原样）：
+        tags_add=a.get("tags_add"), tags_remove=a.get("tags_remove"),
+        condition_space_patch=a.get("condition_space_patch"),
+        depends_on=a.get("depends_on"), dry_run=a.get("dry_run"))
 
 
 # 生效条件：act=(a.get("action") or "promote").strip().lower()；principal 非 None 时一律先 require_admin(f"consolidate_{act}")；imp=a.get("min_importance")，为 None 时回落为 a.get("importance")，随后以 imp 等参数调 cg.consolidate_run 并返回。
@@ -4025,7 +4287,10 @@ def _oversize_r2(nid, a):
 
 
 def _dispatch(cg, name, args):
-    a = args or {}
+    # issue #742 复核（提权面）：`_meta_patch` 等**下划线前缀键是内部标志**，只能由
+    # 内部路径置位（见 `_cg_dispatch` 的元数据补丁分支）。外部调用方若能在 args 里
+    # 自己带上它们，就能绕过内容闸/档位闸直接落盘——故在唯一外部入口统一剥离。
+    a = {k: v for k, v in (args or {}).items() if not str(k).startswith("_")}
     # issue #86（2026-10-09 DSH 端）：**令牌运行期复检**（见 _runtime_token_recheck）
     _re86 = _runtime_token_recheck(getattr(cg, "principal", None))
     if _re86:
@@ -4072,6 +4337,15 @@ def _dispatch(cg, name, args):
         _ov212 = _oversize212(nid, a)
         if _ov212 is not None:
             return _ov212
+        # issue #677（A，2026-11-04）：**自动记忆面也支持幂等**。超时重试是既有病灶
+        # （节点已落盘但应答没回 ⇒ 重试新增一条，实测三条同内容）。`dedupe` 走与
+        # cg(op=write) **同一个闸**（writepipe._gate_dedupe：同层 + 内容指纹 ⇒ 复用既有 id），
+        # 位置也在链首（未落盘、未建边、不过闸审计）。
+        # layer 缺省按本通路口径（contextual）代入——否则闸会去 knowledge 层找而永不命中。
+        from .writepipe import _gate_dedupe as _dedupe677
+        _dup677 = _dedupe677({"a": {**a, "layer": a.get("layer") or "contextual"}, "cg": cg})
+        if _dup677 is not None:
+            return _dup677
         # issue #93（2026-10-09 DSH 端）：**这条通路此前不过 policy 的 forbidden 规则**。
         # 同样内容走 writepipe（cg(op=write)）会被判 REJECT 或打码，而 mdcg_remember
         # ——hooks 自动记忆走的正是它——直接落盘 ⇒ AKIA / ghp_ / URL 内嵌凭据 /
@@ -4528,7 +4802,9 @@ def _dispatch(cg, name, args):
                                 edits=a.get("edits"), merge_into=a.get("merge_into"),
                                 reason=a.get("reason", ""),
                                 redteam=a.get("redteam"), issues=a.get("issues"),
-                                override=bool(a.get("override")))
+                                override=bool(a.get("override")),
+                                reviewed_by=a.get("reviewed_by"),
+                                decided_by=a.get("decided_by"))
 
     if name == "mdcg_review_records":
         nid = a.get("node_id")

@@ -131,44 +131,75 @@ class FileLock:
 
 # 生效条件：先按 self.path 建父目录并 open(self.path, "a+b")，再在 self.timeout 到期前每 self.poll 秒尝试加锁（IS_WIN 用 msvcrt.locking(LK_NBLCK)，否则 fcntl.flock(LOCK_EX|LOCK_NB)）；成功即置 self.acquired=True 并返回 self；OSError 的 errno 不在 (EACCES, EAGAIN, EDEADLK) 时直接 raise，超时后 self.strict 为真抛 TimeoutError、否则返回 self 放行。
     def __enter__(self):
+        # issue #740：**进入前先清掉可能的旧句柄**（重复 enter / 上次未 exit）——
+        # 否则旧 fd 静默泄漏；POSIX 下还会与自己的旧 fd 互斥（表现为「卡到超时」）。
+        if getattr(self, "_f", None) is not None:
+            self._close_fd()
+        self.acquired = False
         os.makedirs(os.path.dirname(os.path.abspath(self.path)) or ".", exist_ok=True)
         self._f = open(self.path, "a+b")
-        deadline = time.time() + self.timeout
-        while True:
-            try:
-                if IS_WIN:
-                    self._f.seek(0)
-                    msvcrt.locking(self._f.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    fcntl.flock(self._f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                self.acquired = True
-                return self
-            except OSError as e:
-                if e.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
-                    raise
-                if time.time() > deadline:
-                    if self.strict:
-                        raise TimeoutError(
-                            f"FileLock 超时未获锁（strict）：{self.path}")
-                    return self          # 放行，不阻断写路径
-                time.sleep(self.poll)
+        try:
+            # #740：`try` **必须紧贴 open 之后**——`time.time() + self.timeout` 本身就可能
+            # 抛（timeout 为 None/字符串时 TypeError），那时 fd 已打开而 `__exit__` 不会
+            # 被调用（with 的清理只在 __enter__ 正常返回后才注册）。
+            deadline = time.time() + self.timeout
+            while True:
+                try:
+                    if IS_WIN:
+                        self._f.seek(0)
+                        msvcrt.locking(self._f.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        fcntl.flock(self._f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.acquired = True
+                    return self
+                except OSError as e:
+                    if e.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                        raise
+                    if time.time() > deadline:
+                        if self.strict:
+                            raise TimeoutError(
+                                f"FileLock 超时未获锁（strict）：{self.path}")
+                        # 非 strict：放行且**显式**标记未持锁（实例复用时靠它区分）。
+                        self.acquired = False
+                        return self
+                    time.sleep(self.poll)
+        except BaseException:
+            # #740：任何异常路径（含 KeyboardInterrupt / SystemExit / TypeError）都先关 fd
+            # 再原样上抛——清理本身绝不抛（否则会遮蔽原始异常）。
+            self._close_fd()
+            raise
+
+    def _close_fd(self):
+        """关句柄并复位状态（#740：**单点关闭**，幂等、绝不抛）。
+
+        - `getattr` 兜底：`__init__` 之前的异常/兼容旧实例时不出现 AttributeError；
+        - 吞 `(OSError, ValueError)`：重复 close（ValueError: I/O operation on closed file）
+          与平台错误都不该冒泡——清理函数抛异常会遮蔽原始异常。
+        """
+        f = getattr(self, "_f", None)
+        self._f = None
+        self.acquired = False
+        if f is None:
+            return
+        try:
+            f.close()
+        except (OSError, ValueError):
+            pass
 
 # 生效条件：self.acquired 为真时按 IS_WIN 用 msvcrt.locking(LK_UNLCK) 或 fcntl.flock(LOCK_UN) 解锁（OSError 被吞掉）；finally 中只要 self._f 为真就 close，随后 self._f=None、self.acquired=False。
     def __exit__(self, *exc):
         try:
-            if self.acquired:
+            # #740：`_f` 可能已是 None（进入失败/已关）——显式判空，别让 finally 崩。
+            if self.acquired and getattr(self, "_f", None) is not None:
                 if IS_WIN:
                     self._f.seek(0)
                     msvcrt.locking(self._f.fileno(), msvcrt.LK_UNLCK, 1)
                 else:
                     fcntl.flock(self._f.fileno(), fcntl.LOCK_UN)
-        except OSError:
+        except (OSError, ValueError):
             pass
         finally:
-            if self._f:
-                self._f.close()
-            self._f = None
-            self.acquired = False
+            self._close_fd()          # 单点关闭（幂等，绝不抛）
 
 
 # 生效条件：作为 `with` 的空上下文——进入返回自身、退出返回 False（不吞异常）。
@@ -1005,6 +1036,30 @@ class ShardedLog:
         self._fh.write(json.dumps(record, ensure_ascii=False,
                                   separators=(",", ":")) + "\n")
         self._fh.flush()
+
+# 生效条件：records 为 list[dict]（空列表直接返回 0）；句柄按需打开，**一次 write + 一次 flush**
+#   （#677 C 根治：把「每条 flush」降为「每批一次」——锁内 IO 次数从 O(N) 降为 O(1)，
+#   而整批仍在调用方的同一个 FileLock 内，与 compact 的 read→clear 互斥语义不变）。
+    def append_many(self, records):
+        recs = list(records or [])
+        if not recs:
+            return 0
+        if self._fh is None:
+            ensure_shard_dir(self.dir, "append")
+            self._fh = open(self.path, "a", encoding="utf-8", newline="\n")
+        # #677 C 复核：上次崩溃可能留下**残尾**（末字节不是换行）。不补一个换行就追加，
+        # 新批第 1 条会与残尾粘成一行——语法完整但解析失败，重放游标照样推进 ⇒
+        # 残尾与那条好记录一起永久丢失（与 append_jsonl 的 ends_mid_line 同一防线）。
+        if ends_mid_line(self.path):
+            self._fh.write("\n")
+        out = []
+        for record in recs:
+            self._seq += 1
+            out.append(json.dumps(dict(record, _t=time.time(), _s=self._seq),
+                                  ensure_ascii=False, separators=(",", ":")))
+        self._fh.write("\n".join(out) + "\n")
+        self._fh.flush()
+        return len(out)
 
 # 生效条件：幂等；self._fh 为真值时 flush 并关闭句柄、再把 self._fh 置 None，为 None 时直接返回不报错；
     def close(self):

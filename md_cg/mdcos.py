@@ -28,6 +28,8 @@ import time
 import uuid
 
 from .mdcg import (MdCG, expand_query_terms, bigrams, normalize_en, fold_accents,
+                    _optional_asset,
+                    parse_min_score,
                     STATE_ACCEPT,
                    STATE_REJECT, STATE_DEFER, STATE_BLINDSPOT, TIER_BUCKET_LIKE,
                    TIER_BUCKET_SCAN, TIER_GLOBAL_LIKE, TIER_GLOBAL_SCAN,
@@ -615,6 +617,37 @@ def _verify_norm(verify):
 def _redteam_required():
     return os.environ.get("MDCG_REDTEAM_REQUIRED", "").strip().lower() \
         in ("1", "true", "yes")
+
+
+# 生效条件：无 required 形参；当 os.environ 中 MDCG_REVIEW_DUAL_CHECK 去空白小写后属 1/true/yes/on 时返回 True，否则 False（缺省关，避免升级即阻断既有裁决流程）。
+def _dual_check_required():
+    """裁决是否强制「反思单元 + 验证单元」双复核（2026-10-27 使用者裁定）。
+
+    裁定原话：「裁决需要用反思单元和验证单元复核。」缺省**关**——与
+    `MDCG_REDTEAM_REQUIRED` 同款：既有脚本/蜂巢流程不该因升级而中断，
+    由部署方显式开启（DSH 端建议开）。
+    """
+    return os.environ.get("MDCG_REVIEW_DUAL_CHECK", "").strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
+#: 复核单元名的中英文同义归一（判据只认两类 + 人工）。
+REVIEW_UNIT_ALIASES = {
+    "reflect": "reflect", "reflection": "reflect", "反思单元": "reflect",
+    "反思": "reflect", "reflect_unit": "reflect",
+    "verify": "verify", "verifier": "verify", "验证单元": "verify",
+    "验证": "verify", "verify_unit": "verify",
+    "human": "human", "user": "human", "使用者": "human", "人工": "human",
+}
+
+
+# 生效条件：name 为假值时返回空串；否则 strip/lower 后查 REVIEW_UNIT_ALIASES，命中返回归一名，未命中原样返回小写值。
+def _norm_review_unit(name):
+    """复核单元名归一 → reflect / verify / human（未知名原样返回，便于报错点名）。"""
+    raw = str(name or "").strip().lower()
+    if not raw:
+        return ""
+    return REVIEW_UNIT_ALIASES.get(raw, raw)
 
 
 # ---- 审核队列裁决动作（治理层）· 2026-09-19 阶段一 ----------------------------
@@ -1262,7 +1295,8 @@ class MdCGOS(MdCG):
 
     @staticmethod
 # 生效条件：node_dict 的 frontmatter 中 ccg_exempt 为真且 content 去空白后非空时返回 DEFER 记录，否则以 (node_dict, query, context) 转 MdCG.judge_qualification；
-    def judge_qualification(node_dict, query: str, context=None):
+    def judge_qualification(node_dict, query: str, context=None,
+                             strict_conditions: bool = True):
         """在父类四态之上支持 legacy 记忆（迁移进来的自由文本）。
 
         迁移进来的历史记忆没有 CCG 5 要素注释。若直接按父类判 BLINDSPOT，
@@ -1275,7 +1309,7 @@ class MdCGOS(MdCG):
         if fm.get("ccg_exempt") and content.strip():
             return {"state": STATE_DEFER,
                     "reason": "legacy 记忆（无 CCG 5 要素）：可检索；建议补生效条件/不适用条件/验证方式"}
-        return MdCG.judge_qualification(node_dict, query, context)
+        return MdCG.judge_qualification(node_dict, query, context, strict_conditions=strict_conditions)
 
     # ================= 检索（含 role 过滤 + 四路召回） =================
 
@@ -1352,12 +1386,14 @@ class MdCGOS(MdCG):
                roles=None, include_work: bool = False, pools=None,
                session=None, branch=None, validity=None,
                start_time=None, end_time=None, start_operator=None,
-               end_operator=None, time_axis=None, view=None):
+               end_operator=None, time_axis=None, view=None,
+               strict_conditions: bool = True):
         """在父类语义之上加 role 过滤（默认剔除工具输出/命令/编辑）。
 
         返回 (results, meta)，与 MdCG.search 完全同构（T0–T3 阶梯 + 资格判定）。
         pools：§七 召回分池（None=关闭原行为 / True=内置表 / dict=自定义表）。
-        validity：时效过滤（显式启用，缺省不过滤）——只排已过期，未生效保留；
+        validity：时效过滤（显式启用，缺省不过滤）。**只排「已过期」，不排「未生效」**
+                  （名字容易读成「只给有效的」，实际是「别看已过期的」，见 issue #672）；
         view：角色化读取视图（第四阶段 6.1，显式启用，缺省 None 零变更）；
         详见 _candidates。
         """
@@ -1365,8 +1401,15 @@ class MdCGOS(MdCG):
         # 批次 15 统一口径（unify.py，2026-09-30 收窄作用域）：只译**英文内容**
         # → 标准原子序列，中文段逐字原样（不再整条归一）；与
         # MdCG.search/search_rrf 三入口同口径（归一层缺省关，显式 =1 才开）
-        from .semantic.unify import unify_query
-        q = unify_query(q)
+        # issue #672：资产包 semantic 可被裁剪（分包/剪枝安装）——缺包时把归一层视为关
+        # （归一层本就缺省关，跳过与关同语义），而不是在调用期抛 ImportError。
+        # 接线形态保持 q = unify_query(q) 字面不变（防回退锚点 G4g/G4h 钉的是这行）。
+        try:
+            from .semantic.unify import unify_query
+        except ImportError:
+            unify_query = None
+        if unify_query is not None:
+            q = unify_query(q)
         if not q:
             return [], {"tier": None, "reason": "empty_query", "scanned": 0}
         self._maybe_reload_index()      # P1b-2：读面代际感知（route/read/search 链）
@@ -1389,7 +1432,9 @@ class MdCGOS(MdCG):
         # 否则大小写断裂 → 词法分恒 0 → LIKE 层失效（p33 ⑤ 回归根因）；
         # + 英→中语素 bigram 补充（与 mdcg.search/_lexical 打分口径同步）
         qb = bigrams(normalize_en(q)) | en_zh_bigrams(q)
-        stat = {"scanned": 0, "query": q}
+        # issue #672：时效口径透出——父类 _emit 据 stat["validity_on"] 落
+        # meta.validity_scope（只排过期 / off），避免 validity 名字被读成「只给有效的」。
+        stat = {"scanned": 0, "query": q, "validity_on": bool(validity)}
         # 时间算子审计（阶段二 4.1）：候选层过滤在 `_candidates` 已完成，此处把
         # 审计块交给父类 `_emit` 落进 meta —— 与 search_rrf 的 `stat["time_filter"]`
         # 同构。缺此步则过滤**确实生效但审计不可见**：调用方无法区分「未启用过滤」
@@ -1481,7 +1526,8 @@ class MdCGOS(MdCG):
             if valid >= min_results:
                 return self._emit(scored, k, tier, stat, route_bucket, record,
                                   len(docs), judge, context, neg_coverage,
-                                  big_domain, big_scores, pool_cfg)
+                                  big_domain, big_scores, pool_cfg,
+                                  strict_conditions=strict_conditions)
             return None
 
         def _prescored(docs, scored_all):
@@ -2121,8 +2167,14 @@ class MdCGOS(MdCG):
                    session=None, branch=None, validity=None,
                    early_stop_threshold=None,
                    start_time=None, end_time=None, start_operator=None,
-                   end_operator=None, time_axis=None, view=None):
+                   end_operator=None, time_axis=None, view=None,
+                   strict_conditions: bool = True):
         """并行多路召回 + RRF 融合。返回 (results, meta)。
+
+        validity：**只排除「已过期」（expired），不排除「未生效」（not_yet）**。
+            双时间轴四态 unknown / not_yet / active / expired 中，本参数只过滤 expired；
+            要排「未来才生效」的条目请用 start_time / end_time 时间算子。
+            meta["validity_scope"] 会显式给出当前口径（"expired_only" / "off"）。
 
         每路各自排序 → Reciprocal Rank Fusion：
             score(d) = Σ_path w_path / (RRF_K + rank_path(d))
@@ -2167,7 +2219,8 @@ class MdCGOS(MdCG):
             REJECT / BLINDSPOT 剔除，DEFER 降权 ×0.5，ACCEPT 保位。候选池取
             fused 前 max(k*2,10) 再裁决补位。语义联系可以是认知噪声（等权 RRF
             双重奖励「多路都靠前」的干扰项），唯有条件证据可授予优先级。
-        validity: 时效过滤（显式启用，缺省不过滤）。**只排已过期**，未生效
+        validity: 时效过滤（显式启用，缺省不过滤）。**只排「已过期」，不排「未生效」**——
+                  名字读作「只给有效的」会误解，实际是「别看已过期的」（issue #672）；未生效
             （valid_from 未到）保留——两者语义相反（scrub 纪律「valid_from 绝不
             并入 _EXPIRY_KEYS」）。详见 _candidates。
         start_time/end_time/start_operator/end_operator/time_axis：时间算子
@@ -2189,8 +2242,15 @@ class MdCGOS(MdCG):
         # 批次 15 统一口径（unify.py，2026-09-30 收窄作用域）：只译**英文内容**
         # → 标准原子序列（中文段逐字原样）；归一后的 q 进热路径缓存键
         # （归一确定 → 缓存不串味）
-        from .semantic.unify import unify_query
-        q = unify_query(q)
+        # issue #672：资产包 semantic 可被裁剪（分包/剪枝安装）——缺包时把归一层视为关
+        # （归一层本就缺省关，跳过与关同语义），而不是在调用期抛 ImportError。
+        # 接线形态保持 q = unify_query(q) 字面不变（防回退锚点 G4g/G4h 钉的是这行）。
+        try:
+            from .semantic.unify import unify_query
+        except ImportError:
+            unify_query = None
+        if unify_query is not None:
+            q = unify_query(q)
         if not q:
             return [], {"tier": None, "reason": "empty_query", "paths": {}}
         # 相对时间锚定（MDCG_TIME_ANCHOR=1，缺省关 ⇒ 不解析、不入键、零变更）：日期从
@@ -2465,7 +2525,8 @@ class MdCGOS(MdCG):
                         and (-upper, nid) >= (-kept[-1][1], kept[-1][0])):
                     break
                 node, s = node_by_id[nid]
-                qual = self.judge_qualification(node, q, context)
+                qual = self.judge_qualification(
+                    node, q, context, strict_conditions=strict_conditions)
                 quals[nid] = qual
                 st = qual.get("state")
                 if st in (STATE_REJECT, STATE_BLINDSPOT):
@@ -2494,12 +2555,13 @@ class MdCGOS(MdCG):
         # （cg(op=read) 默认 bm25=True → search_rrf）**从不经过 _emit**，开关静默失效。
         # 这里按同一环境变量、同一语义在融合面补一刀：过滤发生在资格判定之前，
         # 被滤掉的不参与 boundary_counts（否则统计会把已丢弃条目算成命中）。
-        _rrf_min = 0.0
-        try:
-            _rrf_min = float(os.environ.get("MDCG_MIN_SCORE", "0"))
-        except ValueError:
-            _rrf_min = 0.0
+        # issue #659 F26-06/F26-12：与 mdcg._emit 共用同一解析单点（nan/inf 不再把结果滤空）。
+        _rrf_min, _rrf_status = parse_min_score(os.environ.get("MDCG_MIN_SCORE", "0"), 0.0)
         _rrf_dropped = 0
+        if _rrf_status == "invalid":
+            _rrf_note = {"min_score_input": "invalid"}
+        else:
+            _rrf_note = None
         if _rrf_min > 0:
             _kept = []
             for _nid, _fs in fused:
@@ -2528,7 +2590,8 @@ class MdCGOS(MdCG):
                 for _k in _c:
                     boundary_counts["counts"][_k] += _c[_k]
             elif judge:
-                _jw = MdCG.judge_with_boundary(node, q, context)
+                _jw = MdCG.judge_with_boundary(
+                node, q, context, strict_conditions=strict_conditions)
                 qual = dict(_jw["qualification"])
                 _b = boundary_mark(node, q, context)
                 if _b.get("hit"):
@@ -2616,9 +2679,14 @@ class MdCGOS(MdCG):
                          view=view, extra=_cache_extra, clock_window=_query_window)
         if _rrf_dropped:
             stat["min_score"] = _rrf_min
-        return results, {"tier": "RRF", "scanned": stat["scanned"],
+        # issue #672：把生效的时效口径如实透出——调用方看名字容易以为「只给有效的」，
+        # 读 meta 一眼可辨（只排过期 / 未启用）。
+        _validity_meta = ({"validity_scope": "expired_only"} if validity
+                          else {"validity_scope": "off"})
+        return results, {"tier": "RRF", "scanned": stat["scanned"], **_validity_meta,
                          **({"min_score": _rrf_min, "min_score_dropped": _rrf_dropped}
                             if _rrf_min > 0 else {}),
+                         **(_rrf_note or {}),
                          "paths": per_path, "fused": len(results),
                          "judge_ranking": bool(judge and judge_ranking),
                          "judge_filtered": filtered,
@@ -2743,11 +2811,11 @@ class MdCGOS(MdCG):
             # issue #637：**召回面可配最低分**（MDCG_RECALL_MIN_SCORE，默认 -1 = 关）。
             # 默认关的理由：test_validity_filter ⑤⑦ 依赖 RRF 旁系低分条目可见；
             # 需要「只装相关记忆」的部署设 0.01 即启用（零分条目连同 reason 记账跳过）。
-            try:
-                _rmin = float(os.environ.get("MDCG_RECALL_MIN_SCORE", "-1"))
-            except ValueError:
-                _rmin = -1.0
-            if _rmin >= 0 and score < _rmin:
+            # issue #659 F26-12：此处原为 >=0、另一处为 >0，两处开关判据相反
+            # （=0 时一处关、一处开；-0.0 >= 0 为真会开闸）。统一成 >0 一个判据，
+            # 且解析走同一单点（nan/inf 回落默认 -1 = 关）。
+            _rmin, _rmin_status = parse_min_score(os.environ.get("MDCG_RECALL_MIN_SCORE", "-1"), -1.0)
+            if _rmin > 0 and score < _rmin:
                 skipped.append({"id": node["id"], "tokens": t,
                                 "reason": "below_min_score", "score": score})
                 continue
@@ -3370,7 +3438,7 @@ class MdCGOS(MdCG):
         return f"rev_{pid.split('_')[-1]}_r{int(round_no)}"
 
 # 生效条件：当 rec 提供 record_node_id/record_hash/pid/round/decision/status/redteam_verdict 等键时（缺键会 KeyError），构造审核裁决 body，并调用 self.add 以 layer="self"、override=True、role=AUDIT_ROLE、sensitivity=DEFAULT_SENSITIVITY（issue #522：审计件保护级由件类型固定，不随裁决者 clearance 漂移）等写入，返回 nid；
-    def _write_review_record(self, rec):
+    def _write_review_record(self, rec, reviewers=None):
         """把一轮裁决写成 md 记忆节点（**structural 层**）——外部来源可读、可复核。
 
         2026-10-18 改（方案 A）：此前硬编码 layer="self"，后果实测为——
@@ -3415,7 +3483,13 @@ class MdCGOS(MdCG):
         # 769 条是这类裁决审计记录（98.6%），把真正的自我锚点挤到只剩 11 条。
         # 审计痕迹的语义是「结构事件」，不属「扮演依据」。
         # 同时打 audit_trace 标签——它是 self_surface 过滤的判据单点。
+        # issue #708（2026-10-28）：裁决审计节点写 structural 层，而 structural 属 2 档
+        # （需 reflect + verify）。此前这里**不传 reviewers** ⇒ enforce 档下审计节点被
+        # 同一个闸挡住（jsonl 还在、可复核的 md 节点没了）。
+        # 修法（报告人建议 3）：把**本次裁决已经取得的** reviewed_by 一并带进写入——
+        # 它本来就是「本次裁决的复核单元」，不是凭空自证。
         self.add(nid, body, layer="structural", override=True, role=self.AUDIT_ROLE,
+                 reviewed_by=reviewers,
                  tags=["audit", "audit_trace", self.AUDIT_TAG, f"pid:{rec['pid']}",
                        f"round:{rec['round']}"],
                  importance=0.2, verification_basis="data",
@@ -3429,7 +3503,7 @@ class MdCGOS(MdCG):
 
 # 生效条件：当 pid/item/decision/status/reason/round_no/rt_verdict/issues/vhash/result 传入时，构造 rec 并写 record_hash，把 result 中 ok/node_id/error/state 保留（result.mutation 为 dict 时另落 rec["mutation"]＝变更单执行时点载荷，proposal 链无此键、rec 形状逐位不变）；在 strict 锁内追加 decisions_log；随后尝试写 md 审核记录，成功补 record_node_id/record_hash，异常则补 record_error 并 audit review_record_failed；最后 audit review_decide 并返回 result；
     def _record_decision(self, pid, item, decision, status, reason, round_no,
-                         rt_verdict, issues, vhash, result):
+                         rt_verdict, issues, vhash, result, reviewers=None):
         """落盘一轮裁决：jsonl（权威）+ md 审计节点（可复核、供外部审计）。"""
         t = time.time()
         rec = {"t": t, "pid": pid, "decision": decision, "status": status,
@@ -3454,7 +3528,7 @@ class MdCGOS(MdCG):
             append_jsonl(self.decisions_log, rec, strict=True)
         # md 审计节点写失败不影响裁决（jsonl 仍是权威来源）
         try:
-            self._write_review_record(rec)
+            self._write_review_record(rec, reviewers=reviewers)
             result["record_node_id"] = rec["record_node_id"]
             result["record_hash"] = rec["record_hash"]
         except Exception as exc:  # noqa: BLE001
@@ -3740,11 +3814,56 @@ class MdCGOS(MdCG):
             after_hash=_after_hash)
         return {"ok": True, "node_id": node_id, "mutation": mpay}
 
+# 生效条件：item 为 inbox 记录、decision 属 DECISION_ACTIONS；reviewed_by 可为字符串或 {unit:…} 映射的可迭代，decided_by 为假值时回落到 item 的 proposer/compiled_by/actor；返回 {"ok":True,"reviewed_units":[...]} 或 {"ok":False,"error":...}（dual_check_required / self_review_forbidden / unknown_review_unit）。
+    def _dual_review_verdict(self, item, decision, decided_by=None, reviewed_by=None):
+        """裁决前双单元复核判定（反思单元 + 验证单元；**裁决者不得自证**）。
+
+        归一口径见 `_norm_review_unit`（reflect/verify/human 三类）。两条判据：
+          1. `reviewed_by` 必须**同时**含 reflect 与 verify（同一类重复不算——
+             两个反思单元仍然没有验证，正是「同侧互证」的盲区）；
+          2. 裁决者不得是提案者本人（与 ccg 的 E041「编译者不得自证」同源）。
+
+        只在 `MDCG_REVIEW_DUAL_CHECK=1` 时被调用；关闭时本方法不参与任何路径。
+        """
+        units = []
+        for raw in (reviewed_by or ()):
+            if isinstance(raw, dict):
+                name = raw.get("unit") or raw.get("role") or raw.get("name") or ""
+            else:
+                name = raw
+            unit = _norm_review_unit(name)
+            if unit:
+                units.append(unit)
+        have = set(units)
+        missing = [u for u in ("reflect", "verify") if u not in have]
+        if missing:
+            return {"ok": False, "error": "dual_check_required",
+                    "pid": item.get("pid"), "decision": decision,
+                    "missing": missing, "reviewed_units": sorted(have),
+                    "detail": ("裁决须经反思单元与验证单元复核（2026-10-27 裁定）："
+                               "缺 %s。请带上 reviewed_by 重试，例如 "
+                               "reviewed_by=[\"反思单元\", \"验证单元\"]。"
+                               % "/".join(missing))}
+        unknown = sorted(u for u in have if u not in ("reflect", "verify", "human"))
+        if unknown:
+            return {"ok": False, "error": "unknown_review_unit",
+                    "pid": item.get("pid"), "unknown": unknown,
+                    "detail": "复核单元只认 reflect/verify/human（含中文同义）"}
+        proposer = (item.get("proposer") or item.get("compiled_by")
+                    or item.get("actor") or "")
+        who = decided_by or getattr(self, "actor", None) or ""
+        if proposer and who and str(proposer).strip() == str(who).strip():
+            return {"ok": False, "error": "self_review_forbidden",
+                    "pid": item.get("pid"), "decided_by": str(who),
+                    "detail": "裁决者不得是提案者本人（同侧互证不构成复核）"}
+        return {"ok": True, "reviewed_units": sorted(have)}
+
 # 生效条件：decision 须为 DECISION_ACTIONS（"accept"/"reject"/"edit"/"merge"/"noop"）之一（否则 raise ValueError），inbox_log 中须有 pid 匹配记录（否则 {'ok': False, 'error': 'pid_not_found'}），且 pid 不在 self._closed_pids() 中（否则 'already_decided'）；edits 为真值且含 "verify"、或 redteam 为真值且含 "verify" 时返回 'verify_readonly'；last_status=="needs_reapproval" 时须 redteam.verdict 归一化为 "pass" 且 round_no>last_round（否则 'reapproval_required' / 'round_not_advanced'）；rt_v=="reject" 或（decision=="reject" 且 rt_issues 非空）时记 needs_reapproval 不落节点；decision=="accept" 且 rt_v 为空且 _redteam_required() 为真时返回 'redteam_required'；其余 accept/edit 按 item（edit 时用 edits.get 覆盖 content/tags/layer）add+flush 落节点，merge 须 merge_into 或 item.extra.merge_into 指向的节点存在（否则 'merge_target_not_found'），且写入前经与 add 同款双闸（N131，2026-09-25：principal 在位先 require_layer_write(目标层, 目标敏感度)——与 MdCGSecure.add 同序同错型；再 protect.guard_write(override=override)——self/anchor 层、immutable 标记，拒绝抛 ProtectionError/AccessDenied 且提案留 pending 不落库）后追加内容并定向索引 upsert（_node_entry 同源条目写入 index/_dirty）+flush，reject 与 noop 只记裁决（status 分别为 "rejected"/"noop"）；kind=mutation 的变更单（三档自治批次②）不走上述分支——accept 经 _mutation_execute 执行对应动作（失败即返回错误、不记裁决、提案保持 pending）、reject 只留痕，其余裁决 fail-closed 返回 mutation_decision_unsupported；最后统一 _record_decision + _cascade_dedup + flush 后返回 result。
     def review_decide(self, pid: str, decision: str, edits: dict = None,
                       merge_into: str = None, reason: str = "",
                       redteam: dict = None, issues=None,
-                      override: bool = False):
+                      override: bool = False,
+                      reviewed_by=None, decided_by: str = None):
         """审核裁决：accept / reject / edit / merge / noop。
 
         accept  → 按 inbox 原样写入
@@ -3822,13 +3941,23 @@ class MdCGOS(MdCG):
             return {"ok": False, "error": "redteam_required",
                     "detail": "MDCG_REDTEAM_REQUIRED=1：accept 必须带红队 pass"}
 
+        # 双单元复核闸（可选，MDCG_REVIEW_DUAL_CHECK=1）：**裁决须经反思单元与
+        # 验证单元复核**（2026-10-27 使用者裁定）。与上面的红队闸正交——红队是
+        # 「打回/再审批」，本闸是「谁复核过」。缺省关，开启后缺任一方即拒。
+        if _dual_check_required():
+            _chk = self._dual_review_verdict(item, decision, decided_by, reviewed_by)
+            if _chk.get("ok") is not True:
+                return _chk
+
         # 三档自治批次②（设计 §四）：**变更单**（kind=mutation）走**独立执行桥**
         # ——在既有前置闸（已判/verify_readonly/再审批/红队门控）之后、既有
         # accept/edit/merge/noop 链之前。proposal（含存量无 kind 条目）一律不
         # 进此支，下面整条链对它逐位不变。
         if autonomy_modes.order_kind(item) == autonomy_modes.KIND_MUTATION:
+            # issue #709 连带：变更单桥也要把本次裁决的复核单元带下去（审计节点用它过闸）
             return self._decide_mutation(pid, item, decision, reason, override,
-                                        round_no, rt_v, rt_issues, expect)
+                                        round_no, rt_v, rt_issues, expect,
+                                        reviewers=reviewed_by)
 
         result = {"pid": pid, "decision": decision, "round": round_no,
                   "redteam": rt_v or "absent"}
@@ -3917,8 +4046,13 @@ class MdCGOS(MdCG):
                                     "原写入者身份裁决。"}
             self._seal_override = ((item["id"],) + _seal_as) if _seal_as else None
             try:
+                # issue #709 连带发现（2026-10-28）：accept 落业务节点时，把**本次裁决已取得的**
+                # reviewed_by 一并带入。此前只在审计节点传了、这里没传 ⇒ enforce 下裁决本身
+                # 能过 dual_check，落盘却被同一个闸拒（「批了但写不进去」）。
+                # 层白名单与密级检查照常；dual_check 仍在 accept 之前，复核不被削弱。
                 nid = self.add(item["id"], content, layer=layer, tags=tags,
-                               condition_space=item.get("condition_space"), **extra)
+                               condition_space=item.get("condition_space"),
+                               reviewed_by=reviewed_by, **extra)
             finally:
                 self._seal_override = None
             # 索引增量收尾（2026-09-16 取证）：add 只把条目放进本进程内存 _dirty，
@@ -4014,11 +4148,12 @@ class MdCGOS(MdCG):
                 result.update(ok=True, node_id=target)
 
         return self._finish_decision(pid, item, decision, reason, round_no,
-                                     rt_v, rt_issues, expect, result)
+                                     rt_v, rt_issues, expect, result,
+                                     reviewers=reviewed_by)
 
 # 生效条件：result 为已定好的裁决返回体时，按其 pid/item/decision/reason/round_no/rt_v/rt_issues/expect 调 _record_decision（status 映射统一出口：reject→"rejected"、noop→"noop"、其余→"accepted"）落盘 jsonl + 审计节点，再按 item 的 payload_hash（缺失时 _sig(content)）调 _cascade_dedup 级联出清（有 closed 时写 result["cascade_closed"]），最后 flush 并返回 result；
     def _finish_decision(self, pid, item, decision, reason, round_no, rt_v,
-                         rt_issues, expect, result):
+                         rt_issues, expect, result, reviewers=None):
         """裁决**统一收尾**（单点）：proposal 链与变更单执行桥共用同一收尾。
 
         为何抽出来：三档自治批次② 的变更单走独立执行桥（`_decide_mutation`），
@@ -4031,7 +4166,7 @@ class MdCGOS(MdCG):
             pid, item, decision,
             {DECISION_REJECT: "rejected", DECISION_NOOP: DECISION_NOOP}
             .get(decision, "accepted"),
-            reason, round_no, rt_v, rt_issues, expect, result)
+            reason, round_no, rt_v, rt_issues, expect, result, reviewers=reviewers)
         # 级联出清：主提案已终态，同内容兄弟提案（重复入队产物）自动关闭
         casc = self._cascade_dedup(
             pid, item.get("payload_hash") or _sig(item.get("content") or ""),
@@ -4048,7 +4183,7 @@ class MdCGOS(MdCG):
 
 # 生效条件：item 为 kind=mutation 的队列记录——decision 为 accept 时经 _mutation_execute 执行对应动作（返回 ok=False 时**原样返回该错误**、不落裁决、提案保持 pending），为 reject 时只置 ok=True 留痕；decision 非此二者时返回 {"ok": False, "error": "mutation_decision_unsupported", ...} 带 hint（fail-closed，不落裁决）；通过者交 _finish_decision 收尾后返回其结果；
     def _decide_mutation(self, pid, item, decision, reason, override, round_no,
-                         rt_v, rt_issues, expect):
+                         rt_v, rt_issues, expect, reviewers=None):
         """变更单的裁决分派（三档自治批次② · 设计 §四）：accept 执行 / reject 留痕。
 
         本批只定义 accept/reject 两态；其余裁决（edit/merge/noop）**fail-closed
@@ -4078,7 +4213,8 @@ class MdCGOS(MdCG):
         else:
             result["ok"] = True
         return self._finish_decision(pid, item, decision, reason, round_no,
-                                     rt_v, rt_issues, expect, result)
+                                     rt_v, rt_issues, expect, result,
+                                     reviewers=reviewers)
 
 # 生效条件：无输入形参；调用即返回 list(read_jsonl(self.decisions_log))，记录内容取决于 decisions_log 可读结果；
     def decisions(self):
@@ -4515,7 +4651,25 @@ class MdCGOS(MdCG):
             pack["degraded"].append("tasks")
         # ③ 近期事件（原始滚动窗口）
         try:
-            evs = self.recent_events(limit=max(1, int(recent_limit or 10)))
+            # issue #712（2026-10-30 使用者裁定方案 C）：**取窗顺序**修正——需要按会话
+            # 收窄时**先取全量、再过滤、最后截**。修前是先截末 N 条（本行）再由下方
+            # 4656 过滤 ⇒ 多会话并发时本会话消息被别会话挤出窗口，`session="A"` 可能
+            # 拿到**空 recent**（过滤器没错，窗口错了；false-negative，极难被现有测试
+            # 发现）。选 `limit=0`（全量）而非 `recent_limit×K`：① 本函数 ② goals 段
+            # 已是「全量取数 → 过滤 → 截断」形态（`active_goals(limit=None)` 后切
+            # `[:_PACK_ROWS]`），倍数窗会成为本文件里的第二种形态；② 外部会话条数无
+            # 上界，倍数窗只是把失败概率变小；③ `MdCGSecure.recent_events` 内部本就
+            # `super().recent_events(limit=0, …)` 再 `keep[:limit]`，故此处传 0
+            # **不新增读盘量**。
+            _win = max(1, int(recent_limit or 10))
+            _sess_arg = session if (session and str(session).strip() != "*") else None
+            # issue #712 D 项：分档会话读权限。仅当 `sessions_read` 是集合且不含
+            # "*" 时收窄（None = 与历史逐位相同）。can_admin 不在此处特殊处理——
+            # 它按 issue #35 定稿本就全读，本判据只做「减法」。
+            _sr = getattr(getattr(self, "principal", None), "sessions_read", None)
+            _sr_narrow = isinstance(_sr, tuple) and bool(_sr) and "*" not in _sr
+            _narrow = bool(_sess_arg) or _sr_narrow
+            evs = self.recent_events(limit=0 if _narrow else _win)
             # issue #65（外部报告 by ducc239，对 v0.7.5 实测，本 workflow 修前复现）：
             # 本段此前**不传会话**，而 `MdCGSecure.recent_events` 无 session 形参
             # （只有 private/secret 档做会话归属判断、默认档全放行）⇒ recent 恒为
@@ -4528,11 +4682,42 @@ class MdCGOS(MdCG):
             #     的 "*" 同款语义）；
             #   falsy（None/""）→ 退回旧行为（全局窗口，存量调用面零迁移）。
             # `strip()` 防空白包裹的 "*"（" * " 也按汇总处理）。
-            if session and str(session).strip() != "*":
+            if _sess_arg:
                 evs = [r for r in evs if (r.get("meta") or {}).get("session") == session]
+            if _sr_narrow:
+                evs = [r for r in evs if (r.get("meta") or {}).get("session") in _sr]
+            if _narrow:
+                evs = evs[:_win]
+            if not session:
+                # issue #712 C 项：falsy 会话**不再静默退回全局窗口**——把「你正在读
+                # 全局窗口」放进 degraded，让调用方/工具面看得见（只写日志等于没留痕，
+                # #708 的教训）。
+                pack["degraded"].append("recent_global_window")
+            # issue #712 B 项：注入面恢复**四要素**（会话/时间/身份/id）。
+            # 修前只留 role/text/t，模型因此无法判断「这条是哪个会话说的、私有还是
+            # 共有、谁说的」——「跨窗口串台」的用户侧困惑正源于此。
+            # 取值一律防御式（meta 可能缺失/非 dict），与上一段的既有写法同款。
+            # 宪章第十五条（复读污染）· 注入过滤：给重复事件**加标注**（不折叠、不删条目——
+            # 用户可能真的把同一句话说两遍，实测库里就有一条 x7 的是真发的）。
+            # 只标不折：条数不变，模型能看到「这条重复了 N 次」。（history 去重
+            # `repeat_guard.dedupe` 留给显式要求折叠的调用方，本段不用它。）
+            from . import repeat_guard as _rg
+            evs = _rg.annotate(evs)
             pack["recent"] = [{"role": r.get("role"),
                                "text": (r.get("text") or "")[:300],
-                               "t": r.get("t")} for r in evs]
+                               "t": r.get("t"),
+                               "id": r.get("id"),
+                               "session": (r.get("meta") or {}).get("session"),
+                               "sensitivity": (r.get("meta") or {}).get("sensitivity"),
+                               "actor": (r.get("meta") or {}).get("actor"),
+                               # 2026-10-30 理论《身份与人格》：归因三维（编号/职业身份/汇报线）。
+                               # 只透出**归因必需**的，不透权限快照（理由见 remember_event 注释）。
+                               "token_id": (r.get("meta") or {}).get("token_id"),
+                               "identity_role": (r.get("meta") or {}).get("identity_role"),
+                               "parent": (r.get("meta") or {}).get("parent"),
+                               # 宪章第十五条：复读标注（只在命中时有键，未命中不占位）
+                               **(dict(repeat=r["repeat"]) if isinstance(r.get("repeat"), dict) else {})}
+                              for r in evs]
         except Exception:                                  # noqa: BLE001
             pack["degraded"].append("recent")
         # ④ 未解问题（驱动主动补全）
@@ -4600,13 +4785,20 @@ class MdCGOS(MdCG):
         零依赖启发式（无嵌入 / 无 LLM）：按行去重 + 角色配比 + 截断。
         返回体显式声明 heuristic=True，不冒充语义摘要（语义归纳见 consolidate）。
         """
+        # issue #712（2026-10-30 验证单元复核发现）：**与 session_recall 同型的取窗 bug**——
+        # 修前先截末 N 条、后按会话过滤 ⇒ 多会话并发时本会话事件被挤出窗口，
+        # `session_compact(session=A, note=True)` 可能压出「共 0 条事件」并**写入会话节点**
+        # （比 session_recall 更严重：那只是少看到，这会**写错**一条记忆）。
+        # 修法同 session_recall：需要收窄时先取全量、再过滤、最后再截回 limit。
+        _lc = max(1, int(limit or 40))
+        _narrow_c = bool(session)
         try:
-            evs = self.recent_events(limit=max(1, int(limit or 40)))
+            evs = self.recent_events(limit=0 if _narrow_c else _lc)
         except Exception:                                  # noqa: BLE001
             evs = []
-        if session:
+        if _narrow_c:
             evs = [r for r in evs
-                   if (r.get("meta") or {}).get("session") == session]
+                   if (r.get("meta") or {}).get("session") == session][:_lc]
         roles, seen, points = {}, set(), []
         for r in evs:
             role = r.get("role") or "user"
@@ -4705,7 +4897,9 @@ class MdCGOS(MdCG):
                  content=None, role=None, verification_basis=None,
                  importance_hint=None, node_id=None, write=False,
                  min_jaccard=None, ids=None, pairs=None, actor=None,
-                 sensitivity=None, **extra):
+                 sensitivity=None, tags_add=None, tags_remove=None,
+                 condition_space_patch=None, depends_on=None, dry_run=None,
+                 **extra):
         """记忆维护（P1）：importance / longterm / prefeed / separate / stat。
 
         只读 action（stat/history/longterm 预演）与写层 action（prefeed）不受
@@ -4724,6 +4918,36 @@ class MdCGOS(MdCG):
             # 探活/显式刷新：无副作用面（签名未变时是零开销 stat + False）。
             return {"ok": True, "op": "maintain", "action": "reload",
                     "reloaded": bool(self._maybe_reload_index())}
+        if act == "flush":
+            # issue #677 P2：写路径的「索引落盘」已异步化——阈值触发的那次 flush
+            # 移出了 RPC 返回路径（否则客户端 60s 超时会把「已落盘但没回话」读成
+            # 失败，重试即产生重复条目，见 #677 三条实证）。
+            # 异步的对价是「写完那一刻索引派生物未必已在盘上」，故这里给一个
+            # **显式同步逃生门**：要「确定已落盘」、或要让索引面的错误在带内暴露
+            # （如分片目录重建失败 E_SHARD_DIR_UNREBUILDABLE）时，调它即可。
+            # 语义边界：只落索引派生物（脏条目 append 进分片日志，再关句柄），
+            # **不改内存索引**——「写完立刻可检索」由 _stage 同钩内存索引保证，
+            # 与本 action 无关（异步化不降级检索可见性）。
+            # 异常**不吞**：原样上抛，由 MCP 出口的 getattr(exc,"hint") 渲染成
+            # 结构化 error（code / hint / path 可机读，与 #677 P2 前的写面出口同形）。
+            self.flush()
+            st = self.flush_state()
+            st.update({"ok": True, "op": "maintain", "action": "flush"})
+            return st
+        if act == "retag":
+            # 只改元数据（tags / condition_space / depends_on），正文与证据链原样。
+            # 用于给存量节点补 domain: 标签以迁出 orphan 桶（issue #732 的配套）：
+            # 同 id 覆写 add() 曾重置 created_at/session 并丢 evidence_log/edges，
+            # 故这里走 MdCG.retag 的窄路（内部仍复用 add() 的写链，只是显式保证
+            # 「正文逐字不变」，从而命中 BODY_SAME 的继承分支）。
+            # 缺省 dry_run：沿用 maintain 的「预演优先」口径，apply=True 才落盘。
+            # 双开关收敛（#742 复核）：`dry_run=False` 不得在 `apply=False` 时落盘
+            # （否则「没给 apply 也写」，工具面语义反转）。落盘条件 = apply 且非 dry。
+            _dry = (not apply) if dry_run is None else (bool(dry_run) or not apply)
+            return self.retag(
+                node_id or "", tags_add=tags_add, tags_remove=tags_remove,
+                condition_space_patch=condition_space_patch,
+                depends_on=depends_on, dry_run=_dry)
         if act == "importance":
             return weights.recalc(self, layer=layer, limit=limit, apply=apply,
                                   min_delta=(weights.APPLY_DELTA if min_delta is None
@@ -5199,6 +5423,10 @@ class MdCGOS(MdCG):
             "self_state": self_state.summary(self),
             # 演化账本（md 载体：每一次修改 = 补一条缺失条件，记录规律与状态）
             "evolution": evolution.summary(self),
+            # issue #677 P2：索引落盘的**异步可读面**（脏条数 / 后台线程是否活着 /
+            # 最近一次后台失败）。后台失败冒不到任何调用方，体检面是它的唯一出口
+            # ——「容忍 ≠ 静默」（N225）在异步化后的落点。
+            "index_flush": self.flush_state(),
         }
         return h
 
@@ -6657,7 +6885,15 @@ class MdCGSecure(MdCGOS):
         with node_write_lock(self, node_id):
             sens = self._write_sensitivity(node_id, sensitivity)
             _rank(sens)
-            self.principal.require_layer_write(layer, sens)
+            # issue #708/#709（2026-10-28）：把调用方已经取得的复核单元透传给闸。
+            # 此前这里只传 (layer, sens)，`reviewed_by` 虽在 **kw 里却从未被消费 ⇒
+            # 审计节点与 accept 落盘都被同一个闸挡住。
+            #
+            # **必须 pop 而不是 kw.get**：`reviewed_by` 是**写入闸的输入参数**，不是记忆
+            # 的元数据。若留在 kw 里，它会经 super().add(**kw) 落进 frontmatter
+            # （实测：`test_i50c` 的 B1 逐键对拍报出 `reviewed_by: null` 的白名单外差异）。
+            _reviewers = kw.pop("reviewed_by", None)
+            self.principal.require_layer_write(layer, sens, reviewers=_reviewers)
             self._attribution(kw, sens)
             # B2（2026-09-30）：`sens` 是归一后的落盘值，`sensitivity` 才是调用方
             # 的**原始声明**（None=未声明）。两者必须分别下传——库层 `_write_node`
@@ -6706,7 +6942,12 @@ class MdCGSecure(MdCGOS):
 # 生效条件：调用方未声明 sensitivity 时先经 _write_sensitivity 解析出 sens（issue #297：既有节点**继承旧密级**——缺省 confirm 档下提案记录若在入队时就已降成 internal，accept 只会照抄该值，故继承必须发生在这里、不能只补落盘面），再 principal.require_layer_write(kw.get("layer", "knowledge"), sens)（缺省与基类 MdCGOS.propose 的 layer="knowledge" 一致——此前误用 or "contextual" 导致校验层与落盘层错位：knowledge-only 身份被误拒 / contextual-only 身份入队成死提案，2026-09-25 缺陷 #5），再按**既有节点真层真密级**调 protect.require_layer（#346：提案者自己落不了盘的覆写不入队），最后转 super().propose(node_id, content, sensitivity=sens) 并返回其结果。
     def propose(self, node_id: str, content: str, sensitivity: str = None, **kw):
         sens = self._write_sensitivity(node_id, sensitivity)
-        self.principal.require_layer_write(kw.get("layer", "knowledge"), sens)
+        # issue #709 连带发现（2026-10-28）：propose **不落记忆盘**（只把候选写进 inbox），
+        # 却按目标层要求复核单元 ⇒ enforce 下死锁：要写 knowledge 需 reflect、要 reflect
+        # 需裁决、要裁决需有提案、提案又要 reflect。故此处跳过 write_gate。
+        # 注意：层白名单与密级检查照常；accept 落盘时仍走 add() 的同一道闸，复核不被削弱。
+        self.principal.require_layer_write(kw.get("layer", "knowledge"), sens,
+                                         skip_gate=True)
         # issue #346（2026-10-17 U05a）：入队面此前只比**声明值**（上面那行是拿
         # `sens`——显式声明时原样返回——去比写入者自己的 clearance），不比对既有
         # 节点的真层真密级 ⇒ 低权身份能把「自己落不了盘的覆写」塞进审核队列，再由
@@ -6744,9 +6985,11 @@ class MdCGSecure(MdCGOS):
 
 # 生效条件：verdict（转 str 去空白 lower）属于 {"confirmed","weakened","falsified"} 三态**任一**时**先做索引代际探活重载**（N196：索引缺条目 ≡ 本进程陈旧，不得据以跳过层写闸），随后自索引条目（含 _dirty 未刷条目，口径同 MdCG.get）取该条目 layer 与 sensitivity（缺省回落 DEFAULT_SENSITIVITY）调 protect.require_layer→principal.require_layer_write（N209：三态全覆盖——confirmed/weakened 同样重写被验证节点本体 frontmatter，verify 角色 layers_allow 本就只含 rejected/contextual，tokens.py verify spec forbidden 显式列明「不得改被验证内容」），与 add/add_rejected 同一闸口；随后把 override 原样转 super().verify（受保护节点的 guard_forget 快照留痕在基类 falsified 分支内）。verdict 非法（如空串）时不加闸直接把原值转 super().verify（ValueError 语义由基类维持）；目标节点在重载后索引中仍无条目时同样不加闸（not_found 语义由基类维持，且基类 get 取不到即不写盘）。
     def verify(self, node_id: str, evidence: str, verdict: str,
-               override: bool = False):
+               override: bool = False, superseded_by: str = None):
         v = str(verdict or "").strip().lower()
-        if v in ("confirmed", "weakened", "falsified"):
+        # superseded 同属「对被验证内容的写」（改 fm + 推进 lifecycle），与三态
+        # 共用同一道层写闸；漏进来就会重演 N209 的「零闸分支」形态。
+        if v in ("confirmed", "weakened", "falsified", "superseded"):
             # N196（2026-09-28）：此前直读本进程内存索引且「缺条目 = 放行」——
             # 他进程刚写入并 compact 的节点在本进程索引中不存在时，N130 的
             # 层写闸被整段跳过：verifier（layers_allow=rejected/contextual）
@@ -6768,7 +7011,8 @@ class MdCGSecure(MdCGOS):
                 protect.require_layer(
                     self, node_id, layer=e.get("layer"),
                     sensitivity=e.get("sensitivity"))
-        return super().verify(node_id, evidence, verdict, override=override)
+        return super().verify(node_id, evidence, verdict, override=override,
+                              superseded_by=superseded_by)
 
 # 生效条件：sens 取 sensitivity or DEFAULT_SENSITIVITY，经 _rank(sens) 与 principal.require_write(sens) 后把 m 基于 meta 复制并 setdefault tenant 与 _attributed_session(sens)（写归因三态：env/请求声明→原值；未声明的进程自动随机→unattributed，私有档豁免见该函数）、harness 与 unit 为真值时补入，再强制 m["sensitivity"]=sens，text 经 _seal_content("_recent", text, sens) 后连 tags=tags 一起转 super().remember_event（window 为 None 时不传该参，否则带上 window）。
     def remember_event(self, role: str, text: str, tags=None, meta=None,
@@ -6792,6 +7036,24 @@ class MdCGSecure(MdCGOS):
         # 归因不可辨认；且请求声明对事件面静默失效）；现与节点/入队同一单点
         # 解析——事件面与写面同口径（显式 meta["session"] 仍不可覆盖）。
         m.setdefault("session", self._attributed_session(sens))
+        # issue #712（2026-10-30 验证单元复核发现）：**身份归属此前漏落**——
+        # 同函数里 tenant/session/harness/unit/sensitivity 都从 principal 落值，
+        # 唯独 `actor`（「谁说的」）没落 ⇒ 注入面拿到的 actor 恒为 None，
+        # 「哪些是自己做的、哪些是别人做的」这一要素在库层是空的。
+        # 用 setdefault：调用方显式传 meta["actor"] 时不被覆盖（与上面同款口径）。
+        m.setdefault("actor", self.principal.actor)
+        # 2026-10-30 理论《身份与人格》七要素落地：仅补**归因必需**的三维，
+        # 不给事件加权限快照（clearance/layers_allow/ops_allow 一律不写——权限是
+        # 当前态不是历史事实，固化进事件会造出「假的当时有权」；权限由
+        # sensitivity（数据属性）+ 读取时判据承担）。
+        #   · token_id      = **编号**（同名不同人可区分）
+        #   · identity_role = **职业身份**（干什么；与 role 参数的 user/assistant 不同层，
+        #                     故用不同键名，避免与消息角色混淆）
+        #   · parent        = **汇报线**（有上级时才落）
+        m.setdefault("token_id", getattr(self.principal, "token_id", None))
+        m.setdefault("identity_role", getattr(self.principal, "role", None))
+        if getattr(self.principal, "parent", None):
+            m.setdefault("parent", self.principal.parent)
         if getattr(self.principal, "harness", None):
             m.setdefault("harness", self.principal.harness)
         if getattr(self.principal, "unit", None):

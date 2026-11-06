@@ -251,6 +251,44 @@ def is_dep_sentinel(value) -> bool:
     return False
 
 
+
+# 生效条件：content 中某 CCG 要素行写成「带冒号但冒号后为空」（如 '# 不适用条件：'），
+# 且其后到下一个标题之间**存在非空非标题行**时，返回 [(要素名, 行号), ...]；否则 []。
+def ccg_empty_colon_before_body(content):
+    """检测「带冒号空值 + 换行正文」形态（issue #669 P1 前置守卫）。
+
+    为什么这是坏形态：判定面的两个函数对它的读法**不一致**——
+      · 取值面 ccg_field_value 严格取冒号后同一行 ⇒ 得空串，**不看下一行**；
+      · 剥除面 _strip_ccg_segments 见 rest.strip() 非空（冒号算非空）⇒ 只剥标题行。
+    于是后续列表项全部残留进 body，被 _ban_hit(body, neg) 当断言命中，
+    报成「条件自相矛盾」（实测 self_negation 1.0）。闸门放行的形态判定面吃不了，
+    就该在闸门挡——本判据即那道闸。
+
+    不是「换行即坏」：裸标题（# 不适用条件，无冒号）+ 单行值两个面读法一致，合法。
+    """
+    lines = (content or "").split("\n")
+    bad = []
+    for i, ln in enumerate(lines):
+        hit = None
+        for mark in CCG_MARKS:
+            rest = _ccg_heading_rest(ln, mark)
+            if rest is None:
+                continue
+            if rest.strip() in ("：", ":"):
+                hit = mark
+            break
+        if not hit:
+            continue
+        for nxt in lines[i + 1:]:
+            t = nxt.strip()
+            if not t:
+                continue
+            if t.startswith("#"):
+                break
+            bad.append((hit, i + 1))
+            break
+    return bad
+
 # 生效条件：content 中不存在形如 `# <field_name>` 的标题行 → 返回 None；存在 → 返回该行的值（行内冒号之后的 strip 结果；无冒号则取标题后首个非空非标题行），可为空串；
 def ccg_field_value(content, field_name: str):
     """读取 `# <字段>` 的值（首个命中行；全/半角冒号兼容）。无该行 → None。
@@ -337,9 +375,22 @@ def declares_dependency(content) -> bool:
     return bool(dep_refs(val))
 
 
-# 生效条件：content 为 None 或空串时按源码的 content or "" 回落空串计算，非空时按其原值编码，一律返回 sha256(utf-8) 十六进制摘要的前 12 位（content 的 frontmatter 不计入口径由调用方保证）。
+# 生效条件：content 为 None 或空串时按空串处理（落盘形态即单个换行），非空时先经 normalize_body 补尾换行再编码；一律返回 sha256(utf-8) 十六进制摘要的前 12 位。基准＝正文**落盘形态**（与 dumps 落盘逐字一致），frontmatter 不计入（由调用方保证）。非正文内容（query / 结构化序列化）请直接用 hashlib.sha256——本函数会把「尾换行个数」归一，对非正文是信息损失。
+def normalize_body(content: str) -> str:
+    """正文**落盘形态**的单点规范化（issue #741）——本函数就是从 `dumps()` 抽出的
+    那行尾换行规则。凡在**写盘前**计算 content_hash 的路径（add 内联 /
+    `_write_node` 索引同步 / `_move_layer` 经 `_node_entry`）输入都是未规范化的
+    sealed/正文，不先经它就与「读回正文」（dumps 恒补尾换行）恒差一个字节 ⇒
+    同节点同正文在索引里先后出现两个值（#741 实测 9eb1d121c59f / aaf2ffbbdd36）。
+    `dumps` 与 `content_hash` 都调本函数——规范化规则改动只许发生在这里。
+    """
+    # 严格版（不做 None 兜底）：dumps 走本函数，保持「None 正文 = 调用方错误」的 fail-fast；
+    # content_hash 侧需要 None 兜底，由它自己 `content or ""` 承担。
+    return content if content.endswith("\n") else content + "\n"
+
+
 def content_hash(content: str) -> str:
-    """节点正文的**内容指纹**（sha256 前 12 位）——全仓唯一实现。
+    """节点正文**落盘形态**的内容指纹（sha256 前 12 位）——全仓唯一实现。
 
     两处共用且必须逐位一致，否则对账/变更探测会永远"匹配成功"而失去意义
     （与 `codeindex.region_hash` 同一纪律：两侧各写一份哈希算法，漂移就悄悄失效）：
@@ -351,10 +402,18 @@ def content_hash(content: str) -> str:
     （importance / protected / 生命周期状态 / 时间戳），把它算进去则「内容没变、
     元数据变了」也会判成不匹配，对账会大面积误报 interrupted。
     """
-    return hashlib.sha256((content or "").encode("utf-8")).hexdigest()[:12]
+    # issue #741（2026-11-03）：先经 normalize_body 再哈希——指纹基准 =「落盘形态的
+    # 正文」（恒带尾换行），与重建/读回路径的输入逐位一致。修前调用方各喂各的
+    # 形态（add 内联喂原串、重建喂读回），同一节点同一正文在索引里先后出现两个
+    # 值（实测 9eb1d121c59f / aaf2ffbbdd36），对账恒报 hash_drift 假阳性。
+    # ⇒ 升级注意：存量索引条目（旧口径）首轮对账会报 hash_drift——但 reconcile
+    # 缺省开启、且对 drift 做「以盘面为准」的定向 upsert ⇒ **启动即自愈**；
+    # rebuild_index() 是等价手段（可选，非必须）。空正文的指纹随之改变
+    # （sha("") → sha("换行")），属本次口径变更的显式一面（测试 G8/G9 钉住）。
+    return hashlib.sha256(normalize_body(content or "").encode("utf-8")).hexdigest()[:12]
 
 
-# 生效条件：frontmatter（任意 dict，键按 sorted 输出）与 content（任意 str）均无前置校验即生效；content 不以 "\n" 结尾时补一个换行，返回 "---" + 各键的 "{k}: {json.dumps(v, ensure_ascii=False)}" 行 + "---" 行 + 正文。
+# 生效条件：frontmatter（任意 dict，键按 sorted 输出）与 content（任意 str）均无前置校验即生效；content 经 normalize_body 归一（与 content_hash 同一份规则），返回 "---" + 各键的 "{k}: {json.dumps(v, ensure_ascii=False)}" 行 + "---" 行 + 正文。
 def dumps(frontmatter: dict, content: str) -> str:
     lines = [_DELIM]
     for k in sorted(frontmatter):
@@ -362,7 +421,7 @@ def dumps(frontmatter: dict, content: str) -> str:
         # 一律 JSON 序列化：值内不会出现裸换行，切分才可靠；数字/字符串也保持可读
         lines.append(f"{k}: {json.dumps(v, ensure_ascii=False)}")
     lines.append(_DELIM)
-    body = content if content.endswith("\n") else content + "\n"
+    body = normalize_body(content)   # issue #741：规范化单点（原为手写规则）
     return "\n".join(lines) + "\n" + body
 
 
@@ -722,6 +781,21 @@ FULL_TIME_WINDOW_TEXT = "全时窗（任意时刻成立）"
 #: 旧口径残留行的前缀——「观测位置：X」是单槽冒充，不是生效条件
 LEGACY_POSITION_PREFIX = "观测位置："
 
+#: 条件短语的已知槽标签：**唯一真源**（`MdCG._SLOT_LABELS` 只是本元组的别名）。
+#: 只有这些词出现在冒号**前**时才当分隔符；其余冒号是条件正文的一部分
+#: （比值 `3:1`、时间 `9:00`、URL `http://`）。
+COND_SLOT_LABELS = tuple(label for _key, label in CONDITION_SLOTS)
+
+#: 条件短语匹配面剥掉的**首尾标点**。
+#: 条件常以「：。」收尾，而查询里不会带，故首尾标点不参与比较。
+#: 注意 `'` `"` `!` **刻意不在表内**：它们在条件正文里是**代码字符**
+#: （`''` 空字符串字面量、`!v` 逻辑非），剥掉会把有效 token 吃成空串
+#: 或单字碎片。引号只在「成对包裹整条短语」时才剥，见 `_strip_paired_wrap`。
+COND_EDGE_PUNCT = " \t\u3000，。；：、！？,.;:?（）()【】[]「」《》`·"
+
+#: 成对包裹时才有意义的引号（单独出现是代码字符，不剥）
+COND_PAIRED_WRAP = ("'", '"')
+
 
 # 生效条件：value 为 list/tuple 时用「、」连接各元素 str().strip() 后非空的部分（空元素跳过）；value 为 None 时返回 ""；其余类型返回 str(value).strip()。
 def _as_slot_text(value) -> str:
@@ -825,31 +899,119 @@ def is_legacy_position_condition(text) -> bool:
     return s.startswith(LEGACY_POSITION_PREFIX) and len(s) > len(LEGACY_POSITION_PREFIX)
 
 
-# 生效条件：text 为假值（None/空串）时按空文本处理返回 []；否则按「；/;」拆槽、槽内含「：」或「:」时取首个分隔符之后的内容，再按「，,、/（）()」切短语，丢弃长度 <2、纯数字及命中时间维哨兵关键词的短语并去重后返回 out；
-def cond_terms(text: str) -> list[str]:
-    """生效条件声明 → 匹配短语列表（确定性切分，无语义猜测）。
+# 生效条件：s 为任意字符串；仅当长度≥3、首字符与末字符相同、该字符属 COND_PAIRED_WRAP、且内层首末字符都不是该引号时剥掉首尾这一对，其余原样返回（单侧引号是代码字符不剥；`''` 整体是空字符串字面量，剥了会变空；内层仍以同种引号开头/结尾说明外层不是一对真正包围整条的引号，不剥）。
+def _strip_paired_wrap(s: str) -> str:
+    """成对包裹整条短语的引号才剥；单独出现的引号是代码字符。
 
-    切分规则：按槽分隔「；/;」拆槽（condition_space_text 以「；」连四槽）
-    → 每槽剥「槽标签：」前缀（载体/位置、时间、方法、约束等标签是通用词，
-    参与命中必误判）→ 槽内按「，,、/（）」切短语 → 丢弃长度 <2、纯数字、
-    全时窗哨兵短语（全时窗 = 时间维无信息量，不因其未命中而降级）。
+    三条边界（各自对应一个实测失败）：
+
+    * `''` / `""` 是**空字符串字面量**（长度 2），剥掉首尾会变成空串而丢失
+      ⇒ 要求长度 ≥3；
+    * `'!v'` → `!v` 应当剥（引号确实成对包围整条）；
+    * `''与'!v'` 内层仍是 `'…` 开头 ⇒ 外层不是一对包围整条的引号，**不剥**，
+      否则会把两个相邻的代码字面量粘成一个假短语。
     """
+    if len(s) >= 3 and s[0] == s[-1] and s[0] in COND_PAIRED_WRAP:
+        inner = s[1:-1]
+        if inner and inner[0] != s[0] and inner[-1] != s[0]:
+            return inner
+    return s
+
+
+# 生效条件：text 为假值（None/空串）时按空文本处理，返回 terms 与各计数全为 0 的字典；否则按「；;」拆槽、剥 legacy「观测位置：」与已知槽标签前缀、按「，,、/（）()」切短语、逐段剥首尾标点与成对引号，按 空/纯数字/空值语义哨兵/长度<2/时间维哨兵/重复 六类分流计数，terms 保序去重后返回。
+def condition_terms_diag(text) -> dict:
+    """生效条件声明 → {terms, 各分流计数}（**确定性切分，无语义猜测**）。
+
+    三个细节都是实测出来的，不是设计推演：
+
+    1. 冒号只在已知槽标签前才是分隔符。
+       `condition_space_text()` 的标签是固定四项（`COND_SLOT_LABELS`），而条件正文
+       里的冒号是普通字符（比值 `3:1`、时间 `9:00`、URL `http://`）。旧实现
+       剥「第一个冒号之前的一切」，会把整条条件吃成空串或砍掉前半句。
+    2. 短语首尾标点不参与比较，否则「…按此处置：」带尾冒号永远比不中；
+       但引号只在**成对包裹**时才剥 —— `''` / `!v` 是代码字符，不是标点。
+    3. 各兜底分类**分开计数**，让调用方能区分「没写条件」「写了合法空值声明」
+       与「写了但切不出可用短语」——合并成一个 `short` 会让三者不可归因。
+
+    返回键：`terms` 为匹配短语；`n_empty`（纯标点）/`n_digit`（纯数字）/
+    `n_short`（单字碎片）是**不可用**残段；`n_time_sentinel`（全时窗）与
+    `n_decl_sentinel`（`is_dep_sentinel`，如「无」「不适用」）是**合法空值声明**。
+    """
+    text = str(text or "")
     out, seen = [], set()
-    for slot in re.split(r"[；;]", str(text or "")):
-        if "：" in slot:
-            slot = slot.split("：", 1)[1]
-        elif ":" in slot:
-            slot = slot.split(":", 1)[1]
-        for seg in re.split(r"[，,、/（）()]", slot):
-            seg = seg.strip()
-            if len(seg) < 2 or seg.isdigit():
+    n_empty = n_digit = n_short = n_time_sentinel = n_decl_sentinel = 0
+    if not text.strip():
+        # 空条件不是「写了但切不出」：不能记成 n_empty=1，否则调用方会把
+        # 「没写条件」判成坏条件。
+        return {"terms": out, "n_empty": 0, "n_digit": 0, "n_short": 0,
+                "n_time_sentinel": 0, "n_decl_sentinel": 0}
+    for slot in re.split(r"[；;]", text):
+        s = slot.strip()
+        # legacy 单槽冒充「观测位置：X」：前缀整段剥掉，其余照常切
+        if is_legacy_position_condition(s):
+            s = s[len(LEGACY_POSITION_PREFIX):]
+        m = re.search(r"[：:]", s)
+        if m and s[:m.start()].strip() in COND_SLOT_LABELS:
+            s = s[m.end():]
+        for seg in re.split(r"[，,、/（）()]", s):
+            # 拆出来的**结构性空段**（split 在 `（…）`、`、` 等分隔符处产生的
+            # 空串）不是残段：它一个字符都没有，谈不上「被剥成空」。
+            # 判据是「split 之后、剥边之前就非空」，必须在**剥边之前**判 ——
+            # 剥边后再 `if not seg` 会把两者混为一谈，于是
+            # `时间：全时窗（任意时刻成立）` 这类带括号的合法条件多出 n_empty=1，
+            # 进而 unusable>0，把本应豁免的时间维哨兵误判成 DEFER。
+            if not seg:
+                continue
+            # 剥边要**两轮**，顺序是「标点 → 引号 → 标点」。
+            # 一轮不够，因为引号包裹里常带尾标点：`"key":` 先剥冒号得 `"key"`、
+            # 再剥引号才回到 `key`（与旧实现一致）；只做一轮会得到 `"key"`，
+            # 把匹配面**收窄**了。反过来先剥引号则 `'拒绝访问。'` 会留住内层句号。
+            # 两轮之后 `''`（长度 2，不够成对剥）与 `'!v'`→`!v` 仍照旧救回。
+            for _ in range(2):
+                seg = seg.strip(COND_EDGE_PUNCT)
+                seg = _strip_paired_wrap(seg)
+            seg = seg.strip(COND_EDGE_PUNCT)
+            if not seg:
+                n_empty += 1
+                continue
+            if seg.isdigit():
+                n_digit += 1
+                continue
+            # 单字的空值语义哨兵（「无」「-」「—」）是**合法声明**，必须在长度
+            # 过滤**之前**判：「无」只有 1 字，若先过 len<2 就会被记成碎片，
+            # 永远救不回。多字的哨兵（「无依赖」「不适用」）**不在此列**——
+            # 它们本来就能通过长度过滤、一直作为可匹配短语存在，这里收窄口径
+            # 以免一次「修救援」把既有行为改掉。
+            if len(seg) < 2 and is_dep_sentinel(seg):
+                n_decl_sentinel += 1
+                continue
+            if len(seg) < 2:
+                n_short += 1
                 continue
             if "全时窗" in seg or "任意时刻" in seg:
+                n_time_sentinel += 1
                 continue
             if seg not in seen:
                 seen.add(seg)
                 out.append(seg)
-    return out
+    return {"terms": out, "n_empty": n_empty, "n_digit": n_digit,
+            "n_short": n_short, "n_time_sentinel": n_time_sentinel,
+            "n_decl_sentinel": n_decl_sentinel}
+
+
+# 生效条件：text 为假值（None/空串）时返回 []；否则返回 condition_terms_diag 的 terms 字段（切分与过滤规则见该函数）。
+def cond_terms(text: str) -> list[str]:
+    """生效条件声明 → 匹配短语列表（确定性切分，无语义猜测）。
+
+    切分规则：按槽分隔「；/;」拆槽（condition_space_text 以「；」连四槽）
+    → 剥 legacy「观测位置：」与「槽标签：」前缀（标签是通用词，参与命中必误判）
+    → 槽内按「，,、/（）」切短语 → 剥首尾标点（引号仅成对剥）→ 丢弃空/纯数字/
+    空值语义哨兵/长度<2/全时窗哨兵短语（全时窗 = 时间维无信息量，不因其未命中而降级）。
+
+    **本函数是条件短语切分的唯一真源**：`MdCG._cond_terms` / `_cond_terms_diag`
+    都只是它的别名，禁止在别处再写一份切分。
+    """
+    return condition_terms_diag(text)["terms"]
 
 
 # ---- §5.1 六要素的**索引角色**：那张表从 4 行长成 6 行（P2-1）------------------

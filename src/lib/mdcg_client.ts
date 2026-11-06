@@ -44,6 +44,7 @@ import { pythonPathValue, runRoot } from './datapath.js'
 // 用同一函数算出租户——N62 之后服务端对「令牌记录租户 ≠ 入参租户」fail-closed，
 // 两侧各算一遍就必然分叉（签发按 default、运行按 work ⇒ rc=3 拒启）。
 import { effectiveTenant } from './token_store.js'
+import { stripLoneSurrogates, truncateSafe } from './prompt_safety.js'   // issue #762
 
 /** md_cg 子进程与根目录配置。 */
 export interface MdcgOptions {
@@ -348,8 +349,11 @@ export class MdcgClient {
    *  `max(1, recent_limit or 10)` 归一（`mdcos.py:3309`）。
    *
    *  ⚠️ 两条服务端事实（决定注入侧的可达性，勿据本方法名臆测）：
-   *   ① `recent` 段取 `recent_events(limit=recent_limit)` —— **不按 session
-   *      过滤**（近期事件是运行态滚动窗口，会话归属只写在每条事件的 meta 里）；
+   *   ① `recent` 段在 `session` 为真值时由服务端**严格按会话过滤**（`meta.session`
+   *      精确相等；缺 `meta.session` 的事件被丢弃——最坏空窗口，杜绝错块）；
+   *      `session` 显式传 `'*'` 时不过滤（跨会话汇总的合法用法）；仅当 `session`
+   *      为 falsy 时才退回全局窗口，并在 `pack.degraded` 追加
+   *      `recent_global_window`（注入侧据此 fail-closed，见 src/hooks.ts）。
    *   ② budget 是**整包**预算：库内 notes/tasks/self_state 占位越多，同样
    *      budget 下 recent 段被裁得越短（实测：空库 + 10 条窗口条目，
    *      budget_tokens=600 → recent 8 条；1200 → 10 条）。
@@ -422,7 +426,7 @@ export class MdcgClient {
     if (best && best.score > 0 && STRONG_BASIS.has(best.basis)) {
       return {
         judgment: `采纳：认知图已有强依据节点 ${best.id}（basis=${best.basis}）`,
-        best: best.content.slice(0, 200),
+        best: truncateSafe(stripLoneSurrogates(best.content), 200),   // issue #762
         d_norm: Math.min(1, best.score),
         record_id: best.id,
       }
@@ -430,7 +434,7 @@ export class MdcgClient {
     if (best && best.score > 0) {
       return {
         judgment: `待定：命中节点 ${best.id} 但依据不足（basis=${best.basis || 'unknown'}）`,
-        best: best.content.slice(0, 200),
+        best: truncateSafe(stripLoneSurrogates(best.content), 200),   // issue #762
         d_norm: -1,
         record_id: best.id,
       }

@@ -72,7 +72,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { MdcgClient } from './lib/mdcg_client.js'
-import { escapePromptBraces, renderUntrustedMemoryBlock } from './lib/prompt_safety.js'
+import { escapePromptBraces, renderUntrustedMemoryBlock, stripLoneSurrogates, truncateSafe } from './lib/prompt_safety.js'
 import { HookAuditRecorder, kindOf, type HookWriteRole } from './lib/hook_audit.js'
 // 运行期会话状态单点（B 治本批）：观测在 hooks 面，写归因注入在工具面
 // （src/tools.ts）——两处共用同一状态，见 lib/session_state.ts 头注。
@@ -108,6 +108,28 @@ export interface MemoryHooksOptions {
   autoRecallIdentity?: boolean
   /** 自动记忆脱敏：写入前过滤敏感信息（密钥/密码/令牌/身份证/手机号，默认 true）。 */
   desensitize: boolean
+  /** issue #695：**会话级排除**（默认空数组）。命中列表的会话不写知识面（也不计逢十轮）。
+   *
+   *  为什么需要：外部桥接经 `sessions.prompt()` 注入的控制提示在 DSH 里同样是
+   *  `source.kind='user'`（实测**也带 rpcId**，见 issue 内两组独立读数）——宿主当前不提供
+   *  可信来源字段，任何「凭事件形状判真人」的闸都会被这条链路证伪。故本仓给的是
+   *  **按会话显式排除**的诚实兜底（opt-in，缺省关，既有行为不变）。
+   *
+   *  条目语义：精确匹配；以 `*` 结尾时按前缀匹配（如 `sess_bridge_*`）。
+   */
+  excludeSessions?: string[]
+  /** issue #730：自动写入的记忆标 `sensitivity: private`（默认 false）。
+   *
+   *  开启后服务端 `_readable` 按 `frontmatter.session` 只让归属会话读到，
+   *  实现「读各归各」（既有密级机制，无新参数/as_session/Rust 改动）。
+   *  缺省关：跨会话连续性是既有默认行为（#749 的跨会话召回仍是待定产品决策）。
+   */
+  sessionPrivate?: boolean
+  /** issue #677（@1）：自动记忆写入带 `dedupe`（默认 true）——同层同内容复用既有节点，
+   *  超时重试不再新增；代价是同一会话内同一条消息重复出现只保留一个节点。
+   *  设 false 回逐位旧行为（同内容各写一条）。
+   */
+  dedupe?: boolean
   /** 落盘审计文件路径（issue #56，诊断面：哪些消息被设计滤除、source.kind 分布、
    *  写入/跳过计数）。缺省 `~/.dsh/logs/dsh-memory-hook-audit.json`（与桥探针 /
    *  apply 探针同目录同惯例），供测试与定制注入；审计自身失败静默降级，
@@ -449,11 +471,13 @@ export function formatTimelineDecayed(payload: unknown, opts?: { includeIdentity
     // 的信号——注入面照常成立（与 #354 P1-14 的诚实边界一致：保证的是「原文不出现」，
     // 不是「不注入」）。
     const safe = redactKeepPlaceholders(preview)
-    out.push(`- [${layer}] ` + (safe.length > budget ? safe.slice(0, budget) + '…' : safe))
+    // issue #762：预算落在 emoji 中间时 `slice` 会劈出孤立代理（宿主 JSON.stringify
+    // 产出 "\ud83d" ⇒ 整条请求 400、会话永久废）。改走码元安全截断（不拆代理对）。
+    out.push(`- [${layer}] ` + (safe.length > budget ? truncateSafe(safe, budget) + '…' : safe))
     rank += 1
     if (out.join('\n').length >= RECALL_MAX_CHARS) break
   }
-  return out.join('\n').slice(0, RECALL_MAX_CHARS)
+  return truncateSafe(out.join('\n'), RECALL_MAX_CHARS)   // issue #762：拼完再切也不劈代理对
 }
 
 /** 身份锚点块（issue #635）：只取永久层（self/anchor），独立预算。 */
@@ -473,11 +497,11 @@ export function renderIdentityAnchors(payload: unknown): string {
     const preview = String(it['preview'] ?? '').replace(/\s+/g, ' ').trim()
     if (!preview) continue
     const safe = redactKeepPlaceholders(preview)
-    out.push('  - [' + layer + '] ' + (safe.length > IDENTITY_ITEM_CHARS ? safe.slice(0, IDENTITY_ITEM_CHARS) + '…' : safe))
+    out.push('  - [' + layer + '] ' + (safe.length > IDENTITY_ITEM_CHARS ? truncateSafe(safe, IDENTITY_ITEM_CHARS) + '…' : safe))
     if (out.length >= IDENTITY_MAX_ITEMS) break
     if (out.join('\n').length >= IDENTITY_MAX_CHARS) break
   }
-  return out.join('\n').slice(0, IDENTITY_MAX_CHARS)
+  return truncateSafe(out.join('\n'), IDENTITY_MAX_CHARS)   // issue #762
 }
 
 // ---------------------------------------------------------------- 会话窗口渲染
@@ -493,8 +517,12 @@ export function renderIdentityAnchors(payload: unknown): string {
 const WINDOW_BUDGET_TOKENS = 600
 /** 单条窗口条目预览上限（字符）。 */
 const WINDOW_ITEM_CHARS = 120
-/** 窗口块总长上限（字符）。 */
-const WINDOW_MAX_CHARS = 800
+/** 窗口块总长上限（字符）。
+ *
+ *  issue #712（2026-10-30）：归因前缀（`[MM-DD HH:mm|会话|密级] `，约 20 字符/行）
+ *  会占预算，故由 800 上调到 **900**（10 行 × 20 = 200，实测内容量持平）。
+ *  该块定位仍是「存在性锚点 / 接续提示」——宁可少注入几条，不挤占宿主上下文。 */
+const WINDOW_MAX_CHARS = 900
 /** 单条窗口条目的 role 字段上限（字符，issue #354 [P1-12]）。
  *
  *  缺陷：`text` 有 120 字上限，`role` 却**完全不限长**——一条 3000 字的恶意
@@ -515,7 +543,18 @@ const WINDOW_ROLE_CHARS = 32
  *
  *  空载荷 / 无 recent 段 / 全空条目 → 返回空串（调用方据此**不 push** 第二块）。 */
 // issue #563：同上，导出仅为可测。
-export function formatSessionWindow(payload: unknown, limit: number): string {
+export interface SessionWindowOptions {
+  /** 当前会话 id；提供时用于标注「本会话」还是「其他会话」（不用于过滤——
+   *  过滤由服务端 `session_recall` 按 `meta.session` 完成，前端再滤一次
+   *  会与服务端判据分裂成两份，本仓已多次栽在这上面）。 */
+  session?: string
+  /** 是否渲染归因前缀（默认 true）。设 false 可得旧格式（仅测试/回退用）。 */
+  attribution?: boolean
+}
+
+export function formatSessionWindow(
+  payload: unknown, limit: number, opts: SessionWindowOptions = {},
+): string {
   const items = (payload && typeof payload === 'object'
     && Array.isArray((payload as { recent?: unknown }).recent))
     ? (payload as { recent: Array<Record<string, unknown>> }).recent
@@ -523,19 +562,57 @@ export function formatSessionWindow(payload: unknown, limit: number): string {
   const rows: string[] = []
   const max = Math.max(1, Math.floor(limit) || 10)
   let used = 0
+  const curSid = String(opts.session ?? '').trim()
+  const wantAttr = opts.attribution !== false
+  // issue #712（2026-10-30）：归因前缀——让模型能区分「本会话/其他会话」「私有/共有」
+  // 「刚刚/过去」。库层与注入面已带齐四要素（md_cg/mdcos.py 的 recent 段），此处负责
+  // **渲染出来**；不渲染等于模型永远看不到，等于没做（这正是 PR #712 的原病灶）。
+  // ⚠️ 本改动**变更输出格式**（BREAKING）：原 `[role] text` → `[MM-DD HH:mm|会话|密级] [role] text`。
+  // 前缀会占预算，故 WINDOW_MAX_CHARS 同步上调（见该常量注释）。
+  const stamp = (t: unknown): string => {
+    const n = Number(t)
+    if (!Number.isFinite(n) || n <= 0) return '??-?? ??:??'
+    const d = new Date(n * 1000)
+    const p = (x: number): string => String(x).padStart(2, '0')
+    return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+  }
+  const sessTag = (s: unknown): string => {
+    const v = String(s ?? '').trim()
+    if (!v) return '?'
+    if (curSid && v === curSid) return '本'
+    // issue #762：**负索引** `slice(-4)` 从尾部切，起点可能正好落在低位代理上（半个
+    // 字符）。先清孤立代理，再在必要时向前扩一个码元，保证不从中劈开。
+    const clean = stripLoneSurrogates(v)
+    let st = Math.max(0, clean.length - 4)
+    if (st > 0) {
+      const c0 = clean.charCodeAt(st)
+      const c1 = clean.charCodeAt(st - 1)
+      if (c0 >= 0xdc00 && c0 <= 0xdfff && c1 >= 0xd800 && c1 <= 0xdbff) st -= 1
+    }
+    return `会话${clean.slice(st)}`
+  }
+  const sensTag = (s: unknown): string => {
+    const v = String(s ?? '').trim().toLowerCase()
+    if (v === 'private' || v === 'secret') return '私'
+    if (v === 'public' || v === 'internal' || v === 'restricted') return '共'
+    return '?'
+  }
   for (const it of items.slice(0, max)) {
     // issue #354 [P1-12]：role 与 text 同受单条上限约束——只限 text 时一条超长
     // role 就能让首行突破整块预算并把后续历史全部挤出（首行 used===0 绕过了
     // 下方总预算判据）。role 截断后再判空，仍为空则回落 'user'。
-    const role = String(it['role'] ?? '').trim().slice(0, WINDOW_ROLE_CHARS) || 'user'
+    const role = truncateSafe(String(it['role'] ?? '').trim(), WINDOW_ROLE_CHARS) || 'user'   // issue #762
     const preview = String(it['text'] ?? '').replace(/\s+/g, ' ').trim()
     if (!preview) continue
     // issue #563 ①：同上——窗口块每行也**先脱敏、后截断**，否则截断残片绕过注入侧脱敏。
     const safe = redactKeepPlaceholders(preview)
     const body = safe.length > WINDOW_ITEM_CHARS
-      ? safe.slice(0, WINDOW_ITEM_CHARS) + '…'
+      ? truncateSafe(safe, WINDOW_ITEM_CHARS) + '…'   // issue #762
       : safe
-    const row = `[${role}] ${body}`
+    const attr = wantAttr
+      ? `[${stamp(it['t'])}|${sessTag(it['session'])}|${sensTag(it['sensitivity'])}] `
+      : ''
+    const row = `${attr}[${role}] ${body}`
     const next = used === 0 ? row.length : used + 1 + row.length
     // issue #354 [P1-12]：单条超预算时不再「首条整放」——超过 WINDOW_MAX_CHARS 的
     // 行一律不放（截断 body 已在上面做完，理论上不可达，作 fail-closed 兜底）。
@@ -614,6 +691,24 @@ function isSubagentSession(session: unknown): boolean {
  *  ① 不把委派判定押在 `source.kind` 单点上、② 覆盖「生产者把中继标成
  *  `kind='user'` 且带 form」这一类型面之外的形态——子会话的**首轮用户提示**就可能
  *  是这种：它与真人输入在 `kind` 上不可分，只有会话级判据（或这里的 form）能拦。 */
+/** issue #695：会话是否在 `memory.excludeSessions` 里（精确 / `*` 后缀前缀匹配）。
+ *  形态不符（非数组 / 非字符串项）一律忽略——不因配置写错就静默关掉真人记忆。 */
+function isExcludedSession(sid: string, list: unknown): boolean {
+  if (!sid || !Array.isArray(list)) return false
+  for (const raw of list) {
+    if (typeof raw !== 'string' || !raw) continue
+    if (raw === '*') continue          // 裸 * 会关闭全部会话 ⇒ 忽略（安装时已 warn）
+    if (raw.endsWith('*')) {
+      const prefix = raw.slice(0, -1)
+      if (!prefix) continue            // 防御：空前缀不匹配任何人
+      if (sid.startsWith(prefix)) return true
+    } else if (sid === raw) {
+      return true
+    }
+  }
+  return false
+}
+
 function isRelayedMessage(source: unknown): boolean {
   const s = source as { form?: unknown } | null | undefined
   return !!s && typeof s === 'object' && s.form === 'relay'
@@ -636,6 +731,16 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
    *  「写入失败/漏记」。审计失败静默降级（见 src/lib/hook_audit.ts），
    *  绝不冒泡进记忆路径、不改任何写入/过滤判定。 */
   const audit = new HookAuditRecorder(opts.auditPath)
+  // issue #695：配置自检（不静默）——裸 `*` 与中缀 `*` 都不会按预期工作，启动即告警。
+  if (Array.isArray(opts.excludeSessions)) {
+    for (const raw of opts.excludeSessions) {
+      if (raw === '*') {
+        ctx.logger.warn('dsh-memory: excludeSessions 含裸 "*"（会关闭全部会话的知识面记忆），已忽略；如需全关请用 userMessage=false')
+      } else if (typeof raw === 'string' && raw.includes('*') && !raw.endsWith('*')) {
+        ctx.logger.warn(`dsh-memory: excludeSessions 条目 "${raw}" 的 * 不在结尾，按精确匹配处理（不会命中任何会话）`)
+      }
+    }
+  }
 
   // ── 短期会话窗口（contextWindow）：与知识面写入**独立成轨**（见文件头）──
   // 缺省开启（{ enabled: true, turns: 10 }）；enabled=false → 写侧与注入侧
@@ -711,6 +816,7 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
    *  **逐位等价**（差异窗口「本实例未观测 ∧ 模块单点非空」单实例下不可达；
    *  HMR 重载时新实例回落 '' 属更保守行为）。 */
   let observedSession = false
+  let warnedEmptySid = false
 
   /** 记忆沉淀（fire-and-forget）。认知图未就绪则跳过并告警（不退回 AEIS）。
    *  `role`=null 表示**读预热**（user-recall）——审计只统计写入路径，
@@ -777,13 +883,19 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
   /** 待推送提醒（session → 文本）：用户回合计数命中时写入，assemble 时只消费一次；
    *  不做 sticky 重推（那是提醒常驻的直接原因）。 */
   const pendingReminder = new Map<string, string>()
-  /** 提醒间隔：false → 0（关闭）；数字 → clamp 1..100；未设 → 10。 */
+  /** issue #695：已记过「本会话被排除」日志的会话（避免每条消息刷一条）。 */
+  const excludedLogged = new Set<string>()
+  /** 提醒间隔：false 或 **<= 0 → 0（关闭）**；数字 → clamp 1..100；未设/非有限 → 10。
+   *  issue #659 F26-21：旧实现把 0 钳成 1（每轮提醒一次），与「0 = 关」的直觉相反；
+   *  负数同样落 0（关），而不是变成 1。非有限（NaN/Infinity）仍回落默认 10。 */
   const reminderInterval = (() => {
     const cfg = opts.turnReminder
     if (cfg === false) return 0
-    const n = typeof cfg === 'number' ? cfg : 10
-    if (!Number.isFinite(n)) return 10
-    return Math.max(1, Math.min(100, Math.floor(n)))
+    if (typeof cfg !== 'number') return 10
+    if (!Number.isFinite(cfg)) return 10
+    const n = Math.floor(cfg)
+    if (n <= 0) return 0                  // 0 / 负数 = 关闭（#659 F26-21）
+    return Math.min(100, n)
   })()
   {
     // 本 handler **恒定注册**（#657）：提醒是独立配置（memory.turnReminder），
@@ -796,12 +908,21 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
         const hostCtx = (_ctx as unknown) as { agent?: { session?: unknown } } | undefined
         const sid = sessionIdOf(hostCtx?.agent?.session)
           || (observedSession ? currentSession() : '')
+        // 会话 id 为空时后端会退回全局滚动窗口（跨会话串台）。只告警一次，
+        // 避免每个 assemble step 刷日志；不改注入内容或数据路径。
+        if (!sid && !warnedEmptySid) {
+          warnedEmptySid = true
+          ctx.logger.warn('dsh-memory: 会话 id 为空，短期窗口可能退回全局滚动窗口（跨会话串台）；请检查 host.agent.session 或会话观测是否可用')
+        }
         // 逢十轮提醒的消费面（#657）：不受 autoRecall 门控。
         if (sid) {
           const pending = pendingReminder.get(sid)
           if (pending) {
             pendingReminder.delete(sid)
             assembly.contexts.push({ name: 'lingshu:turn-reminder', text: pending })
+            // issue #659 F26-24：消费点留一条日志（旧实现完全静默——「提醒到底有没有
+            // 注入过」只能靠翻上下文猜）。
+            ctx.logger.info('dsh-memory: 逢十轮提醒已注入（消费一次，不重推）')
           }
         }
         if (opts.autoRecall && graph.isReady()) {
@@ -818,18 +939,29 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
           // 用户回合上，这里只消费一次待推文本。旧实现把 assemble 当轮次 + 段内永久重推
           // ⇒ 提醒几乎常驻、agent 反复空转归档；sid 缺失时还回落共用键 __no_sid__，
           // 并行会话互相污染频率。现改为：无 sid 不提醒；提醒只在本回合第一次 assemble 出现。
-          if (sid) {
-            const pending = pendingReminder.get(sid)
-            if (pending) {
-              pendingReminder.delete(sid)
-              assembly.contexts.push({ name: 'lingshu:turn-reminder', text: pending })
-            }
-          }
+          // （提醒消费已在门控外做掉，见上；此处不再重复——重复块是 #657 修复的残留。）
           // 非永久层 → 既有「最近记忆」块；self/anchor → 独立「身份锚点」块（独立预算）。
           const identityOn = opts.autoRecallIdentity === true
           const timelinePayload = await graph.timeline(
-            identityOn ? recallLimit + IDENTITY_MAX_ITEMS : recallLimit,
+            recallLimit,
             sid ? { session: sid } : {})
+          // issue #715（2026-10-30 外部报告，逐行复现）：**身份块必须单独取数**。
+          //
+          // 病灶：此前身份块复用上面这份**带会话过滤**的 payload（还把 limit 加 3 试图
+          // 「多取 3 条」），但 `self`/`anchor` 节点的 `session` **恒为 `unattributed`**
+          // ——身份锚点在语义上就注定跨会话（`identity` 写入不带 session_id 时即如此，
+          // 状态卡与关系节点同理）。两者叠加 ⇒ 永久层被会话过滤全部滤掉 ⇒
+          // `renderIdentityAnchors` 拿到空集 ⇒ **块从不出现且无任何报错**（静默失效）。
+          //
+          // 这正是《身份与人格》理论的 R3：**人格的可见性不该由会话决定**。
+          // 用会话过滤去筛人格节点是**类别错误**，不是参数没调好。
+          //
+          // 故身份块改为**不带会话过滤**取数（不传 session ⇒ 跨会话视图），
+          // 再由 `renderIdentityAnchors` 只挑 self/anchor（其余层照样被它跳过）。
+          // 「最近记忆」块保持会话隔离不变——那是工作记忆，本就该跟会话走。
+          const identityPayload = identityOn
+            ? await graph.timeline(IDENTITY_MAX_ITEMS * 3, {})
+            : null
           const text = formatTimelineDecayed(timelinePayload)
           if (text) {
             // 注入边界转义（issue #16）：宿主 system-prompt 对 context 文本做严格
@@ -854,7 +986,7 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
             // 注入**，内容是前缀 + `[已过滤:密钥]`。真正的保证是**凭据原文不出现在上下文**
             // （一定被替换成占位），而不是「不注入」；`if (recallBody)` 只是兜底，
             // 覆盖渲染文本本身即纯凭据（无前缀）的形态。
-            const recallBody = desensitize(text.slice(0, RECALL_MAX_CHARS))
+            const recallBody = desensitize(truncateSafe(text, RECALL_MAX_CHARS))   // issue #762
             if (recallBody) {
               assembly.contexts.push({
                 name: 'lingshu:auto-recall',
@@ -865,13 +997,21 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
           }
           if (identityOn) {
             try {
-              const idText = renderIdentityAnchors(timelinePayload)
+              // issue #715：用**独立取数**的 payload（不带会话过滤），不再复用已滤会话的那份。
+              const idText = renderIdentityAnchors(identityPayload)
               if (idText) {
                 assembly.contexts.push({
                   name: 'lingshu:identity-anchor',
                   text: escapePromptBraces(renderUntrustedMemoryBlock(
                     '【灵枢身份锚点】（self/anchor 层，独立预算）\n' + idText)),
                 })
+              } else {
+                // issue #715（静默失效）：此前「开关开了但块从不出现」与「库里确实没有
+                // self/anchor 节点」**完全不可分辨**——catch 不触发（没抛错），也没有任何
+                // 提示。开着的功能不生效却无声，比报错更难查。故此处显式留痕。
+                ctx.logger.info(
+                  'dsh-memory: autoRecallIdentity 已开启但无可注入的身份节点'
+                  + '（self/anchor 层为空——请用 cg(op=identity, action=anchor) 建立锚点）')
               }
             } catch (err) {
               // issue #128 同款纪律：fail-soft 但不静默——空 catch 会被
@@ -891,20 +1031,36 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
           if (cwEnabled) {
             try {
               const win = await graph.sessionRecall(sid, cwTurns, WINDOW_BUDGET_TOKENS)
-              const winText = formatSessionWindow(win, cwTurns)
-              if (winText) {
-                // 注入边界同规（文件头硬约束）：不可信内容边界 + `{{` 转义，
-                // 都只改注入副本——窗口原文在库内保真。
-                // issue #354 [P1-14] 同族：窗口块也是注入面，同样过脱敏（理由与
-                // 诚实边界见上方 auto-recall 块）——渲染文本自带 `[role] ` 前缀，
-                // 故「整条皆凭据」时该块仍会注入，但凭据原文一定被替换成占位。
-                const winSafe = desensitize(winText)
-                if (winSafe) {
-                  assembly.contexts.push({
-                    name: 'lingshu:session-window',
-                    text: escapePromptBraces(renderUntrustedMemoryBlock(
-                      `【本会话近期对话】\n${winSafe}`)),
-                  })
+              // issue #712：sid 交服务端**按会话取数**（真值时严格过滤）与行内归因；
+              // 前端不再二次过滤（两份判据会分裂，本仓已多次栽在这上面）。
+              // 2026-11-01 实测补充：服务端在**会话标识缺失**时会把 recent 段降级为
+              // **全局窗口**，并在 payload.degraded 标注 'recent_global_window'
+              // （md_cg/mdcos.py 的 session_recall）。本块语义是「本会话近期对话」——
+              // 降级时原样注入等于用块标题误导模型（多窗口下会把其他会话/历史条目
+              // 当成本会话输入；本仓 #65 同族事故的注入面残口）。fail-closed：降级时
+              // 不注入本块（timeline 块不受影响），并显式留痕——宁可少注入，不错块。
+              const winDegraded: unknown[] = Array.isArray((win as { degraded?: unknown })?.degraded)
+                ? (win as { degraded: unknown[] }).degraded
+                : []
+              if (winDegraded.some((d) => String(d) === 'recent_global_window')) {
+                ctx.logger.warn('dsh-memory: 会话窗口取数已降级为全局窗口（缺会话标识），'
+                  + '为避免跨会话注入已跳过本会话窗口块')
+              } else {
+                const winText = formatSessionWindow(win, cwTurns, { session: sid })
+                if (winText) {
+                  // 注入边界同规（文件头硬约束）：不可信内容边界 + `{{` 转义，
+                  // 都只改注入副本——窗口原文在库内保真。
+                  // issue #354 [P1-14] 同族：窗口块也是注入面，同样过脱敏（理由与
+                  // 诚实边界见上方 auto-recall 块）——渲染文本自带 `[role] ` 前缀，
+                  // 故「整条皆凭据」时该块仍会注入，但凭据原文一定被替换成占位。
+                  const winSafe = desensitize(winText)
+                  if (winSafe) {
+                    assembly.contexts.push({
+                      name: 'lingshu:session-window',
+                      text: escapePromptBraces(renderUntrustedMemoryBlock(
+                        `【本会话近期对话】\n${winSafe}`)),
+                    })
+                  }
                 }
               }
             } catch (err) {
@@ -947,22 +1103,63 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
       noteSession(sid)
       observedSession = true
     }
-    const sessionTag = sid ? { session: sid } : { session: UNASSIGNED_SESSION }
+    // 「有归属会话」判据单点（#730 复核）：`sid` 非空**且不等于占位哨兵**——
+    // 宿主若把 `unassigned` 当 id 传进来，旧写法会「标 private + 归属=哨兵」⇒ 写丢。
+    const sidOwned = !!sid && sid !== UNASSIGNED_SESSION
+    const sessionTag = sidOwned ? { session: sid } : { session: UNASSIGNED_SESSION }
+    // issue #730：会话记忆标 private（opt-in）——服务端 `_readable` 按 session 过滤；
+    // 无归属时不加 private（private 无归属 ⇒ 仅设计者可见，等于写丢）。
+    const sessionPrivacy = (opts.sessionPrivate && sidOwned) ? { sensitivity: 'private' } : {}
+    // issue #677（@1）：自动记忆默认带 dedupe——超时重试幂等（#776 的服务端闸）。
+    // 关掉即回逐位旧行为（同内容各写一条）；见 index.ts 的 memory.dedupe 注释。
+    const dedupeWrite = (opts.dedupe === false) ? {} : { dedupe: true }
+    // issue #695：**会话级排除**（opt-in）。外部桥接的控制提示与真人输入在事件形状上
+    // 不可区分（同 kind=user、同带 rpcId），故按会话显式排除。**只门控知识面轨**
+    // （三类 remember + 语义召回 + 逢十轮计数）；窗口写侧（windowEntry/noteRecent）
+    // 照常——它是运行态、不进检索正排（见 docs/ops「自动记忆的会话级排除」）。
+    const excludedSession = !!sid && Array.isArray(opts.excludeSessions)
+      && isExcludedSession(sid, opts.excludeSessions)
+    if (excludedSession && (event.type === 'user/message'
+        || event.type === 'assistant/message' || event.type === 'tool/result')) {
+      // 只有 user/message 带 source.kind；assistant/tool 只记 reason（不留痕反而是缺口）。
+      const excludedKind = event.type === 'user/message' ? kindOf(event.data.source) : undefined
+      audit.filtered('session_excluded', excludedKind)
+      if (event.type === 'user/message' && !excludedLogged.has(sid)) {
+        excludedLogged.add(sid)
+        ctx.logger.info(`dsh-memory: 会话 ${sid} 在 memory.excludeSessions 中，知识面记忆已跳过（issue #695）`)
+      }
+    }
     // 逢十轮提醒的**计轮点**（#645/#658）：真实用户回合 = 用户消息条数。
     // 位置在 opts.userMessage 之外——那个开关是「消息不自动进知识面」的正当决策，
     // 与「提醒还该不该跑」是两件事；旧实现把计轮塞在它里面，关知识面会连带静默杀死提醒。
     if (event.type === 'user/message' && event.data.source?.kind === 'user'
-        && !isRelayedMessage(event.data.source) && sid && reminderInterval > 0) {
+        && !isRelayedMessage(event.data.source) && sid && !excludedSession
+        && reminderInterval > 0) {
       const n = (userTurns.get(sid) ?? 0) + 1
       userTurns.set(sid, n)
       if (shouldRemindTurn(n, reminderInterval)) {
-        pendingReminder.set(sid, escapePromptBraces(formatTurnReminder(n)))
+        // issue #659 F26-24：**不覆盖未消费**的提醒。旧实现直接 set：n=20 覆盖 n=10，
+        // 若 n=10 那条还没被某个 assemble 取走，就永久丢失（用户只看到「20 轮」一次）。
+        // 现在保留最早一条（它承载的「该归档了」语义更强），并在已有待推时记一条日志。
+        const existed = pendingReminder.get(sid)
+        if (existed) {
+          ctx.logger.info('dsh-memory: 逢十轮提醒已有待推条目（保留最早一条，丢弃本轮重复）')
+        } else {
+          // issue #762：turn-reminder 是唯一不经 renderUntrustedMemoryBlock 的模型可见文本，
+          // 当前文案是常量 + 数字（无孤代理来源），仍过一道 strip 作防御（将来插入外部数据时不漏）。
+          pendingReminder.set(sid, escapePromptBraces(stripLoneSurrogates(formatTurnReminder(n))))
+        }
       }
     }
-    if (event.type === 'user/message' && opts.userMessage) {
+    if (event.type === 'user/message' && opts.userMessage && !excludedSession) {
       // 落盘审计（issue #56）：source.kind 分布——先于两级判据记录**完整**输入分布
       // （含被滤与放行），「宿主到底给这条消息标了什么 kind」是排障第一问。
       audit.observeKind(kindOf(event.data.source))
+      // issue #695 诊断面：记录 source 的**键名集合**（不含任何值）。
+      // kind 只说「以什么形式提交」，键名集合才能回答「source 带哪些字段」——
+      // 外部桥接经 sessions.prompt() 注入的控制提示同样走 kind="user"，
+      // 靠这一维才有可核验的盘面读数（绝不记内容）。
+      audit.observeSourceShape(event.data.source)
       // H1 **消息级**判据：委派/中继消息（`form: 'relay'` 语义＝「另一个 agent
       // 发给本 agent 的消息」）不写。先于 kind 判据，理由见 isRelayedMessage 注释。
       if (isRelayedMessage(event.data.source)) {
@@ -985,7 +1182,7 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
       memorize('user', 'user', (g) => g.remember(safe, {
         condition_space: condSpace('user'),
         role: 'user', tags: ['dsh', 'user'], importance: opts.importance,
-        ...sessionTag,
+        ...sessionTag, ...sessionPrivacy, ...dedupeWrite,
       }))
       // T4：用用户消息做一次语义召回——md_cg 的读取会记 access log（复用观测，
       // 供 importance / scrub 陈旧度使用），同时预热检索路径。
@@ -1000,7 +1197,7 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
       // 带上它不构成越权：cg 读路径的 session 是**归因/视图**维度，不参与任何授权
       // （issue #35 定稿「身份不可自报」，见 md_cg/mdcos.py 的 _candidates）。
       memorize('user-recall', null, (g) => g.read(safe.slice(0, 200), { k: 3, ...sessionTag }))
-    } else if (event.type === 'assistant/message' && opts.assistantMessage) {
+    } else if (event.type === 'assistant/message' && opts.assistantMessage && !excludedSession) {
       const text = extractText(event.data.message.content)
       if (!text) return
       const safe = sanitize(text)
@@ -1008,9 +1205,9 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
       memorize('assistant', 'assistant', (g) => g.remember(safe, {
         condition_space: condSpace('assistant'),
         role: 'assistant', tags: ['dsh', 'assistant'], importance: opts.importance * 0.8,
-        ...sessionTag,
+        ...sessionTag, ...sessionPrivacy, ...dedupeWrite,
       }))
-    } else if (event.type === 'tool/result' && opts.toolResult) {
+    } else if (event.type === 'tool/result' && opts.toolResult && !excludedSession) {
       if (event.data.error) return
       const text = extractText(event.data.message.content)
       if (!text) return
@@ -1019,7 +1216,7 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
       memorize('tool', 'tool', (g) => g.remember(safe, {
         condition_space: condSpace('tool'),
         role: 'tool-output', tags: ['dsh', 'tool'], importance: opts.importance * 0.6,
-        ...sessionTag,
+        ...sessionTag, ...sessionPrivacy, ...dedupeWrite,
       }))
     }
 

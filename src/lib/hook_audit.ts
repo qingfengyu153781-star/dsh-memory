@@ -40,7 +40,8 @@ import { expandHome } from './datapath.js'
 import { dirname, join } from 'node:path'
 
 /** 三处过滤分支的成因（与 hooks.ts 一一对应：子代理会话 / 中继消息 / kind 非 user）。 */
-export type HookFilterReason = 'subagent' | 'relay' | 'kind'
+/** issue #695：`session_excluded` = 会话在 memory.excludeSessions 里（按会话显式排除）。 */
+export type HookFilterReason = 'subagent' | 'relay' | 'kind' | 'session_excluded'
 /** 写入路径的角色（与 md_cg 对 DSH 会话事件的 role 约定一致）。 */
 export type HookWriteRole = 'user' | 'assistant' | 'tool'
 /** 跳过写入的成因。 */
@@ -67,6 +68,12 @@ export interface HookAuditState {
   }
   /** 进入消息级处理的 `source.kind` 分布（缺字段/空串/非字符串记 "undefined"）。 */
   kinds: Record<string, number>
+  /** `source` 的**键名集合**分布（issue #695：只记键名，绝不记值）。
+   *  为什么需要：`kind` 只说明「以什么形式提交」，不说明「谁提交的」。
+   *  外部桥接经 `sessions.prompt()` 注入的控制提示同样以 kind="user" 通过，
+   *  只看 kind 无法区分；而**键名集合**（如 `kind` / `form+kind` / `kind+origin`）
+   *  能直接回答「这条事件的 source 到底带哪些字段」，是排查来源归因缺口的第一读数。 */
+  source_shapes: Record<string, number>
   /** 最近 ≤MAX_LAST 条摘要。 */
   last: HookAuditEntry[]
   updated_at: string
@@ -94,7 +101,9 @@ const MAX_KINDS = 32
 /** kinds 归并桶。 */
 const OTHER_KIND = 'other'
 
-const FILTER_REASONS: HookFilterReason[] = ['subagent', 'relay', 'kind']
+const FILTER_REASONS: HookFilterReason[] = ['subagent', 'relay', 'kind', 'session_excluded']
+/** 只在**新增**键上允许旧盘面缺省（前向兼容），旧键缺失仍判坏盘面。 */
+const OPTIONAL_COUNT_KEYS = new Set<string>(['session_excluded'])
 const WRITE_ROLES: HookWriteRole[] = ['user', 'assistant', 'tool']
 const SKIP_REASONS: HookSkipReason[] = ['sanitized', 'not_ready', 'failed']
 
@@ -105,6 +114,15 @@ export function kindOf(source: unknown): string {
   return typeof k === 'string' && k.length > 0 ? k : 'undefined'
 }
 
+/** `source` 的键名集合（排序后 join '+'）：空对象记 "empty"，非对象记 "not-object"。
+ *  只取 `Object.keys`——**绝不读值**，因此不含任何内容/凭据。 */
+export function sourceShapeOf(source: unknown): string {
+  if (source === null || source === undefined) return 'undefined'
+  if (typeof source !== 'object') return 'not-object'
+  const keys = Object.keys(source as Record<string, unknown>).sort()
+  return keys.length ? keys.join('+') : 'empty'
+}
+
 function nowIso(): string {
   return new Date().toISOString()
 }
@@ -112,11 +130,12 @@ function nowIso(): string {
 function emptyState(): HookAuditState {
   return {
     counts: {
-      filtered: { subagent: 0, relay: 0, kind: 0 },
+      filtered: { subagent: 0, relay: 0, kind: 0, session_excluded: 0 },
       written: { user: 0, assistant: 0, tool: 0 },
       skipped: { sanitized: 0, not_ready: 0, failed: 0 },
     },
     kinds: {},
+    source_shapes: {},
     last: [],
     updated_at: nowIso(),
   }
@@ -127,12 +146,19 @@ function countOf(v: unknown): number {
   return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0
 }
 
-/** 摘要只接受完整的非负安全整数桶；坏盘面不伪装成零计数。 */
+/** 摘要只接受非负安全整数桶；**缺键按 0 计**（版本前向兼容：旧盘面没有新增 reason），
+ *  形态不符仍返回 null（坏盘面不伪装成零计数）。 */
 function sumCounts(bucket: unknown, keys: readonly string[]): number | null {
   if (!bucket || typeof bucket !== 'object' || Array.isArray(bucket)) return null
   let total = 0
   for (const key of keys) {
     const value = (bucket as Record<string, unknown>)[key]
+    // 只对**新增**键放行缺省（旧盘面没有它）；旧三项缺键仍判坏——
+    // 否则「盘面被手改删键」会被伪装成健康零计数。
+    if (value === undefined) {
+      if (OPTIONAL_COUNT_KEYS.has(key)) continue
+      return null
+    }
     if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) return null
     total += value
     if (!Number.isSafeInteger(total)) return null
@@ -144,7 +170,7 @@ function sumCounts(bucket: unknown, keys: readonly string[]): number | null {
 function mergeState(raw: unknown): HookAuditState {
   const s = emptyState()
   if (!raw || typeof raw !== 'object') return s
-  const r = raw as { counts?: unknown; kinds?: unknown; last?: unknown }
+  const r = raw as { counts?: unknown; kinds?: unknown; source_shapes?: unknown; last?: unknown }
   if (r.counts && typeof r.counts === 'object') {
     const c = r.counts as { filtered?: unknown; written?: unknown; skipped?: unknown }
     const buckets: Array<[Record<string, number>, string[], unknown]> = [
@@ -160,6 +186,11 @@ function mergeState(raw: unknown): HookAuditState {
   if (r.kinds && typeof r.kinds === 'object') {
     for (const [k, v] of Object.entries(r.kinds as Record<string, unknown>)) {
       if (typeof v === 'number' && Number.isFinite(v) && v > 0) s.kinds[k] = Math.floor(v)
+    }
+  }
+  if (r.source_shapes && typeof r.source_shapes === 'object') {
+    for (const [k, v] of Object.entries(r.source_shapes as Record<string, unknown>)) {
+      if (typeof v === 'number' && Number.isFinite(v) && v > 0) s.source_shapes[k] = Math.floor(v)
     }
   }
   if (Array.isArray(r.last)) {
@@ -212,7 +243,7 @@ export class HookAuditRecorder {
     }
   }
 
-  /** 一条**被设计滤除**的消息（三处过滤分支各调一次）。 */
+  /** 一条**被设计滤除**的消息（各过滤分支各调一次）。 */
   filtered(reason: HookFilterReason, kind?: string): void {
     this.#mutate((s) => {
       s.counts.filtered[reason] += 1
@@ -227,6 +258,18 @@ export class HookAuditRecorder {
     this.#mutate((s) => {
       const key = this.#boundedKindKey(s, kind)
       s.kinds[key] = (s.kinds[key] ?? 0) + 1
+    })
+  }
+
+  /** `source` 的键名集合分布（issue #695）：只记**键名**，不记任何值。
+   *
+   *  与 `observeKind` 的分工：kind 回答「以什么形式提交」，本方法回答「source 带哪些字段」。
+   *  两者都不参与写入判定（本模块是诊断面，红线不动）。
+   */
+  observeSourceShape(source: unknown): void {
+    const shape = sourceShapeOf(source)
+    this.#mutate((s) => {
+      s.source_shapes[shape] = (s.source_shapes[shape] ?? 0) + 1
     })
   }
 

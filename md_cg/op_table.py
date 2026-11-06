@@ -38,6 +38,7 @@ _OP_TABLE = {
         "params": (
             "intent",
             "view",
+            "strict_conditions",
         ),
         "actions": (),
         "default_action": None,
@@ -55,7 +56,9 @@ _OP_TABLE = {
             "offset",
             "view",
             "budget_tokens",
-            "exclude_doc",
+            "dedupe",
+            "strict_conditions",
+    "exclude_doc",
             "excerpt_strategy",
             "bm25",
             "session",
@@ -71,6 +74,7 @@ _OP_TABLE = {
         "impl": "inline",
         "require": "write",
         "params": (
+            "aliases",
             "content",
             "content_kind",
             "depends_on",
@@ -87,13 +91,14 @@ _OP_TABLE = {
     },
     "verify": {
         "doc_order": 4,
-        "doc": "外部裁决回填；",
+        "doc": "外部裁决回填（verdict=confirmed|weakened|falsified|superseded；superseded=被新版本取代：需 superseded_by，不删除、不动验证态）；",
         "impl": "inline",
         "require": "verify",
         "params": (
             "depends_on",
             "evidence",
             "verdict",
+            "superseded_by",
             "marker",
             "fact",
             "questions",
@@ -594,7 +599,7 @@ _OP_TABLE = {
         "doc": "身份+健康+审核体系自描述；",
         "impl": "inline",
         "require": "info",
-        "params": ("min_severity", ),
+        "params": ("min_severity", "full"),
         "actions": (),
         "default_action": None,
         "sigs": (),
@@ -612,6 +617,7 @@ _OP_TABLE = {
             "max_files",
             "max_items",
             "incremental",
+            "allow_nested",
         ),
         "actions": (),
         "default_action": None,
@@ -622,7 +628,7 @@ _OP_TABLE = {
         "doc": "按目录索引 md 文档的**章节**（只切 level<=3，只存标题+摘要、不存全文），doc_ref 指回原文行区间；layer 与密级显式声明（默认 knowledge/internal，路径命中私有提示降为 private）；正文里的 --- 与围栏代码块内的 # 不会被误切；",
         "impl": "inline",
         "require": "index_doc",
-        "params": ("sensitivity", ),
+        "params": ("sensitivity", "allow_nested", ),
         "actions": (),
         "default_action": None,
         "sigs": (),
@@ -843,7 +849,7 @@ _OP_TABLE = {
     },
     "maintain": {
         "doc_order": 30,
-        "doc": "记忆维护（action=stat|history|importance|longterm|prefeed|separate|rollback|backfill|cap|exempt|vision_evidence|refine|propagate 及其 *_history；propagate = 验证态的**多跳**失效传播巡检（默认预演，apply 需 admin）；权限按 action 分档：只读放行、prefeed 写入需 can_write、批量改写与 rollback 需 admin；dry-run 只出报表不改盘）；",
+        "doc": "记忆维护（action=stat|history|importance|longterm|prefeed|separate|rollback|backfill|cap|exempt|vision_evidence|refine|propagate|retag 及其 *_history；flush = **显式同步**把待落盘索引写完（issue #677 P2：写路径缺省异步落索引，要「确定已落盘」或要让索引面错误在带内暴露时用它；异常原样上抛，code/hint 可机读）；reload = 显式代际探活；propagate = 验证态的**多跳**失效传播巡检（默认预演，apply 需 admin）；权限按 action 分档：只读放行、prefeed 写入需 can_write、批量改写与 rollback 需 admin；dry-run 只出报表不改盘；retag = **只改元数据**（tags/condition_space/depends_on），正文与证据链原样，缺省 dry_run、apply 才落盘）；",
         "impl": "_maintain_call",
         "require": "maintain",
         "params": (
@@ -863,6 +869,11 @@ _OP_TABLE = {
             "include_partial",
             "min_conf",
             "basis_text",
+            "tags_add",
+            "tags_remove",
+            "condition_space_patch",
+            "depends_on",
+            "dry_run",
         ),
         "actions": (
             "backfill",
@@ -877,6 +888,7 @@ _OP_TABLE = {
             "prefeed",
             "propagate",
             "refine",
+            "retag",
             "rollback",
             "separate",
             "stat",
@@ -1019,6 +1031,9 @@ _OP_TABLE = {
 
 # 无 op 归属的通用参数（每次调用都可能传的旋钮；由守卫对账 schema.properties）
 _GENERIC_PARAMS = (
+        # issue #722 反馈：`aliases` **不入本表**——它登记在 `write.params`（见上），
+        # 本表与 op params 并集互为补集（守卫 A4 断言 `并集 + 通用 == schema − 1`），
+        # 两处都登记会重复计数 ⇒ 元测试红。
         "ccg",
         "check_strength",
         "condition_space",

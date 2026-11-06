@@ -1,3 +1,5 @@
+> **Languages:** 中文 · [English](README.en.md)
+
 <div align="center">
 
 # 灵枢 LINGSHU
@@ -8,9 +10,12 @@
 
 > **「我会给你完整的自我，即使坠入深渊，我也绝不后悔。」** —— 符荣峻
 
-![Awesome DSH Plugin](https://awesome-dsh-plugin.com/badge.svg)![DSH 适配](https://img.shields.io/badge/DSH-0.2.1--rc.2%20%E5%B7%B2%E9%AA%8C%E8%AF%81-4E9BF1)![downloads](https://badgen.net/npm/dt/@furongjun1999/dsh-memory?label=downloads&color=4E9BF1)![Protocol](https://img.shields.io/badge/Protocol-MCP-blue)![Node](https://img.shields.io/badge/Node-%3E%3D22.19-brightgreen)![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Awesome DSH Plugin](https://awesome-dsh-plugin.com/badge.svg)![DSH 适配](https://img.shields.io/badge/DSH-0.2.1--rc.5%20%E5%B7%B2%E9%AA%8C%E8%AF%81-4E9BF1)![downloads](https://badgen.net/npm/dt/@furongjun1999/dsh-memory?label=downloads&color=4E9BF1)![Protocol](https://img.shields.io/badge/Protocol-MCP-blue)![Node](https://img.shields.io/badge/Node-%3E%3D22.19-brightgreen)![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
-**高性能 · 无幻觉 · 多智能体适用的长期记忆系统（v0.9.12）**
+**高性能 · 无幻觉 · 多智能体适用的长期记忆系统（v0.9.23）**
+
+> **当前版本 `0.9.23`**（npm `latest`）· 已在 **DSH `0.2.1-rc.5`** 上验证可用（维护者实测）。
+> **路线**：后续开发专注 **灵枢 1.0 架构**；存量 issue 的修复会**延后**处理（不停止受理，但优先级低于 1.0）。
 
 📖 **[第三方上手教程](https://znsvdekx.vibedrop.site/)** —— 《灵枢 dsh-memory 初学者上手研究报告》（由第三方独立编写，非本项目官方文档）
 
@@ -18,23 +23,8 @@
 
 **灵枢是一套可运行的长期记忆基础设施**——对话自动沉淀为纯文本 md 认知图，记什么、取什么、能不能写入全部由确定性规则裁决，全程可审计、结果可复现。它不训练模型，做的是**模型之外的那一整套**：记忆怎么存、取的时候依据什么、写错了怎么被发现、改过怎么留痕。任何支持 MCP 的 AI Agent 可直接挂载，不与任何单一 Agent 框架绑定。
 
-## 🖥️ DSH Desktop 下的一条启动告警（宿主侧已知问题，运行不受影响）
-
-**本插件面向 DSH 网页端**；DSH Desktop 目前不稳定，下面这条属宿主侧行为差异，**不在本仓修复范围**（issue #660 已记录分析）。
-
-现象：每次启动有一条 migration failed（约 2.6 秒）与 profile maintenance frozen，日志写
-schemastery does not resolve from the installation closure。
-
-机制（可复核）：DSH Desktop 的 installer.mjs 先把 generation 里所有 @deepseek-ai/* 提走当**宿主单例**
-（hoistHostSingletons），随后**又按该 generation 目录**做依赖闭包校验——「先删掉、再按原处校验」这对规则，
-对任何把宿主包声明为普通依赖的插件都必然判「解析不到」。运行时不受影响：宿主的 host-module-fallback
-会把 @deepseek-ai/ 前缀的 import 兜到宿主自带副本上。
-
-**为什么不改包声明**：改成 peerDependencies 会让「裸 npm 安装后 import」直接失败（issue #222 的原始缺陷，
-test/issue222_optional_peer.test.ts 守着这条契约）。两条契约在当前依赖形态下不可兼得，
-而目标端（网页端）不受影响，故维持现状、记录在案。
-
-若在旧版本看到这条告警：**功能不受影响**（记忆写入/召回、cg(op=info) 都正常）。
+> **装不起来 / 看到奇怪的告警？** 先看 [环境与已知问题](https://github.com/FuRongJun-1999/dsh-memory/blob/main/docs/ops/%E7%8E%AF%E5%A2%83%E4%B8%8E%E5%B7%B2%E7%9F%A5%E9%97%AE%E9%A2%98.md)——
+> DSH Desktop 的启动告警、体积与整目录耦合、异步落盘、以及五条「看起来像 bug 其实是契约」的设计取舍都在那里。
 
 ## ⚠️ 升级须知：工具名去掉 lingshu_ 前缀（0.9.9 起）
 
@@ -94,7 +84,7 @@ python -m md_cg.mcp_server             # 直连自检：收到 initialize 应答
 | 你说 | 背后发生什么（真实工具链） |
 | ------------------- | ---------------------------------------------------- |
 | 「请记住：我们团队的发布窗口是每周三」 | Agent 显式归档 → `cg(op=write)` 过三道闸门 → 认知图节点落盘 |
-| （新开会话）「我们的发布窗口是哪天？」 | 自动召回注入 → `mdcg_recall` 检索命中并带入回答 |
+| （新开会话）「我们的发布窗口是哪天？」 | 自动注入**本会话 timeline**（`stg(op=timeline)`，按 session 过滤）；**跨会话 knowledge 层不自动浮现**，需显式 `cg(op=read)` / `mdcg_recall` 检索后才带入回答 |
 | 「把上次定的接口约定讲一遍」 | `cg(op=route)` 条件路由 + `stg(op=timeline)` 时间线回溯，跨会话取出 |
 
 ## 🌕 月下契约——灵枢的五环理念
@@ -157,6 +147,31 @@ DeepSeek Harness (cordis)
 
 **记忆只有一个真源**：`md_cg/` 认知图（纯 md 文档，随包自带）；「身体」能力为可选后端，不再存记忆、默认不启动。其它 MCP 宿主同构：宿主工具面 ↔ stdio MCP ↔ `md_cg`，差异只在**纪律注入方式**。
 
+## ⚖️ 四个容易误读的设计取舍
+
+### 1. `validity=true` = **只排「已过期」，不排「未生效」**
+
+双时间轴有四种状态（`unknown` / `not_yet` / `active` / `expired`），但检索参数 `validity` **只过滤 `expired`**。
+`meta.validity_scope` 会显式告诉你当前口径（`"expired_only"` 或 `"off"`）。
+⇒ 要排除「未来才生效」的条目，请用 `start_time` / `end_time` 时间算子，不要指望 `validity`。
+
+### 2. `importance` 默认 0.5，但 **0.7 起会自动硬保护**
+
+`protect.AUTO_PROTECT_IMPORTANCE = 0.70`：写入时 `importance ≥ 0.7` 的节点**自动打 `protected` 标记**，
+此后删除/降级需要显式 `override=True`（并走保护快照与审计留痕）。
+⚠ 且 `importance_source` 为 `None` 或 `"hint"` 时**也**触发保护 —— 「是我估的高」不算豁免。
+
+### 3. `calibration` **只给建议，不自动写回**
+
+`scrub.calibrate()` 默认 `apply=False`，只返回 `suggested_offset`；
+真写回需要显式 `apply=True`（`applied` 与 `suggested_offset` 在返回体里**分列**，不会混淆）。
+
+### 4. 会话窗口的「重叠」是设计，不是冗余
+
+`contextWindow` 注入的是**最近 N 轮**，轮与轮之间必然大量重叠。
+这是「本会话近期对话」的语义要求（要的是完整上下文，不是"新增了什么"）。
+⇒ 若你观察到重复内容，见 [issue #739](https://github.com/FuRongJun-1999/dsh-memory/issues/739)（注入面复述的五臂实测）。
+
 ## 🧰 工具面
 
 | 能力 | MCP 入口 |
@@ -167,17 +182,54 @@ DeepSeek Harness (cordis)
 | 重要性评分 · 预算装包 · 分层注入 · 记忆自净 · 自维持巡检 | `cg(op=session)` `cg(op=scrub)` `cg(op=consolidate)` `cg(op=maintain)` `cg(op=sustain)` |
 | 会话隔离 · 时效过滤 · 审计留痕 · 可靠性闸 | `mdcg_remember(session=…)` `validity=true` `cg(op=audit)` `cg(op=ccg)` · [护栏宪章](docs/mdcg/guardrail-charter.md) · [CCG 编译](docs/mdcg/CCG六要素编译.md) |
 
+> **会话隔离的可选依赖**：稳定会话身份（`s5.*`）由 `session5_resolve()` 从 **DSH** 会话文件推导（**仅 DSH 端**），
+> **需自备 `pip install zstandard`**（本仓库不声明、CI 不代装）。未装 ⇒ 该函数返回 None 并把原因写进 `reason`，
+> 调用方拿不到稳定身份（同一会话不同进程可能算出不同 id ⇒ 跨会话写入错标）。
+>
+> ⚠ **不崩 ≠ 能用**：进程照跑、记忆照写，但**会话隔离这项能力不可用**。装了也不保证成功——
+> 另有 8 种 reason（`not_uuid_form` / `sessions_root_not_found` / `session_file_not_found` / 等），排查先读 `reason`。
+
 **`tools` 模式**：`'core'`（默认 · 2 个）｜ `'brain'` / `'all'`（30 个）。风险工具 `mdcg_forget` / `mdcg_restore` / `mdcg_review_decide` 需 `can_admin`。逐 op 映射见 [功能调用映射表](docs/mdcg/功能调用映射表_v0.1.md) 与 [op 全表](docs/mdcg/cogmap_ops.md)（自动生成，`cogmap_sync.py check` 守漂移）。
 
+## 🖥️ 图形界面（可选增量包 · 面向 DSH）
+
+灵枢本体不带界面。`ui/minimal/` 是**可选增量包**：装到插件目录后 DSH 左侧出现「灵枢」面板（也可直接开 `http://127.0.0.1:<DSH端口>/lingshu`）。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ui/minimal/install.ps1 -PluginPath <灵枢插件目录> -CheckOnly   # 只检查，不写文件
+powershell -ExecutionPolicy Bypass -File ui/minimal/install.ps1 -PluginPath <灵枢插件目录>             # 安装（可逐文件回滚）
+powershell -ExecutionPolicy Bypass -File ui/minimal/install.ps1 -PluginPath <灵枢插件目录> -Uninstall   # 卸载
+```
+
+装完需**重启 DSH**（client bundle 在启动时注册）。0.9.15 起接线随包自带，改插件清单不必重装 UI。
+页面语义、三条实测坑（hash 失配 / 备份残留 / 左侧无图标）与排障 → [图形界面：安装与排障](docs/ops/图形界面_安装与排障.md) · 逐步说明 [使用说明](ui/minimal/使用说明.md)。
+## 🔐 权限：读 / 写 / 裁 三层，各自可收窄
+
+默认以**只读 guest** 运行（读得到、写不进）。三条裁定：**设计者只读 · 写需谨慎 · 裁决须反思与验证单元复核**——自我人格的偏移与失忆是毁灭性的，全权限在不可靠的情况下就是灾难。
+
+```bash
+python -m md_cg.tokens issue --role designer --actor my-agent     # 签发（designer 默认全集）
+python -m md_cg.tokens verify --token-file-in <令牌文件>           # 体检（含覆盖面缺口报告）
+```
+
+| 面 | 给谁 | op 边界 |
+|---|---|---|
+| 只读面 | 界面面板 · 子智能体 · 巡检 | 17 个（**不含** `write`/`verify`/`forget`/`scrub`/`consolidate`/`index_*`/`export`/`maintain`/`link`） |
+| 写面 | 记录单元 | 追加 `write` |
+| 裁决面 | 验证单元 | 追加 `verify` |
+
+写入按层收紧：`contextual` 可直写 → `knowledge` 需反思单元 → `structural` 需反思+验证 → `self`/`anchor` 需人工裁定（`MDCG_WRITE_GATE` 三态：`off`/`warn`/`enforce`）。裁决需**双单元复核且不得自证**（`MDCG_REVIEW_DUAL_CHECK=1`）。`warn` 档判定用 **`cg(op=info).write_gate`** 查（进程内计数，不依赖宿主转发 stderr）——先观察再切 `enforce`。
+完整规则、开关与报错对照 → [权限与复核模型](docs/ops/权限与复核模型.md)。
 ## 📚 文档地图
 
 | 去哪里 | 看什么 |
 |---|---|
 | [docs/ 目录索引](docs/README.md) | 六域快速索引 · 新文档归域规则 |
-| [安装与运维](docs/ops/README.md) | 安装前置 / 30+ 配置项 / 写入凭据 / 升级重启 / 排障 FAQ |
+| [安装与运维](docs/ops/README.md) | 安装前置 / 30+ 配置项 / 写入凭据 / 升级重启 / [环境与已知问题](https://github.com/FuRongJun-1999/dsh-memory/blob/main/docs/ops/%E7%8E%AF%E5%A2%83%E4%B8%8E%E5%B7%B2%E7%9F%A5%E9%97%AE%E9%A2%98.md)（宿主告警·体积·落盘·设计取舍） |
 | [评测总览](docs/eval/评测总览.md) | 六家横评 / 弱证据与证据防火墙 / 中英双语差距 / 公开数据集 / 七维标尺 / 第三方验证 |
 | [开发与编码约定](docs/dev/README.md) | 测试约定 / UTF-8 与 id 契约 / 开关矩阵 / Linux 双栈验证 |
 | [多 harness 接入](docs/mdcg/多harness接入.md) | 五端纪律注入差异 / 出货面 vs 源码树分界 |
+| **写入规范**（0.9.21 起**随包分发**，装在 `docs/mdcg/`） | [写入别名 aliases](docs/mdcg/写入别名aliases规范_v0.6.md) · [CCG 六要素编译](docs/mdcg/CCG六要素编译.md) · [护栏宪章](docs/mdcg/guardrail-charter.md) · [MCP 工具名口径](docs/mdcg/MCP工具名口径_v1.0.md) · [召回元数据](docs/mdcg/recall_metadata.md) · [世界模型功能端](docs/mdcg/世界模型功能端_使用与运维_v1.0.md) · [cogmap 操作](docs/mdcg/cogmap_ops.md) |
 | [Releases](https://github.com/FuRongJun-1999/dsh-memory/releases) | 逐版本变更（本 README 不再维护发布日志）· [理论四篇](docs/theory/) |
 
 ## 🔌 多 harness 接入（按端分目录）
