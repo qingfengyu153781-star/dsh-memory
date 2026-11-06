@@ -58,6 +58,7 @@ SCHEMA = 2                # v2：水位以「源文件绝对路径」为键（v1
 LEDGER_FILE = "_refindex.json"
 REF_KEYS = ("code_ref", "doc_ref")
 MAX_CHECK = 2000          # 巡检节点上限（超出报 truncated，不静默截断）
+NESTED_LIST_MAX = 20      # #770 嵌套重复检测：回执里最多列多少条待清清单
 STATUSES = ("ok", "stale", "dangling", "unresolved", "error")
 
 
@@ -423,15 +424,22 @@ def _domain_of(it: dict) -> str:
     两者混成一个字段就会重演普查里的退化：实例名嵌进条件字段 → 3037 桶 /
     3048 节点（99.9% 单例桶），路由等于失效。
 
-    取 path 首段，与改造前 `normalize_domain(observation_position)` 的产物
-    **逐字相同**，故本次加标签不改变任何既有节点的分桶结果。
+    取**整条相对路径**（2026-10-21 采纳外部用户 miyu 的修复一）。
+
+    为什么不再取首段：真实知识树常见形态是「少数顶层目录 + 其下大量子树」，
+    例如 default-kb/{shorinwiki,kb}。取首段时只有 2 个桶、99 篇文档全压在一个
+    桶里 ⇒ 巨桶占比 97.2%、期望扫描 94.6%，路由等于失效（外部实测：改整路径后
+    桶数 2→60、最大桶 97.2%→5.8%、期望扫描 94.6%→2.7%）。
+
+    安全性：docindex.node_id 只哈希 path#heading_path，**不含本域键**，
+    故改域只换桶、节点 id 完全不变，不产生重复节点。
     """
     path = it.get("path") or ""
-    return path.split("/")[0] or "orphan"
+    return path or "orphan"
 
 
 
-# 生效条件：cg.get(nid) 不可读或节点不存在时返回 None；节点存在且其 frontmatter[kind]['root'] 非空、且与入参 root 不是同一个源根（_same_root）时返回冲突读数 dict（id/kind/existing_root/root）；节点无该 ref 键 / ref 无 root / 同根时返回 None；只读，不写盘；
+# 生效条件：cg.get(nid) 不可读或节点不存在时先走不过滤内部读面（索引条目 + cg._read）——节点存在且其 frontmatter[kind]['root'] 非空、与入参 root 不是同一个源根（_same_root）、旧根目录仍在盘上时返回冲突读数 dict（id/kind/existing_root/root/invisible=True，issue #426-B fail-closed），否则返回 None；可见节点路径与既有逐位一致（frontmatter[kind]['root'] 非空且异根才返回 id/kind/existing_root/root）；只读，不写盘；
 def root_clash(cg, nid, kind, root):
     """同 id 节点是否已归属**另一个源根**（#352-E 冲突闸）。
 
@@ -456,7 +464,28 @@ def root_clash(cg, nid, kind, root):
     except Exception:                                  # noqa: BLE001
         prev = None
     if not prev:
-        return None
+        # issue #426-B：cg.get 按调用者 clearance 过滤——低权令牌（record/internal）
+        # 看不见 designer 以 restricted/private 索引的既有节点，原实现据此判「无冲突」
+        # 并整条覆写（密级一起降为 internal，原主之后重索引还会被闸挡回）。冲突判定
+        # 必须基于**库内客观事实**，故改走不过滤内部读面（索引条目 + 基类 _read）；
+        # 「存在但不可读」按 fail-closed 视为冲突（不覆写），invisible 供回执归因。
+        e = ((getattr(cg, "index", None) or {}).get("nodes") or {}).get(nid)
+        if e is None:
+            return None                              # 真不存在：无冲突
+        try:
+            fm, _c = cg._read(e)
+        except Exception:                            # noqa: BLE001
+            fm = None
+        if not fm:
+            return None                              # 读不出（损坏/瞬时失败）：维持既有 None 语义
+        _pr = (fm.get(kind) or {})
+        _prev_root = _pr.get("root") if isinstance(_pr, dict) else None
+        if not _prev_root or not root or _same_root(_prev_root, root):
+            return None                              # 同根/无 ref：覆写语义不变
+        if not os.path.isdir(_prev_root):
+            return None                              # 陈化豁免与可见路径同口径
+        return {"id": nid, "kind": kind, "existing_root": _prev_root,
+                "root": root, "invisible": True}
     pr = ((prev.get("frontmatter") or {}).get(kind) or {})
     prev_root = pr.get("root") if isinstance(pr, dict) else None
     if not prev_root or not root or _same_root(prev_root, root):
@@ -522,7 +551,19 @@ def add_items(cg, items, *, kind: str, root: str, layer=None, sensitivity=None,
             )
         else:                                      # doc_ref
             level = it.get("level")
-            s, _basis = docindex.sensitivity_for(it.get("path") or "", sensitivity)
+            # issue #452（2026-10-16 实测）：`it["path"]` 是**相对被摄取根**的路径，
+            # 而私有提示可能正落在**被摄取根自身**的名字上——`cg(op=ingest,
+            # action=dir, path=<…>/private)` 时 item path 只剩 `hr_archive.md`，
+            # `private` 这一段被抹掉 ⇒ 提示永不命中 ⇒ 敏感文档以 internal 落库，
+            # 低权身份可读回其正文；同一份文档改传父目录即正确判 private 并
+            # fail-closed（同一文件、同一写者，只有 path 参数不同）。
+            # 故密级判据面改用「**摄取根 + 相对路径**」的合成路径：与
+            # `docindex.sensitivity_for` 已支持的绝对路径写法**同口径**，而该函数
+            # 只按段找提示、命中只会收紧为 private ⇒ 仍满足其 docstring 的
+            # 「只可能更严、不可能更松」。`root` 为空时合成结果即原 path，
+            # 行为与修前逐字一致（非摄取通路的调用点不受影响）。
+            _hint = os.path.join(root or "", it.get("path") or "").replace("\\", "/")
+            s, _basis = docindex.sensitivity_for(_hint, sensitivity)
             sens[s] = sens.get(s, 0) + 1
             extra = (extra_of(it) or {}) if extra_of else {}
             cg.add(
@@ -684,6 +725,97 @@ def _fast_path_verdict(cg, n: dict, e: dict, rel: str, src_root: str,
 
 
 # 生效条件：cg 的 index['nodes'] 非空时汇总 stale/dangling/unresolved/errors/ledger_mismatch 并返回 ok =（无 stale 且无 dangling）；only_tagged 为真时只探测 tags 含 'code'/'doc' 的节点，ledger 非空时先经 _fast_path_verdict 走 (size, mtime, sha256) 快路径。
+# 生效条件：inner、outer 均非空、归一后不相等、且 inner 位于 outer 之下（按路径分隔符边界，不是字符串前缀）时返回 True，否则 False。
+def _is_sub_root(inner, outer) -> bool:
+    """inner 是否是 outer 的**严格子目录**（#770 检测用）。
+
+    必须按分隔符边界判，不能用裸 `startswith`：`D:/a/bc` 不是 `D:/a/b` 的子根，
+    但字符串前缀恰好成立——那会把两个互不包含的大域误判成嵌套。
+    """
+    try:
+        a, b = _norm_root(inner), _norm_root(outer)
+    except (TypeError, ValueError):
+        return False
+    if not a or not b or a == b:
+        return False
+    return a.startswith(b + os.sep)
+
+
+# 生效条件：始终返回 dict（不抛），键含 count/files/entries/truncated/scanned；
+# count = 可清节点数，files = 命中的 (kind, realpath) 数，entries 最多 limit 条。
+def nested_duplicates(cg, *, limit: int = NESTED_LIST_MAX,
+                      only_tagged: bool = True) -> dict:
+    """存量「嵌套根重复」检测（**只读**：不删节点、不写水位、不改任何文件）。
+
+    #754 的入口守卫只拦**新增**嵌套根（`index_code`/`index_doc` 命中即拒）；
+    守卫上线前已双写的节点仍在库里，检索照样返回重复内容（#770）。
+    本函数只做**发现**，清理见 `prune_nested`。
+
+    判据（三条同时成立才算一条待清）：
+    ① 同一 kind（code_ref 与 doc_ref 不互相判重）；
+    ② 两套 root 指向**同一 realpath 文件**（`realpath(join(root, path))` 相等）；
+    ③ 其中一套 root 是另一套的**严格子目录**。
+    只满足 ①② 但 root 互不包含的，是「多源根合法多域」（#352-E 的冲突面），
+    **不算**本缺陷，这里如实不列。
+
+    返回的每条 entry 是**内侧那套**的一个文件：
+    `{ref_kind, root(内侧), outer_root, realpath, nodes[节点 id]}`。
+    """
+    nodes = (getattr(cg, "index", {}) or {}).get("nodes") or {}
+    groups = {}          # (kind, realpath) -> {norm_root: {"root": ..., "ids": [...]}}
+    scanned = 0
+    for nid in list(nodes):
+        if only_tagged:
+            tags = (nodes.get(nid) or {}).get("tags") or []
+            if not any(t in ("code", "doc") for t in tags):
+                continue
+        try:
+            node = cg.get(nid)
+        except Exception:                 # 检测不抛：读不回就跳过
+            continue
+        kind, ref = ref_of(node)
+        if not ref:
+            continue
+        root = ref.get("root") or ""
+        rel = ref.get("path") or ""
+        if not root or not rel:
+            continue
+        scanned += 1
+        try:
+            fp = os.path.realpath(os.path.join(root, rel))
+        except (OSError, ValueError):
+            continue
+        bucket = groups.setdefault((kind, fp), {})
+        bucket.setdefault(_norm_root(root), {"root": root, "ids": []})["ids"].append(nid)
+
+    entries = []
+    for (kind, fp), by_root in groups.items():
+        if len(by_root) < 2:
+            continue
+        roots = list(by_root.values())
+        for inner in roots:
+            for outer in roots:
+                if inner is outer or not _is_sub_root(inner["root"], outer["root"]):
+                    continue
+                entries.append({
+                    "ref_kind": kind,
+                    "root": inner["root"],
+                    "outer_root": outer["root"],
+                    "realpath": fp,
+                    "nodes": sorted(inner["ids"]),
+                })
+    entries.sort(key=lambda e: (e["ref_kind"], e["realpath"], e["root"]))
+    return {
+        "count": sum(len(e["nodes"]) for e in entries),
+        "files": len(entries),
+        "entries": entries[:limit],
+        "truncated": len(entries) > limit,
+        "scanned": scanned,
+        "note": ("只读检测：内侧 root 与外侧 root 指向同一 realpath 文件的节点才是候选；"
+                 "root 互不包含的多源根合法多域不计入（#352-E）。"),
+    }
+
+
 def check_refs(cg, *, ledger: "Ledger" = None, max_nodes: int = MAX_CHECK,
                only_tagged: bool = True) -> dict:
     """漂移 / 悬空巡检（只读、不抛）。
@@ -799,6 +931,8 @@ def check_refs(cg, *, ledger: "Ledger" = None, max_nodes: int = MAX_CHECK,
         # 但也不是静默——写序断裂 / 跨域撞 id 在这里可见（只增键，语义不动）。
         "ledger_mismatch": mismatch[:20],
         "ledger_mismatch_count": len(mismatch),
+        # #770 存量嵌套根重复（只读）：count/files/entries 见 nested_duplicates。
+        "nested_duplicate": nested_duplicates(cg, only_tagged=only_tagged),
         "truncated": truncated, "max_nodes": max_nodes,
     }
 
